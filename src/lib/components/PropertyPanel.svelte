@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize } from '$lib/types/pattern';
+  import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize, PointConstraint } from '$lib/types/pattern';
   import { selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
   import FormulaDialog from '$lib/components/FormulaDialog.svelte';
 
@@ -34,6 +34,21 @@
       p.id === editingPoint.id ? { ...p, [field]: typeof value === 'string' ? value : Number(value) } : p);
     onchange({ ...currentPattern, points, hasChanged: true });
   }
+  function setConstraint(c: PointConstraint | undefined) {
+    if (!editingPoint) return;
+    const points = currentPattern.points.map((p) => (p.id === editingPoint.id ? { ...p, constraint: c } : p));
+    onchange({ ...currentPattern, points, hasChanged: true });
+  }
+  function changeConstraintType(type: string) {
+    const others = currentPattern.points.filter((p) => p.id !== editingPoint?.id);
+    const from = others[0]?.id ?? '';
+    const path = currentPattern.paths[0]?.id ?? '';
+    if (type === 'fixed') setConstraint(undefined);
+    else if (type === 'offset') setConstraint({ type: 'offset', from, dxFormula: '0', dyFormula: '0' });
+    else if (type === 'lengthAngle') setConstraint({ type: 'lengthAngle', from, lengthFormula: '0', angleFormula: '0' });
+    else if (type === 'sliding') setConstraint({ type: 'sliding', path, positionFormula: '0' });
+  }
+
   function updatePiece(fn: (p: Piece) => Piece) {
     if (!editingPiece) return;
     const pieces = currentPattern.pieces.map((p) => (p.id === editingPiece.id ? fn(p) : p));
@@ -334,14 +349,47 @@
     {/each}
 
   {:else if editingPoint}
+    {@const ep = editingPoint}
+    {@const cn = ep.constraint}
     <div class="p-3 space-y-2 text-sm">
-      <h4 class="font-semibold text-accent">Point: {editingPoint.name}</h4>
+      <h4 class="font-semibold text-accent">Point: {ep.name}</h4>
       <label class="flex flex-col gap-0.5">Name
-        <input type="text" class="input input-bordered input-xs" value={editingPoint.name} oninput={(e) => updatePoint('name', e.currentTarget.value)} /></label>
-      <label class="flex flex-col gap-0.5">X (mm)
-        <input type="number" class="input input-bordered input-xs" value={editingPoint.x} oninput={(e) => updatePoint('x', parseFloat(e.currentTarget.value) || 0)} step="0.1" /></label>
-      <label class="flex flex-col gap-0.5">Y (mm)
-        <input type="number" class="input input-bordered input-xs" value={editingPoint.y} oninput={(e) => updatePoint('y', parseFloat(e.currentTarget.value) || 0)} step="0.1" /></label>
+        <input type="text" class="input input-bordered input-xs" value={ep.name} oninput={(e) => updatePoint('name', e.currentTarget.value)} /></label>
+      <div class="grid grid-cols-2 gap-1">
+        <label>X (mm)<input type="number" class="input input-bordered input-xs w-full" value={ep.x.toFixed(1)} disabled={!!cn} oninput={(e) => updatePoint('x', parseFloat(e.currentTarget.value) || 0)} step="0.1" /></label>
+        <label>Y (mm)<input type="number" class="input input-bordered input-xs w-full" value={ep.y.toFixed(1)} disabled={!!cn} oninput={(e) => updatePoint('y', parseFloat(e.currentTarget.value) || 0)} step="0.1" /></label>
+      </div>
+
+      <hr class="border-base-200" />
+      <h5 class="font-semibold">Construction</h5>
+      <label class="flex flex-col gap-0.5">Type
+        <select class="select select-bordered select-xs" value={cn?.type ?? 'fixed'} onchange={(e) => changeConstraintType(e.currentTarget.value)}>
+          <option value="fixed">Fixed (x, y)</option>
+          <option value="offset">Offset from point (dx, dy)</option>
+          <option value="lengthAngle">Length &amp; angle from point</option>
+          <option value="sliding">Sliding along path</option>
+        </select></label>
+
+      {#if cn?.type === 'offset' || cn?.type === 'lengthAngle'}
+        <label class="flex flex-col gap-0.5">From point
+          <select class="select select-bordered select-xs" value={cn.from} onchange={(e) => setConstraint({ ...cn, from: e.currentTarget.value })}>
+            {#each currentPattern.points.filter((p) => p.id !== ep.id) as op}<option value={op.id}>{op.name}</option>{/each}
+          </select></label>
+      {/if}
+      {#if cn?.type === 'offset'}
+        <label class="flex flex-col gap-0.5">dx (formula, mm)<input class="input input-bordered input-xs font-mono" value={cn.dxFormula} oninput={(e) => setConstraint({ ...cn, dxFormula: e.currentTarget.value })} /></label>
+        <label class="flex flex-col gap-0.5">dy (formula, mm)<input class="input input-bordered input-xs font-mono" value={cn.dyFormula} oninput={(e) => setConstraint({ ...cn, dyFormula: e.currentTarget.value })} /></label>
+      {:else if cn?.type === 'lengthAngle'}
+        <label class="flex flex-col gap-0.5">Length (formula, mm)<input class="input input-bordered input-xs font-mono" value={cn.lengthFormula} oninput={(e) => setConstraint({ ...cn, lengthFormula: e.currentTarget.value })} /></label>
+        <label class="flex flex-col gap-0.5">Angle (formula, °)<input class="input input-bordered input-xs font-mono" value={cn.angleFormula} oninput={(e) => setConstraint({ ...cn, angleFormula: e.currentTarget.value })} /></label>
+      {:else if cn?.type === 'sliding'}
+        <label class="flex flex-col gap-0.5">Along path
+          <select class="select select-bordered select-xs" value={cn.path} onchange={(e) => setConstraint({ ...cn, path: e.currentTarget.value })}>
+            {#each currentPattern.paths as pa}<option value={pa.id}>{pa.name || pa.id.slice(0, 8)}</option>{/each}
+          </select></label>
+        <label class="flex flex-col gap-0.5">Distance along (formula, mm)<input class="input input-bordered input-xs font-mono" value={cn.positionFormula} oninput={(e) => setConstraint({ ...cn, positionFormula: e.currentTarget.value })} /></label>
+      {/if}
+      {#if cn}<p class="text-xs opacity-60">Position is computed from the formula(s). Reference variables and body measurements by name.</p>{/if}
     </div>
 
   {:else}

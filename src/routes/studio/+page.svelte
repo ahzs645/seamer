@@ -25,6 +25,7 @@
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
   import WelcomeModal from '$lib/components/WelcomeModal.svelte';
+  import { redraft, hasConstraints } from '$lib/solver/solve';
 
   let currentPattern = $state<Pattern>(structuredClone(EMPTY_PATTERN));
   let saved = $state(true);
@@ -86,7 +87,32 @@
 
   function handlePatternUpdate(updated: Pattern) {
     if (JSON.stringify(currentPattern) !== JSON.stringify(updated)) pushUndo($state.snapshot(currentPattern) as Pattern);
+    // live re-draft: recompute formula-constrained points from variables/measurements
+    if (hasConstraints(updated)) {
+      const solved = redraft(updated);
+      if (JSON.stringify(solved.points) !== JSON.stringify(updated.points) || JSON.stringify(solved.variables) !== JSON.stringify(updated.variables)) {
+        updated = solved;
+      }
+    }
     currentPattern = updated; saved = false; pattern.set(updated);
+  }
+
+  // A user-run drape settled: persist the freshly-settled per-piece savedPositions so re-opening shows
+  // the result instantly and body re-fits chain off the latest drape. Not an undo-able user edit, so
+  // no pushUndo; savedPositions isn't in the 3D patternKey, so this won't trigger a re-drape. Mark
+  // unsaved and let the 5s autosave (or an explicit save) write it.
+  function handleDrapeSettled(savedByPiece: Record<string, number[]>) {
+    let changed = false;
+    const pieces = currentPattern.pieces.map((p) => {
+      const sp = savedByPiece[p.id];
+      if (!sp) return p;
+      changed = true;
+      return { ...p, settings3d: { ...p.settings3d, savedPositions: sp } };
+    });
+    if (!changed) return;
+    currentPattern = { ...currentPattern, pieces };
+    pattern.set(currentPattern);
+    saved = false;
   }
 
   async function handleSave() {
@@ -119,25 +145,46 @@
 
   function doPrint() { printPattern(currentPattern, patternName || 'Pattern'); }
 
+  /** Parse imported text by extension into a Pattern (shared by the file picker + sample loader). */
+  function parseImport(text: string, ext: string | undefined, name: string): Pattern {
+    if (ext === 'dxf') return dxfToPattern(text, name);
+    if (ext === 'svg') return svgToPattern(text, name);
+    const raw = JSON.parse(text);
+    return isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
+  }
+
+  function applyImported(data: Pattern) {
+    currentPattern = data; patternName = data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
+    toastSuccess(`Imported "${data.name}"`);
+  }
+
   function handleImport() {
     const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.dxf,.svg';
     input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0]; if (!file) return;
       const ext = file.name.split('.').pop()?.toLowerCase();
       try {
-        const text = await file.text();
-        let data: Pattern;
-        if (ext === 'dxf') data = dxfToPattern(text, file.name.replace(/\.dxf$/i, ''));
-        else if (ext === 'svg') data = svgToPattern(text, file.name.replace(/\.svg$/i, ''));
-        else {
-          const raw = JSON.parse(text);
-          data = isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
-        }
-        currentPattern = data; patternName = data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
-        toastSuccess(`Imported "${data.name}"`);
+        applyImported(parseImport(await file.text(), ext, file.name.replace(/\.(dxf|svg|json|seamer\.json)$/i, '')));
       } catch { toastError('Could not import file'); }
     };
     input.click();
+  }
+
+  // Bundled DXF/SVG fixtures (served from /samples) for one-click import testing.
+  const importSamples: { file: string; label: string }[] = [
+    { file: 'pocket-curved.svg', label: 'Pocket (curved, SVG)' },
+    { file: 'two-pieces.svg', label: 'Two pieces (SVG)' },
+    { file: 'rect-piece.dxf', label: 'Rectangle (DXF)' },
+    { file: 'curved-hem.dxf', label: 'Curved hem (DXF bulge)' }
+  ];
+
+  async function importSample(file: string) {
+    try {
+      const res = await fetch(`/samples/${file}`);
+      if (!res.ok) throw new Error('not found');
+      const ext = file.split('.').pop()?.toLowerCase();
+      applyImported(parseImport(await res.text(), ext, file.replace(/\.(dxf|svg)$/i, '')));
+    } catch { toastError(`Could not load sample "${file}"`); }
   }
 
   async function handleNew() {
@@ -292,7 +339,16 @@
     <div class="flex items-center gap-1">
       <button class="btn btn-ghost btn-xs" onclick={handleUndo} title="Undo (Ctrl+Z)">&#x21A9;</button>
       <button class="btn btn-ghost btn-xs" onclick={handleRedo} title="Redo (Ctrl+Shift+Z)">&#x21AA;</button>
-      <button class="btn btn-ghost btn-xs" onclick={handleImport}>Import</button>
+      <div class="dropdown dropdown-end">
+        <div role="button" tabindex="0" class="btn btn-ghost btn-xs">Import</div>
+        <ul class="dropdown-content menu bg-base-200 rounded-box z-50 w-52 p-2 shadow text-sm">
+          <li><button onclick={handleImport}>From file… (JSON/DXF/SVG)</button></li>
+          <li class="menu-title pt-2">Samples</li>
+          {#each importSamples as s}
+            <li><button onclick={() => importSample(s.file)}>{s.label}</button></li>
+          {/each}
+        </ul>
+      </div>
       <div class="dropdown dropdown-end">
         <div role="button" tabindex="0" class="btn btn-ghost btn-xs">Export</div>
         <ul class="dropdown-content menu bg-base-200 rounded-box z-50 w-44 p-2 shadow text-sm">
@@ -340,11 +396,11 @@
     <div class="flex-1 flex overflow-hidden">
       {#if viewMode === 'both'}
         <div class="w-1/2 border-r relative"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
-        <div class="w-1/2 relative"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} {labelDisplay} /></div>
+        <div class="w-1/2 relative"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
       {:else if viewMode === '2d'}
         <div class="flex-1 relative"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
       {:else}
-        <div class="flex-1 relative"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} {labelDisplay} /></div>
+        <div class="flex-1 relative"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
       {/if}
     </div>
 

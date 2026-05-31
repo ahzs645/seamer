@@ -5,6 +5,7 @@
     indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines,
     pathPolyline, type Vec2
   } from '$lib/utils/patternGeometry';
+  import { hasConstraints, solveForSize } from '$lib/solver/solve';
 
   let { currentPattern, onclose }: { currentPattern: Pattern; onclose: () => void } = $props();
 
@@ -32,30 +33,46 @@
     c.clearRect(0, 0, W, H);
     c.fillStyle = '#ffffff'; c.fillRect(0, 0, W, H);
 
-    const paths = indexPaths(currentPattern);
-    const points = indexPoints(currentPattern);
-
-    // per-piece base geometry + its origin (grading scales about the origin)
+    // TRUE grading when points are formula-constrained: re-solve geometry per size from variable
+    // overrides. Otherwise fall back to a proportional grade (scale about each piece's origin).
+    const solverMode = hasConstraints(currentPattern);
     type Shape = { outline: Vec2[]; internals: Vec2[][]; origin: Vec2 };
-    const shapes: Shape[] = [];
-    for (const piece of currentPattern.pieces) {
-      const outline = pieceWorldOutline(currentPattern, piece, paths, points, 3);
-      const internals = pieceWorldInternalPolylines(currentPattern, piece, paths, points, 3);
-      if (outline.length >= 2) shapes.push({ outline, internals, origin: pieceOrigin(piece) });
-    }
-    const draftPolys = showDraft ? currentPattern.paths.map((p) => pathPolyline(p, points, 3)) : [];
 
-    // graded transform for a piece at a given size: scale about origin, optionally re-centre on it
-    const grade = (p: Vec2, origin: Vec2, scale: number): Vec2 => {
-      const x = origin.x + (p.x - origin.x) * scale;
-      const y = origin.y + (p.y - origin.y) * scale;
-      return alignByOrigin ? { x: x - origin.x, y: y - origin.y } : { x, y };
+    /** Build placed shapes for a given pattern variant, optionally proportionally graded by `scale`. */
+    const buildShapes = (variant: Pattern, scale: number): Shape[] => {
+      const paths = indexPaths(variant);
+      const points = indexPoints(variant);
+      const out: Shape[] = [];
+      for (const piece of variant.pieces) {
+        const origin = pieceOrigin(piece);
+        const grade = (p: Vec2): Vec2 => {
+          const x = origin.x + (p.x - origin.x) * scale, y = origin.y + (p.y - origin.y) * scale;
+          return alignByOrigin ? { x: x - origin.x, y: y - origin.y } : { x, y };
+        };
+        let outline = pieceWorldOutline(variant, piece, paths, points, 3);
+        let internals = pieceWorldInternalPolylines(variant, piece, paths, points, 3);
+        if (scale !== 1 || alignByOrigin) { outline = outline.map(grade); internals = internals.map((poly) => poly.map(grade)); }
+        if (outline.length >= 2) out.push({ outline, internals, origin });
+      }
+      return out;
     };
 
-    // fit everything (all sizes) to the canvas
+    // per-size variable overrides: explicit values, else scale every editable variable by the grade
+    const sizeOverrides = (sz: { scale: number; values?: Record<string, number> }): Record<string, number> =>
+      sz.values ?? Object.fromEntries(currentPattern.variables.filter((v) => v.isEditable).map((v) => [v.id, (v.value ?? 0) * sz.scale]));
+
+    // shapes for each size layer
+    const layerShapes = sizeLayers.map((sz) =>
+      solverMode
+        ? buildShapes(sz.id === 'base' ? currentPattern : solveForSize(currentPattern, sizeOverrides(sz)), 1)
+        : buildShapes(currentPattern, sz.scale)
+    );
+    const draftPolys = showDraft ? currentPattern.paths.map((p) => pathPolyline(p, indexPoints(currentPattern), 3)) : [];
+
+    // fit everything to the canvas
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     const acc = (p: Vec2) => { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); };
-    if (showPieces) for (const sh of shapes) for (const sz of sizeLayers) for (const p of sh.outline) acc(grade(p, sh.origin, sz.scale));
+    if (showPieces) for (const shapes of layerShapes) for (const sh of shapes) sh.outline.forEach(acc);
     for (const poly of draftPolys) poly.forEach(acc);
     if (!isFinite(minX)) { minX = minY = 0; maxX = maxY = 100; }
     const pad = 30;
@@ -63,10 +80,10 @@
     const ox = (W - (maxX - minX) * s) / 2, oy = (H - (maxY - minY) * s) / 2;
     const T = (p: Vec2) => ({ x: ox + (p.x - minX) * s, y: H - (oy + (p.y - minY) * s) }); // flip y
 
-    const trace = (poly: Vec2[], close: boolean, map: (p: Vec2) => Vec2 = (p) => p) => {
+    const trace = (poly: Vec2[], close: boolean) => {
       if (poly.length < 2) return;
-      c.beginPath(); const a = T(map(poly[0])); c.moveTo(a.x, a.y);
-      for (let i = 1; i < poly.length; i++) { const q = T(map(poly[i])); c.lineTo(q.x, q.y); }
+      c.beginPath(); const a = T(poly[0]); c.moveTo(a.x, a.y);
+      for (let i = 1; i < poly.length; i++) { const q = T(poly[i]); c.lineTo(q.x, q.y); }
       if (close) c.closePath();
     };
 
@@ -76,15 +93,15 @@
       c.setLineDash([]);
     }
     if (showPieces) {
-      for (const sz of sizeLayers) {
+      sizeLayers.forEach((sz, li) => {
         c.strokeStyle = sz.color; c.lineWidth = sz.id === 'base' ? 1.75 : 1.25;
-        for (const sh of shapes) {
-          trace(sh.outline, true, (p) => grade(p, sh.origin, sz.scale)); c.stroke();
+        for (const sh of layerShapes[li]) {
+          trace(sh.outline, true); c.stroke();
           c.save(); c.strokeStyle = sz.color + '88'; c.setLineDash([4, 3]);
-          for (const ip of sh.internals) { trace(ip, false, (p) => grade(p, sh.origin, sz.scale)); c.stroke(); }
+          for (const ip of sh.internals) { trace(ip, false); c.stroke(); }
           c.restore();
         }
-      }
+      });
     }
   }
 
