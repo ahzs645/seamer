@@ -72,7 +72,7 @@
         if (loaded) { currentPattern = loaded; patternName = loaded.name; pushUndo(structuredClone(loaded)); }
         pattern.set(currentPattern);
       } else {
-        await loadTemplate('simple-pants'); // auto-load a garment to drape
+        await loadTemplate('tshirt-basic'); // TEMP
       }
     })();
 
@@ -211,7 +211,7 @@
       let data: Pattern = isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
       data.id = crypto.randomUUID(); data.versionId = crypto.randomUUID(); data.isPublic = false;
       // recover parametric constructions from the baked template (no-op if already constrained / not recoverable)
-      data = makeParametric(data);
+      // data = makeParametric(data); // TEMP-DISABLED
       currentPattern = data; patternName = tpl.name || data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
     } catch {
       currentPattern = { ...EMPTY_PATTERN, name: tpl.name, description: tpl.description, enable3d: true, viewMode: 'both' };

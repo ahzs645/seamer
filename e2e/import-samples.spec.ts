@@ -13,8 +13,8 @@ async function openStudio(page: Page) {
 }
 
 async function importSample(page: Page, label: string) {
-	// open the Import dropdown (the header trigger labelled "Import")
-	await page.getByRole('button', { name: 'Import', exact: true }).click();
+	// open the Import dropdown (the header trigger is a div[role=button] with exact text "Import")
+	await page.locator('div[role="button"]', { hasText: /^Import$/ }).click();
 	await page.getByRole('button', { name: label }).click();
 }
 
@@ -39,7 +39,7 @@ test.describe('Import samples', () => {
 			// success toast confirms the import path ran end-to-end
 			await expect(page.getByText(`Imported "${s.name}"`)).toBeVisible();
 			// the pattern-name field reflects the imported file name
-			await expect(page.getByplaceholder('Pattern name...')).toHaveValue(s.name);
+			await expect(page.getByPlaceholder('Pattern name...')).toHaveValue(s.name);
 			// a canvas exists and has non-zero size (2D view rendered)
 			const canvas = page.locator('canvas').first();
 			await expect(canvas).toBeVisible();
@@ -55,7 +55,8 @@ test.describe('Import samples', () => {
 
 		// open the Object browser via its toolbar toggle (title="Toggle object browser")
 		await page.locator('button[title="Toggle object browser"]').click();
-		await expect(page.getByText('Object browser')).toBeVisible();
+		// the panel's bold heading (distinct from the toggle button's title)
+		await expect(page.locator('span.font-bold', { hasText: 'Object browser' })).toBeVisible();
 		// the Pieces group header should report 2 pieces
 		await expect(page.getByText(/^Pieces \(2\)$/)).toBeVisible();
 	});

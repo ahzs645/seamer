@@ -14,9 +14,9 @@ export interface Formula {
  * Formula strings are evaluated in mm/degrees.
  */
 export type PointConstraint =
-  | { type: 'offset'; from: string; dxFormula: string; dyFormula: string }
-  | { type: 'lengthAngle'; from: string; lengthFormula: string; angleFormula: string }
-  | { type: 'sliding'; path: string; positionFormula: string };
+  | { type: 'offset'; from: string; dxFormula: string; dyFormula: string; unit?: string }
+  | { type: 'lengthAngle'; from: string; lengthFormula: string; angleFormula: string; lengthUnit?: string; angleUnit?: string }
+  | { type: 'sliding'; path: string; positionFormula: string; from?: string; unit?: string };
 
 export interface ConstrainablePoint {
   id: string;

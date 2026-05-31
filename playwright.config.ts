@@ -3,6 +3,7 @@ import { defineConfig, devices } from '@playwright/test';
 // E2E config: boots the dev server, runs Chromium against the studio.
 export default defineConfig({
 	testDir: './e2e',
+	testMatch: '**/*.spec.ts',
 	timeout: 60_000,
 	expect: { timeout: 15_000 },
 	fullyParallel: false,

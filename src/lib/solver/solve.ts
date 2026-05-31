@@ -14,7 +14,7 @@ export type Scope = Record<string, number>;
  */
 export function resolveVariables(pattern: Pattern, overrides: Record<string, number> = {}): Scope {
   const scope: Scope = {};
-  for (const [name, value] of Object.entries(pattern.body.fields)) scope[name] = value;
+  for (const [name, value] of Object.entries(pattern.body?.fields ?? {})) scope[name] = value as number;
   const bind = (v: Pattern['variables'][number], val: number) => { scope[v.id] = val; if (v.name) scope[v.name] = val; };
 
   const resolved = new Set<string>();
@@ -53,6 +53,91 @@ function pointAlong(anchors: Pt[], dist: number): Pt {
   return { ...anchors[anchors.length - 1] };
 }
 
+const UNIT_MM: Record<string, number> = { cm: 10, mm: 1, inch: 25.4, in: 25.4 };
+const unitToMm = (u?: string) => UNIT_MM[u ?? ''] ?? 1;
+
+function cubicAt(a: Pt, c1: Pt, c2: Pt, b: Pt, t: number): Pt {
+  const mt = 1 - t, w0 = mt * mt * mt, w1 = 3 * mt * mt * t, w2 = 3 * mt * t * t, w3 = t * t * t;
+  return { x: w0 * a.x + w1 * c1.x + w2 * c2.x + w3 * b.x, y: w0 * a.y + w1 * c1.y + w2 * c2.y + w3 * b.y };
+}
+
+/** Geometric length (mm) of a path from its currently-solved anchors (cubic when handles exist). */
+function pathLengthMm(path: ConstrainablePath, solved: Map<string, Pt>): number | null {
+  const seq = path.pathPoints.map((pp) => ({ p: solved.get(pp.id), h: pp.handle }));
+  if (seq.some((s) => !s.p)) return null;
+  let L = 0;
+  for (let i = 1; i < seq.length; i++) {
+    const a = seq[i - 1].p!, b = seq[i].p!;
+    const out = seq[i - 1].h?.v2, inc = seq[i].h?.v1;
+    if (out || inc) {
+      const c1 = out ? { x: a.x + out.x, y: a.y + out.y } : a;
+      const c2 = inc ? { x: b.x + inc.x, y: b.y + inc.y } : b;
+      let prev = a;
+      for (let s = 1; s <= 16; s++) { const q = cubicAt(a, c1, c2, b, s / 16); L += Math.hypot(q.x - prev.x, q.y - prev.y); prev = q; }
+    } else L += Math.hypot(b.x - a.x, b.y - a.y);
+  }
+  return L;
+}
+
+/** Replace `PathId.length` tokens with the path's length expressed in `unit`. null if unresolvable yet. */
+function subLengths(formula: string, unit: string, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): string | null {
+  if (!/\.length/.test(formula)) return formula;
+  let ok = true;
+  const r = formula.replace(/([A-Za-z_$][\w$]*)\.length/g, (_m, id) => {
+    const path = pathById.get(id);
+    const L = path ? pathLengthMm(path, solved) : null;
+    if (L === null) { ok = false; return '0'; }
+    return String(L / unitToMm(unit));
+  });
+  return ok ? r : null;
+}
+
+function evalLen(formula: string, unit: string, scope: Scope, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): number | null {
+  const sub = subLengths(formula, unit, solved, pathById);
+  if (sub === null) return null;
+  const r = evalExpr(sub, scope);
+  return r === null ? null : r * unitToMm(unit);
+}
+function evalAngleDeg(formula: string, unit: string | undefined, scope: Scope, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): number | null {
+  const sub = subLengths(formula, 'mm', solved, pathById); // any path-length ref in an angle stays in mm
+  if (sub === null) return null;
+  const r = evalExpr(sub, scope);
+  return r === null ? null : r * (unit === 'radians' ? 180 / Math.PI : 1);
+}
+
+/** Compute a constrained point's position, or null if its dependencies aren't solved yet. */
+function constraintPos(cn: NonNullable<ConstrainablePoint['constraint']>, scope: Scope, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): Pt | null {
+  if (cn.type === 'offset') {
+    const a = solved.get(cn.from); if (!a) return null;
+    const dx = evalLen(cn.dxFormula, cn.unit ?? 'mm', scope, solved, pathById);
+    const dy = evalLen(cn.dyFormula, cn.unit ?? 'mm', scope, solved, pathById);
+    return dx === null || dy === null ? null : { x: a.x + dx, y: a.y + dy };
+  }
+  if (cn.type === 'lengthAngle') {
+    const a = solved.get(cn.from); if (!a) return null;
+    const len = evalLen(cn.lengthFormula, cn.lengthUnit ?? 'mm', scope, solved, pathById);
+    const ang = evalAngleDeg(cn.angleFormula, cn.angleUnit ?? 'degrees', scope, solved, pathById);
+    if (len === null || ang === null) return null;
+    const r = (ang * Math.PI) / 180;
+    return { x: a.x + len * Math.cos(r), y: a.y + len * Math.sin(r) };
+  }
+  // sliding: a distance (from an anchor) along a path's polyline
+  const path = pathById.get(cn.path); if (!path) return null;
+  const anchors = path.pathPoints.map((pp) => solved.get(pp.id));
+  if (anchors.some((a) => !a)) return null;
+  const dist = evalLen(cn.positionFormula, cn.unit ?? 'mm', scope, solved, pathById);
+  if (dist === null) return null;
+  let base = 0;
+  if (cn.from) {
+    let cum = 0;
+    for (let i = 1; i < path.pathPoints.length; i++) {
+      if (path.pathPoints[i - 1].id === cn.from) { base = cum; break; }
+      cum += Math.hypot((anchors[i]! as Pt).x - (anchors[i - 1]! as Pt).x, (anchors[i]! as Pt).y - (anchors[i - 1]! as Pt).y);
+    }
+  }
+  return pointAlong(anchors as Pt[], base + dist);
+}
+
 /** Solve every point's position given a variable scope. Fixed points keep x/y; constrained points compute. */
 export function solvePoints(pattern: Pattern, scope: Scope): Map<string, Pt> {
   const out = new Map<string, Pt>();
@@ -60,34 +145,13 @@ export function solvePoints(pattern: Pattern, scope: Scope): Map<string, Pt> {
   const pathById = new Map(pattern.paths.map((pa) => [pa.id, pa]));
 
   let changed = true;
-  let guard = pattern.points.length + 4;
+  let guard = pattern.points.length + 6;
   while (changed && guard-- > 0) {
     changed = false;
     for (const p of pattern.points) {
       if (out.has(p.id) || !p.constraint) continue;
-      const cn = p.constraint;
-      if (cn.type === 'offset' || cn.type === 'lengthAngle') {
-        const a = out.get(cn.from);
-        if (!a) continue;
-        if (cn.type === 'offset') {
-          const dx = evalExpr(cn.dxFormula, scope), dy = evalExpr(cn.dyFormula, scope);
-          if (dx === null || dy === null) continue;
-          out.set(p.id, { x: a.x + dx, y: a.y + dy }); changed = true;
-        } else {
-          const len = evalExpr(cn.lengthFormula, scope), ang = evalExpr(cn.angleFormula, scope);
-          if (len === null || ang === null) continue;
-          const r = (ang * Math.PI) / 180;
-          out.set(p.id, { x: a.x + len * Math.cos(r), y: a.y + len * Math.sin(r) }); changed = true;
-        }
-      } else if (cn.type === 'sliding') {
-        const path = pathById.get(cn.path);
-        if (!path) continue;
-        const anchors = path.pathPoints.map((pp) => out.get(pp.id));
-        if (anchors.some((a) => !a)) continue;
-        const dist = evalExpr(cn.positionFormula, scope);
-        if (dist === null) continue;
-        out.set(p.id, pointAlong(anchors as Pt[], dist)); changed = true;
-      }
+      const pos = constraintPos(p.constraint, scope, out, pathById);
+      if (pos) { out.set(p.id, pos); changed = true; }
     }
   }
   // unresolved constrained points (cycles / missing deps) → keep their last baked position
@@ -121,67 +185,60 @@ export function solveForSize(pattern: Pattern, overrides: Record<string, number>
   return applySolved(pattern, resolveVariables(pattern, overrides));
 }
 
-const UNIT_MM: Record<string, number> = { cm: 10, mm: 1, inch: 25.4, in: 25.4 };
-const unitToMm = (u?: string) => UNIT_MM[u ?? ''] ?? 1;
+type Constraint = NonNullable<ConstrainablePoint['constraint']>;
 
 /**
  * Recover parametric constructions from a template whose points are baked. The original app stores
- * construction on PATHS (a `line` path with `basePoint` + length/angle formulas positions its other
- * endpoint by polar). The construction *order* is lost, so we disambiguate each point's constructor
- * by which formula reproduces its baked position (within tol). Recovered points get a `lengthAngle`
- * constraint (formulas normalised to mm/degrees) so they re-draft from variables; everything else is
- * left untouched. Never moves geometry at base values — only enables parametric editing/grading.
+ * construction on PATHS — a line/curve path with `basePoint` + length/angle formulas positions its
+ * other endpoint by polar; a path's `slidingPoints` position points along it; formulas may reference
+ * `OtherPath.length` and variables (by id), in cm/inch/etc. The construction *order* is lost, so we
+ * disambiguate each point's constructor by which candidate reproduces its baked position (within tol),
+ * resolving path-length references iteratively. Recovered points get a constraint (units preserved) so
+ * they re-draft from variables. Never moves geometry at base values — only enables parametric editing.
  */
-export function makeParametric(pattern: Pattern, tolMm = 2): Pattern {
+export function makeParametric(pattern: Pattern, tolMm = 1): Pattern {
+  if (!pattern.points?.length || !pattern.paths?.length) return pattern;
   if (pattern.points.some((p) => p.constraint)) return pattern; // already parametric / authored
   const scope = resolveVariables(pattern);
   const baked = new Map(pattern.points.map((p) => [p.id, { x: p.x, y: p.y }]));
+  const pathById = new Map(pattern.paths.map((pa) => [pa.id, pa]));
 
-  // candidate constructors per point: line paths (no `.length` deps, to stay solver-supportable)
-  const cand = new Map<string, ConstrainablePath[]>();
+  // candidate constructions per point (length+angle from line/curve paths; sliding from slidingPoints)
+  const cand = new Map<string, Constraint[]>();
+  const add = (pid: string, c: Constraint) => { if (baked.has(pid)) (cand.get(pid) ?? cand.set(pid, []).get(pid)!).push(c); };
   for (const pa of pattern.paths) {
-    if (pa.pathType !== 'line' || !pa.basePoint || pa.pathPoints.length !== 2 || !pa.lengthFormula?.formula) continue;
-    if (/\.length/.test(pa.lengthFormula.formula) || /\.length/.test(pa.angleFormula?.formula ?? '')) continue;
-    const other = pa.pathPoints.find((q) => q.id !== pa.basePoint);
-    if (!other) continue;
-    (cand.get(other.id) ?? cand.set(other.id, []).get(other.id)!).push(pa);
+    if ((pa.pathType === 'line' || pa.pathType === 'curve') && pa.basePoint && pa.pathPoints.length === 2 && pa.lengthFormula?.formula) {
+      const other = pa.pathPoints.find((q) => q.id !== pa.basePoint);
+      if (other) add(other.id, { type: 'lengthAngle', from: pa.basePoint, lengthFormula: pa.lengthFormula.formula, angleFormula: pa.angleFormula?.formula ?? '0', lengthUnit: pa.lengthFormula.unit, angleUnit: pa.angleFormula?.unit ?? 'degrees' });
+    }
+    for (const sp of pa.slidingPoints ?? []) {
+      if (sp.positionFormula?.formula) add(sp.id, { type: 'sliding', path: pa.id, from: sp.positionFrom, positionFormula: sp.positionFormula.formula, unit: sp.positionFormula.unit });
+    }
   }
   if (cand.size === 0) return pattern;
 
-  const norm = (f: string, factor: number) => (factor === 1 ? `(${f})` : `(${f})*${factor}`);
-  const sol = new Map<string, { x: number; y: number }>();
-  const chosen = new Map<string, ConstrainablePath>();
+  // iterative disambiguation: solve points whose deps are ready, choosing the candidate matching baked
+  const sol = new Map<string, Pt>();
+  const chosen = new Map<string, Constraint>();
   for (const p of pattern.points) if (!cand.has(p.id)) sol.set(p.id, baked.get(p.id)!);
 
   let changed = true, guard = pattern.points.length + 8;
   while (changed && guard-- > 0) {
     changed = false;
-    for (const [pid, paths] of cand) {
+    for (const [pid, cands] of cand) {
       if (sol.has(pid)) continue;
-      let best: { x: number; y: number } | null = null, bestErr = tolMm, bestPa: ConstrainablePath | null = null;
-      for (const pa of paths) {
-        const base = sol.get(pa.basePoint!);
-        if (!base) continue;
-        const lraw = evalExpr(pa.lengthFormula!.formula, scope);
-        const araw = pa.angleFormula ? evalExpr(pa.angleFormula.formula, scope) : 0;
-        if (lraw === null || araw === null) continue;
-        const L = lraw * unitToMm(pa.lengthFormula!.unit);
-        const ang = (araw * (pa.angleFormula?.unit === 'radians' ? 180 / Math.PI : 1) * Math.PI) / 180;
-        const pos = { x: base.x + L * Math.cos(ang), y: base.y + L * Math.sin(ang) };
+      let best: Pt | null = null, bestErr = tolMm, bestC: Constraint | null = null;
+      for (const c of cands) {
+        const pos = constraintPos(c, scope, sol, pathById);
+        if (!pos) continue;
         const err = Math.hypot(pos.x - baked.get(pid)!.x, pos.y - baked.get(pid)!.y);
-        if (err < bestErr) { bestErr = err; best = pos; bestPa = pa; }
+        if (err < bestErr) { bestErr = err; best = pos; bestC = c; }
       }
-      if (best && bestPa) { sol.set(pid, best); chosen.set(pid, bestPa); changed = true; }
+      if (best && bestC) { sol.set(pid, best); chosen.set(pid, bestC); changed = true; }
     }
   }
   if (chosen.size === 0) return pattern;
 
-  const points = pattern.points.map((p) => {
-    const pa = chosen.get(p.id);
-    if (!pa) return p;
-    const lf = norm(pa.lengthFormula!.formula, unitToMm(pa.lengthFormula!.unit));
-    const af = norm(pa.angleFormula?.formula ?? '0', pa.angleFormula?.unit === 'radians' ? 180 / Math.PI : 1);
-    return { ...p, constraint: { type: 'lengthAngle' as const, from: pa.basePoint!, lengthFormula: lf, angleFormula: af } };
-  });
+  const points = pattern.points.map((p) => (chosen.has(p.id) ? { ...p, constraint: chosen.get(p.id) } : p));
   return { ...pattern, points };
 }

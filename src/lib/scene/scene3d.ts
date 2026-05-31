@@ -7,6 +7,11 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
 import { OBJExporter } from 'three/examples/jsm/exporters/OBJExporter.js';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import type { Pattern, Material } from '$lib/types/pattern';
 import { AvatarController } from '$lib/model/avatarController';
 import { buildCylinders, type CylinderFrame } from '$lib/geometry/cylinders';
@@ -14,6 +19,7 @@ import { prepareCloth, ClothSimulation, type PreparedCloth } from '$lib/sim/simu
 import { cylinderRefit } from '$lib/sim/cylinderRefit';
 import { requestClothDevice, isWebGPUAvailable } from '$lib/sim/webgpu/device';
 import { createGarmentMaterial, createAvatarMaterial, hasSeparateBack } from './materials';
+import { isDarkTheme, onThemeChange } from '$lib/utils/theme';
 
 export type RendererStatus = 'idle' | 'loading' | 'ready' | 'simulating' | 'error';
 
@@ -47,11 +53,20 @@ export class PatternRenderer {
   private renderer: THREE.WebGLRenderer;
   private controls: OrbitControls;
   private clothGroup = new THREE.Group();
+  private floor: THREE.Mesh | null = null;
+  private grid: THREE.GridHelper | null = null;
+  private themeUnsub: () => void = () => {};
   private lightRig: THREE.Object3D[] = [];
   private lightRigBase: number[] = []; // base intensities, scaled down when an HDRI env is active
   private pmrem: THREE.PMREMGenerator | null = null;
   private envCache = new Map<string, THREE.Texture>();
   private lightingMode = 'flat';
+  // Post-processing: ground-truth ambient occlusion (soft contact darkening in folds/seams/leg-gap and
+  // where the garment meets the body) + SMAA edge AA, matching the source's polished look. Guarded —
+  // if the composer fails to build, we fall back to direct rendering.
+  private composer: EffectComposer | null = null;
+  private gtaoPass: GTAOPass | null = null;
+  private postEnabled = true;
 
   private avatar: AvatarController | null = null;
   private cylinders: Map<string, CylinderFrame> = new Map();
@@ -170,9 +185,39 @@ export class PatternRenderer {
     this.setupLights();
     this.setupFloor();
     this.setupGrab();
+    this.setupComposer(w, h);
+    this.applySceneTheme(isDarkTheme());
+    this.themeUnsub = onThemeChange(() => this.applySceneTheme(isDarkTheme()));
 
     this.renderLoop();
     window.addEventListener('resize', this.onResize);
+  }
+
+  // Build the post-processing chain: RenderPass -> GTAO (ambient occlusion) -> SMAA (edge AA) ->
+  // OutputPass (tone map + sRGB). Fully guarded: any failure leaves composer null -> direct render.
+  private setupComposer(w: number, h: number) {
+    try {
+      const composer = new EffectComposer(this.renderer);
+      composer.addPass(new RenderPass(this.scene, this.camera));
+      const gtao = new GTAOPass(this.scene, this.camera, w, h);
+      gtao.output = GTAOPass.OUTPUT.Default; // beauty × AO
+      gtao.blendIntensity = 0.9;
+      // World-space radii tuned for human/garment scale (metres): subtle contact darkening.
+      gtao.updateGtaoMaterial({ radius: 0.12, distanceExponent: 1.0, thickness: 0.1, scale: 1.0, samples: 16 });
+      composer.addPass(gtao);
+      composer.addPass(new SMAAPass(w, h));
+      composer.addPass(new OutputPass());
+      this.composer = composer;
+      this.gtaoPass = gtao;
+    } catch (e) {
+      this.composer = null; this.gtaoPass = null;
+      console.warn('Post-processing unavailable, using direct render:', e);
+    }
+  }
+
+  /** Toggle GTAO/SMAA post-processing (falls back to direct render when off). */
+  setPostProcessing(on: boolean) {
+    this.postEnabled = on;
   }
 
   private setupLights() {
@@ -231,18 +276,32 @@ export class PatternRenderer {
   }
 
   private setupFloor() {
-    const floor = new THREE.Mesh(
+    this.floor = new THREE.Mesh(
       new THREE.PlaneGeometry(20, 20),
       new THREE.MeshStandardMaterial({ color: '#c8ccd2', roughness: 0.9, metalness: 0, depthWrite: true })
     );
-    floor.rotation.x = -Math.PI / 2;
-    floor.receiveShadow = true;
-    this.scene.add(floor);
-    const grid = new THREE.GridHelper(8, 32, 0xb0b4ba, 0xc4c8ce);
-    grid.position.y = 0.002;
-    (grid.material as THREE.Material).opacity = 0.4;
-    (grid.material as THREE.Material).transparent = true;
-    this.scene.add(grid);
+    this.floor.rotation.x = -Math.PI / 2;
+    this.floor.receiveShadow = true;
+    this.scene.add(this.floor);
+    this.grid = new THREE.GridHelper(8, 32, 0xb0b4ba, 0xc4c8ce);
+    this.grid.position.y = 0.002;
+    (this.grid.material as THREE.Material).opacity = 0.4;
+    (this.grid.material as THREE.Material).transparent = true;
+    this.scene.add(this.grid);
+  }
+
+  // Light/dark theme for the 3D canvas: scene background + floor + grid. HDRI modes set
+  // scene.environment (lighting) but leave background = the theme colour, so dark mode reads as a
+  // dark studio. Driven by the app's data-theme (see utils/theme).
+  private applySceneTheme(dark: boolean) {
+    const bg = dark ? '#171b21' : '#dfe3e8';
+    (this.scene.background as THREE.Color)?.set?.(bg) ?? (this.scene.background = new THREE.Color(bg));
+    if (this.floor) (this.floor.material as THREE.MeshStandardMaterial).color.set(dark ? '#1c2128' : '#c8ccd2');
+    if (this.grid) {
+      const g = this.grid as unknown as { material: THREE.LineBasicMaterial[] | THREE.LineBasicMaterial };
+      const mats = Array.isArray(g.material) ? g.material : [g.material];
+      for (const m of mats) m.color.set(dark ? '#39424e' : '#b8bcc2');
+    }
   }
 
   /** Mouse interaction: grab a cloth particle and drag it (pulls the fabric, like the reference). */
@@ -350,13 +409,15 @@ export class PatternRenderer {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    this.composer?.setSize(w, h);
   };
 
   private renderLoop = () => {
     if (this.disposed) return;
     this.rafId = requestAnimationFrame(this.renderLoop);
     this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    if (this.composer && this.postEnabled) this.composer.render();
+    else this.renderer.render(this.scene, this.camera);
   };
 
   /** Build or update the avatar + cloth for a pattern. */
@@ -503,8 +564,12 @@ export class PatternRenderer {
         const n = new THREE.Vector3(nattr.getX(nearest), nattr.getY(nearest), nattr.getZ(nearest));
         if (n.lengthSq() < 1e-9) n.set(0, 0, 1);
         n.normalize();
+        // flip the normal toward the camera so the badge always faces the viewer and reads
+        // upright — otherwise back/side-facing pieces show the plane's reverse (mirrored, upside-down).
+        const px = arr[nearest * 3], py = arr[nearest * 3 + 1], pz = arr[nearest * 3 + 2];
+        if (n.x * (this.camera.position.x - px) + n.y * (this.camera.position.y - py) + n.z * (this.camera.position.z - pz) < 0) n.negate();
         // sit the label on the local surface vertex, lifted 3mm along its normal
-        label.obj.position.set(arr[nearest * 3], arr[nearest * 3 + 1], arr[nearest * 3 + 2]).addScaledVector(n, 0.003);
+        label.obj.position.set(px, py, pz).addScaledVector(n, 0.003);
         const up = Math.abs(n.y) > 0.95 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(0, 1, 0);
         const x = new THREE.Vector3().crossVectors(up, n).normalize();
         const y = new THREE.Vector3().crossVectors(n, x).normalize();
@@ -569,7 +634,7 @@ export class PatternRenderer {
   /** A piece label as either a camera-facing billboard sprite or a flat plane on the fabric. */
   private makeLabel(text: string): { obj: THREE.Object3D; aspect: number } {
     const { tex, aspect } = this.makeLabelTexture(text);
-    const H = 0.05; // world height of the label (meters)
+    const H = 0.035; // world height of the label (meters) — kept subtle, like the source
     if (this.labelMode === 'flat') {
       const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
       const mesh = new THREE.Mesh(new THREE.PlaneGeometry(H * aspect, H), mat);
@@ -948,6 +1013,7 @@ export class PatternRenderer {
     for (const t of this.envCache.values()) t.dispose();
     this.envCache.clear();
     this.pmrem?.dispose();
+    try { this.composer?.dispose(); } catch { /* ignore */ }
     this.renderer.dispose();
     if (this.renderer.domElement.parentElement === this.container) {
       this.container.removeChild(this.renderer.domElement);
