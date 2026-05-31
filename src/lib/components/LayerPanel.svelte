@@ -48,12 +48,21 @@
   }
 
   function deleteLayer(layerId: string) {
-    if (currentPattern.layers.length <= 1) return;
+    if (currentPattern.layers.length <= 1 || layerId === 'default') return; // default layer cannot be deleted
     const layers = currentPattern.layers.filter(l => l.id !== layerId);
-    const newCurrentId = currentPattern.currentLayerId === layerId
-      ? layers[0]?.id || 'default'
-      : currentPattern.currentLayerId;
-    onchange({ ...currentPattern, layers, currentLayerId: newCurrentId, hasChanged: true });
+    const fallback = layers.find(l => l.id === 'default')?.id ?? layers[0]?.id ?? 'default';
+    const newCurrentId = currentPattern.currentLayerId === layerId ? fallback : currentPattern.currentLayerId;
+    // move the deleted layer's elements onto the fallback layer
+    const reassign = <T extends { layerId?: string }>(arr: T[]): T[] => arr.map(e => (e.layerId === layerId ? { ...e, layerId: fallback } : e));
+    onchange({
+      ...currentPattern,
+      layers,
+      currentLayerId: newCurrentId,
+      points: reassign(currentPattern.points),
+      paths: reassign(currentPattern.paths),
+      pieces: reassign(currentPattern.pieces),
+      hasChanged: true
+    });
   }
 </script>
 

@@ -1,6 +1,7 @@
 <script lang="ts">
-  import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath } from '$lib/types/pattern';
+  import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize } from '$lib/types/pattern';
   import { selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
+  import FormulaDialog from '$lib/components/FormulaDialog.svelte';
 
   interface Props {
     currentPattern: Pattern;
@@ -8,9 +9,10 @@
     onclose?: () => void;
     labelDisplay?: 'off' | 'billboard' | 'flat';
     onlabeldisplaychange?: (v: 'off' | 'billboard' | 'flat') => void;
+    ongrading?: () => void;
   }
 
-  let { currentPattern, onchange, onclose, labelDisplay = 'flat', onlabeldisplaychange }: Props = $props();
+  let { currentPattern, onchange, onclose, labelDisplay = 'flat', onlabeldisplaychange, ongrading }: Props = $props();
 
   const editingPoint = $derived<ConstrainablePoint | null>(
     $selectedPointIds.size === 1 ? currentPattern.points.find((p) => p.id === [...$selectedPointIds][0]) ?? null : null
@@ -127,8 +129,28 @@
   const unitLabel = $derived(lenUnit === 'inch' ? 'in' : lenUnit);
 
   let selectedVariableId = $state<string | null>(null);
+  let formulaVarId = $state<string | null>(null);
+  // scope offered to the formula editor: other variables + body measurements
+  const formulaScope = $derived([
+    ...currentPattern.variables.filter((v) => v.id !== formulaVarId).map((v) => ({ name: v.name, value: v.value ?? 0 })),
+    ...Object.entries(currentPattern.body.fields).map(([name, value]) => ({ name, value }))
+  ]);
   const selectedVariable = $derived(currentPattern.variables.find((v) => v.id === selectedVariableId) ?? null);
   const VAR_TYPE_ICON: Record<string, string> = { number: 'tag', boolean: 'check', enum: 'list', string: 'text_fields', length: 'straighten', angle: 'rotate_right' };
+
+  // ---- graded sizes ---------------------------------------------------------
+  const SIZE_COLORS = ['#c91d1d', '#1d4ed8', '#15803d', '#a21caf', '#ea580c', '#0891b2'];
+  const sizes = $derived(currentPattern.gradingProfile?.sizes ?? []);
+  function setSizes(next: Pattern['gradingProfile']) { updatePattern({ gradingProfile: next }); }
+  function addSize() {
+    const list = sizes;
+    const size = { id: uid('size'), name: `Size ${list.length + 1}`, scale: 1 + list.length * 0.05, color: SIZE_COLORS[list.length % SIZE_COLORS.length] };
+    setSizes({ sizes: [...list, size] });
+  }
+  function updateSize(id: string, partial: Partial<GradeSize>) {
+    setSizes({ sizes: sizes.map((s) => (s.id === id ? { ...s, ...partial } : s)) });
+  }
+  function removeSize(id: string) { setSizes({ sizes: sizes.filter((s) => s.id !== id) }); }
 
   function addVariable() {
     const v = { id: uid('var'), name: 'unnamed', description: '', type: 'number', value: 0, valueFormula: { formula: '0', unit: 'none' }, isEditable: true, isVisible: true, options: [], unitType: 'length' };
@@ -381,10 +403,24 @@
               <h6 class="border-b-2 border-base-200 font-semibold pb-1">Sizes</h6>
               <div class="flex items-center gap-2">
                 <select class="select select-bordered select-xs flex-1" value={currentPattern.currentSize} onchange={(e) => updatePattern({ currentSize: e.currentTarget.value })}>
-                  <option value="">Custom</option>
+                  <option value="">Custom (base)</option>
+                  {#each sizes as sz}<option value={sz.name}>{sz.name}</option>{/each}
                 </select>
-                <button class="btn btn-xs btn-primary" onclick={addVariable}>Create a size…</button>
+                <button class="btn btn-xs btn-primary" onclick={addSize}>Create a size…</button>
               </div>
+              {#if sizes.length}
+                <div class="flex flex-col gap-1">
+                  {#each sizes as sz}
+                    <div class="flex items-center gap-1">
+                      <span class="inline-block w-3 h-3 rounded-full shrink-0" style="background:{sz.color}"></span>
+                      <input class="input input-bordered input-xs flex-1 min-w-0" value={sz.name} oninput={(e) => updateSize(sz.id, { name: e.currentTarget.value })} />
+                      <input type="number" step="0.01" class="input input-bordered input-xs w-16" title="Grade scale" value={sz.scale} oninput={(e) => updateSize(sz.id, { scale: parseFloat(e.currentTarget.value) || 1 })} />
+                      <button class="btn btn-ghost btn-xs p-1 text-error" title="Remove size" aria-label="Remove size" onclick={() => removeSize(sz.id)}><span class="material-symbols-rounded text-base">delete</span></button>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              {#if ongrading}<button class="btn btn-xs btn-outline w-full" onclick={ongrading}><span class="material-symbols-rounded text-base">table_chart</span> Sizes &amp; grading overlay…</button>{/if}
 
               <!-- Variables -->
               <h6 class="border-b-2 border-base-200 font-semibold pb-1 mt-3">Variables</h6>
@@ -426,7 +462,9 @@
                       <input type="number" class="input input-bordered input-sm flex-1" value={v.value ?? 0} oninput={(e) => updateVariable(v.id, { value: parseFloat(e.currentTarget.value) || 0, valueFormula: { ...v.valueFormula, formula: e.currentTarget.value } })} />
                       <select class="select select-bordered select-sm w-16" value={v.valueFormula?.unit ?? 'none'} onchange={(e) => updateVariable(v.id, { valueFormula: { ...v.valueFormula, unit: e.currentTarget.value } })}>
                         <option value="none">none</option><option value="cm">cm</option><option value="mm">mm</option><option value="inch">in</option><option value="percent">%</option><option value="degrees">°</option></select>
-                    </span></label>
+                      <button class="btn btn-primary btn-sm w-8 h-8 p-1" title="Formula editor" aria-label="Formula editor" onclick={() => (formulaVarId = v.id)}><span class="material-symbols-rounded">function</span></button>
+                    </span>
+                    {#if v.valueFormula?.formula && v.valueFormula.formula !== String(v.value)}<span class="text-xs opacity-60 font-mono">= {v.valueFormula.formula}</span>{/if}</label>
                 </div>
               {/if}
 
@@ -474,3 +512,13 @@
     {/each}
   {/if}
 </div>
+
+{#if formulaVarId}
+  {@const fv = currentPattern.variables.find((v) => v.id === formulaVarId)}
+  <FormulaDialog
+    formula={fv?.valueFormula?.formula ?? String(fv?.value ?? '')}
+    variables={formulaScope}
+    onsave={(f, val) => { if (formulaVarId) updateVariable(formulaVarId, { valueFormula: { ...(fv?.valueFormula ?? { formula: '', unit: 'none' }), formula: f }, value: val ?? fv?.value ?? 0 }); formulaVarId = null; }}
+    oncancel={() => (formulaVarId = null)}
+  />
+{/if}

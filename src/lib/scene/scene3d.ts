@@ -23,6 +23,7 @@ interface ClothMeshEntry {
   count: number;
   geometry: THREE.BufferGeometry;
   mesh: THREE.Mesh;
+  backMesh?: THREE.Mesh; // optional separate back-face mesh (shares geometry); for distinct back textures
 }
 
 // One movable piece in the pre-simulation arrangement editor: its flat-on-body geometry is centred
@@ -121,6 +122,11 @@ export class PatternRenderer {
       if (!m.emissive) continue;
       m.emissive.setHex(e.pieceId === id ? HI : 0x000000);
       m.emissiveIntensity = e.pieceId === id ? 0.45 : 1;
+      if (e.backMesh) {
+        const bm = e.backMesh.material as THREE.MeshPhysicalMaterial;
+        bm.emissive.setHex(e.pieceId === id ? HI : 0x000000);
+        bm.emissiveIntensity = e.pieceId === id ? 0.45 : 1;
+      }
     }
     if (this.mode === 'arrange') {
       const idx = this.arrangeEntries.findIndex((e) => e.pieceId === id);
@@ -428,7 +434,11 @@ export class PatternRenderer {
       geo.setIndex(localIndex);
       const pieceMat = matById.get(piece.materialId);
       const separateBack = hasSeparateBack(pieceMat);
-      const mat = createGarmentMaterial(pieceMat, flat, separateBack ? { side: THREE.FrontSide } : {});
+      // Our cloth triangles wind with their geometric front face pointing INWARD, so the outward
+      // surface the camera sees is the BackSide. For a separate back texture we therefore render the
+      // FACE (front) texture on a BackSide mesh (shows outward) and the back texture on a FrontSide
+      // mesh (shows inward). With a single double-sided material this doesn't matter (both sides same).
+      const mat = createGarmentMaterial(pieceMat, flat, separateBack ? { side: THREE.BackSide } : {});
       mat.wireframe = this.showTriangles;
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
@@ -439,16 +449,17 @@ export class PatternRenderer {
       mesh.visible = !hidden;
       this.clothGroup.add(mesh);
       // separate back side: a second mesh on the same (deforming) geometry, back faces only
+      let backMesh: THREE.Mesh | undefined;
       if (separateBack) {
-        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.BackSide, back: true });
+        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true });
         backMat.wireframe = this.showTriangles;
-        const backMesh = new THREE.Mesh(geo, backMat);
+        backMesh = new THREE.Mesh(geo, backMat);
         backMesh.castShadow = true; backMesh.receiveShadow = true; backMesh.frustumCulled = false;
         backMesh.visible = !hidden;
         this.clothGroup.add(backMesh);
         this.clothBackMeshes.push(backMesh);
       }
-      this.clothMeshes.push({ pieceId: piece.pieceId, start: piece.start, count: piece.count, geometry: geo, mesh });
+      this.clothMeshes.push({ pieceId: piece.pieceId, start: piece.start, count: piece.count, geometry: geo, mesh, backMesh });
 
       const name = srcPiece?.name ?? 'Piece';
       const { obj, aspect } = this.makeLabel(`${name} face side`);
@@ -511,6 +522,8 @@ export class PatternRenderer {
       (e.mesh.material as THREE.Material).dispose();
     }
     this.clothMeshes = [];
+    for (const b of this.clothBackMeshes) { this.clothGroup.remove(b); (b.material as THREE.Material).dispose(); }
+    this.clothBackMeshes = [];
     for (const l of this.pieceLabels) {
       this.clothGroup.remove(l.obj);
       const m = (l.obj as THREE.Sprite | THREE.Mesh).material as THREE.SpriteMaterial | THREE.MeshBasicMaterial;
@@ -907,6 +920,7 @@ export class PatternRenderer {
     this.showTriangles = v;
     for (const e of this.clothMeshes) {
       (e.mesh.material as THREE.MeshPhysicalMaterial).wireframe = v;
+      if (e.backMesh) (e.backMesh.material as THREE.MeshPhysicalMaterial).wireframe = v;
     }
   }
 

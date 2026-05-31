@@ -8,9 +8,11 @@
     selectedPieceId?: string | null;
     onpieceselect?: (id: string | null) => void;
     labelDisplay?: 'off' | 'billboard' | 'flat';
+    /** Fired when a user-run drape settles, with per-piece settled savedPositions to persist. */
+    ondrapesettled?: (savedByPiece: Record<string, number[]>) => void;
   }
 
-  let { currentPattern, selectedPieceId = null, onpieceselect, labelDisplay = 'flat' }: Props = $props();
+  let { currentPattern, selectedPieceId = null, onpieceselect, labelDisplay = 'flat', ondrapesettled }: Props = $props();
 
   let containerEl: HTMLDivElement;
   let renderer: PatternRenderer | null = null;
@@ -51,6 +53,7 @@
     renderer.onStatus = (s, msg) => { status = s; statusMessage = msg ?? ''; };
     renderer.onModeChange = (m, piece) => { sceneMode = m; selectedPiece = piece; };
     renderer.onSelectPiece = (id) => { onpieceselect?.(id); };
+    renderer.onDrapeSettled = (savedByPiece) => { ondrapesettled?.(savedByPiece); };
     lastKey = patternKey(currentPattern);
     lightingMode = currentPattern.settings3d.lightingMode || 'flat';
     renderer.setPattern(currentPattern).then(() => {

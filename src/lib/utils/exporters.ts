@@ -74,3 +74,64 @@ export function downloadText(filename: string, text: string, mime: string) {
   a.href = url; a.download = filename; a.click();
   URL.revokeObjectURL(url);
 }
+
+/** Trigger a Blob download in the browser. */
+export function downloadBlob(filename: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * Pattern → raster PNG (Blob) of the flat plan: light-filled piece outlines + dashed internals,
+ * scaled to fit `maxPx` on the long edge. Resolves null if the pattern has no geometry.
+ */
+export function patternToPNG(pattern: Pattern, maxPx = 2000, marginPx = 40): Promise<Blob | null> {
+  const polys = collectPolylines(pattern);
+  if (polys.length === 0) return Promise.resolve(null);
+  const b = bounds(polys);
+  const wMm = b.maxX - b.minX || 1;
+  const hMm = b.maxY - b.minY || 1;
+  const scale = (maxPx - marginPx * 2) / Math.max(wMm, hMm);
+  const W = Math.ceil(wMm * scale + marginPx * 2);
+  const H = Math.ceil(hMm * scale + marginPx * 2);
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const c = canvas.getContext('2d');
+  if (!c) return Promise.resolve(null);
+  c.fillStyle = '#ffffff';
+  c.fillRect(0, 0, W, H);
+  // pattern y is up; canvas y is down → flip about maxY
+  const tx = (v: Vec2) => ({ x: (v.x - b.minX) * scale + marginPx, y: (b.maxY - v.y) * scale + marginPx });
+  const trace = (pts: Vec2[]) => {
+    c.beginPath();
+    const a = tx(pts[0]); c.moveTo(a.x, a.y);
+    for (let i = 1; i < pts.length; i++) { const q = tx(pts[i]); c.lineTo(q.x, q.y); }
+  };
+  for (const p of polys) {
+    if (!p.closed) continue;
+    trace(p.pts); c.closePath();
+    c.fillStyle = 'rgba(148,163,184,0.15)'; c.fill();
+    c.strokeStyle = '#1e293b'; c.lineWidth = 2; c.setLineDash([]); c.stroke();
+  }
+  c.strokeStyle = 'rgba(30,41,59,0.6)'; c.lineWidth = 1.5; c.setLineDash([6, 4]);
+  for (const p of polys) { if (p.closed) continue; trace(p.pts); c.stroke(); }
+  c.setLineDash([]);
+  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
+}
+
+/** Open the pattern's SVG in a new window and invoke the browser's print dialog. */
+export function printPattern(pattern: Pattern, title = 'Pattern') {
+  const svg = patternToSVG(pattern);
+  const w = window.open('', '_blank', 'width=900,height=700');
+  if (!w) return;
+  w.document.write(
+    `<!doctype html><html><head><title>${title}</title>` +
+      `<style>@page{margin:10mm}body{margin:0}svg{width:100%;height:auto;display:block}</style>` +
+      `</head><body>${svg}` +
+      `<script>window.onload=function(){window.focus();window.print();}<\/script>` +
+      `</body></html>`
+  );
+  w.document.close();
+}

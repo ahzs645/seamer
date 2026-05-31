@@ -108,6 +108,13 @@
     return currentPattern.materials.find((m) => m.id === id) ?? currentPattern.materials[0] ?? null;
   }
 
+  // ---- layers: visibility / lock --------------------------------------------
+  function layerOf(layerId?: string) {
+    return currentPattern.layers.find((l) => l.id === (layerId ?? 'default'));
+  }
+  const layerVisible = (layerId?: string) => layerOf(layerId)?.visible ?? true;
+  const layerLocked = (layerId?: string) => layerOf(layerId)?.locked ?? false;
+
   /** A fabric-tiled CanvasPattern (aligned to world mm) or a flat color fallback. */
   function pieceFill(c: CanvasRenderingContext2D, material: ReturnType<typeof materialOf>): string | CanvasPattern {
     const tex = material?.frontTexture;
@@ -360,9 +367,12 @@
   function hitTestPlaced(cx: number, cy: number, threshold = HOVER_THRESHOLD): PlacedPoint | null {
     const pt = toPattern(cx, cy);
     const t = threshold / baseScale();
+    const pts = indexPoints(currentPattern);
     let best: PlacedPoint | null = null;
     let bestDist = Infinity;
-    for (const pp of placedPoints(currentPattern)) {
+    for (const pp of placedPoints(currentPattern, pts)) {
+      const lid = pts.get(pp.pointId)?.layerId;
+      if (!layerVisible(lid) || layerLocked(lid)) continue; // can't pick hidden/locked-layer points
       const d = Math.hypot(pt.x - pp.world.x, pt.y - pp.world.y);
       if (d < t && d < bestDist) { bestDist = d; best = pp; }
     }
@@ -419,7 +429,7 @@
     }
 
     for (const piece of currentPattern.pieces) {
-      if (piece.hidden) continue; // object-browser visibility toggle
+      if (piece.hidden || !layerVisible(piece.layerId)) continue; // hidden piece or hidden layer
       const isSelected = $selectedPieceIds.has(piece.id);
       const outline = pieceWorldOutline(currentPattern, piece, paths, points, 4);
       if (outline.length < 2) continue;
@@ -571,7 +581,7 @@
       for (const pp of piece.internalPaths) usedPaths.add(pp.path);
     }
     for (const path of currentPattern.paths) {
-      if (usedPaths.has(path.id)) continue;
+      if (usedPaths.has(path.id) || !layerVisible(path.layerId)) continue;
       const isSelected = $selectedPathIds.has(path.id);
       c.strokeStyle = isSelected ? '#f97316' : '#cbd5e1';
       c.lineWidth = isSelected ? 2.5 : 1;
@@ -583,6 +593,7 @@
       const selPieces = $selectedPieceIds;
       const showLabels = baseScale() > 0.18;
       for (const pp of placedPoints(currentPattern, points)) {
+        if (!layerVisible(points.get(pp.pointId)?.layerId)) continue;
         const pt = pp.world;
         const cp = toCanvas(pt);
         const isHovered = hoveredPointId === pp.pointId;
@@ -734,7 +745,7 @@
     const paths = indexPaths(currentPattern);
     const points = indexPoints(currentPattern);
     for (const piece of currentPattern.pieces) {
-      if (piece.hidden) continue;
+      if (piece.hidden || !layerVisible(piece.layerId) || layerLocked(piece.layerId)) continue;
       if (pointInPolygon(pat, pieceWorldOutline(currentPattern, piece, paths, points, 6))) return piece;
     }
     return null;
@@ -915,10 +926,19 @@
         { label: 'Mirror along Y-axis', icon: 'flip', onClick: () => mirrorPiece(piece, 'Y') },
         { label: 'Bring to front', icon: 'flip_to_front', sep: true, onClick: () => reorderPiece(piece, true) },
         { label: 'Send to back', icon: 'flip_to_back', onClick: () => reorderPiece(piece, false) },
+        ...currentPattern.layers
+          .filter((l) => l.id !== (piece.layerId ?? 'default'))
+          .map((l, i): MenuItem => ({ label: `Move to: ${l.name}`, icon: 'layers', sep: i === 0, onClick: () => moveToLayer(piece, l.id) })),
         { label: piece.hidden ? 'Show piece' : 'Hide piece', icon: piece.hidden ? 'visibility' : 'visibility_off', sep: true, onClick: () => togglePieceHidden(piece) },
         { label: 'Delete', icon: 'delete', danger: true, sep: true, onClick: () => deletePiece(piece) }
       ]
     };
+  }
+
+  function moveToLayer(piece: Piece, layerId: string) {
+    mutatePieces((ps) => ps.map((p) => (p.id === piece.id ? { ...p, layerId } : p)));
+    const name = currentPattern.layers.find((l) => l.id === layerId)?.name ?? layerId;
+    toast(`Moved to ${name}`, 'success');
   }
 
   // ---- tool actions (new point / pen / create piece / seam / text) ----------
@@ -940,7 +960,7 @@
   /** Add a free ConstrainablePoint at a world position; returns the new pattern + id. */
   function withNewPoint(p: Pattern, world: Vec2): { p: Pattern; id: string } {
     const id = uid('ConstrainablePoint');
-    const points = [...p.points, { id, name: nextPointName(p), x: world.x, y: world.y }];
+    const points = [...p.points, { id, name: nextPointName(p), x: world.x, y: world.y, layerId: p.currentLayerId }];
     return { p: { ...p, points }, id };
   }
 
@@ -1126,7 +1146,7 @@
     const tol = 10 / baseScale();
     let best: string | null = null, bestD = tol;
     for (const piece of currentPattern.pieces) {
-      if (piece.hidden) continue;
+      if (piece.hidden || !layerVisible(piece.layerId) || layerLocked(piece.layerId)) continue;
       const tf = pieceTransform(piece, points);
       for (const pp of piece.mainPaths) {
         const poly = piecePathPolyline(pp, paths, points, 4).map(tf);
@@ -1260,6 +1280,7 @@
       const points = indexPoints(currentPattern);
       let hitPiece: string | null = null;
       for (const piece of currentPattern.pieces) {
+        if (piece.hidden || !layerVisible(piece.layerId) || layerLocked(piece.layerId)) continue;
         if (pointInPolygon(pat, pieceWorldOutline(currentPattern, piece, paths, points, 6))) { hitPiece = piece.id; break; }
       }
       if (hitPiece) {

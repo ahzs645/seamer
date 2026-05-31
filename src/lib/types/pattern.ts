@@ -8,11 +8,23 @@ export interface Formula {
   unit: 'inch' | 'cm' | 'mm' | 'degrees' | 'radians' | string;
 }
 
+/**
+ * Optional parametric construction for a point. When present the solver computes the point's
+ * position from formulas (referencing variables + body measurements); otherwise x/y are fixed.
+ * Formula strings are evaluated in mm/degrees.
+ */
+export type PointConstraint =
+  | { type: 'offset'; from: string; dxFormula: string; dyFormula: string }
+  | { type: 'lengthAngle'; from: string; lengthFormula: string; angleFormula: string }
+  | { type: 'sliding'; path: string; positionFormula: string };
+
 export interface ConstrainablePoint {
   id: string;
   name: string;
-  x: number; // millimeters
+  x: number; // millimeters (solved value, or fixed when no constraint)
   y: number; // millimeters
+  constraint?: PointConstraint; // parametric construction (optional)
+  layerId?: string; // layer membership (defaults to the 'default' layer)
 }
 
 /** A 2D vector used for grain direction / piece origin (carries an id+name in the data). */
@@ -61,6 +73,7 @@ export interface SlidingPoint {
 export interface ConstrainablePath {
   id: string;
   name: string;
+  layerId?: string; // layer membership (defaults to the 'default' layer)
   pathType: 'line' | 'curve' | 'referenced' | string;
   pathPoints: PathPoint[];
   slidingPoints?: SlidingPoint[];
@@ -126,6 +139,7 @@ export interface PieceSettings3D {
 export interface Piece {
   id: string;
   name: string;
+  layerId?: string; // layer membership (defaults to the 'default' layer)
   type: 'dynamic' | string; // "dynamic" => closed simulatable cloth piece
   materialId: string;
   origin: NamedVector; // piece-local origin in 2D mm
@@ -236,6 +250,18 @@ export interface PatternSettings3D {
   debugFocusPoint: boolean;
 }
 
+/** A graded size: a proportional scale (about each piece origin) + a swatch colour. */
+export interface GradeSize {
+  id: string;
+  name: string;
+  scale: number; // proportional fallback grade (1.0 = base) when no formula constraints exist
+  color: string; // overlay swatch colour
+  values?: Record<string, number>; // per-size variable value overrides (variableId -> value) for true grading
+}
+export interface GradingProfile {
+  sizes: GradeSize[];
+}
+
 export interface PatternImage {
   id: string;
   [k: string]: unknown;
@@ -277,7 +303,7 @@ export interface Pattern {
   layers: Layer[];
   currentLayerId: string;
   useBodyMeasurementsForSizes: boolean;
-  gradingProfile: unknown | null;
+  gradingProfile: GradingProfile | null;
   markerSettings: unknown | null;
 
   graphicsOffset: { x: number; y: number };

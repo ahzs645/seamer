@@ -17,9 +17,14 @@
   import { deletePoint, deletePath, deletePiece } from '$lib/utils/patternMutations';
   import Toaster from '$lib/components/Toaster.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import GradingOverlay from '$lib/components/GradingOverlay.svelte';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { confirm } from '$lib/stores/confirm';
-  import { patternToSVG, patternToDXF, patternToCSV, downloadText } from '$lib/utils/exporters';
+  import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern } from '$lib/utils/exporters';
+  import { dxfToPattern, svgToPattern } from '$lib/utils/patternImport';
+  import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
+  import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
+  import WelcomeModal from '$lib/components/WelcomeModal.svelte';
 
   let currentPattern = $state<Pattern>(structuredClone(EMPTY_PATTERN));
   let saved = $state(true);
@@ -30,6 +35,8 @@
   let patternName = $state('New Pattern');
   let labelDisplay = $state<'off' | 'billboard' | 'flat'>('flat'); // projected-on-fabric, like the source
   let showObjectBrowser = $state(false);
+  let showShortcuts = $state(false);
+  let showGrading = $state(false);
 
   const templatePatterns: Record<string, { name: string; description: string; file: string }> = {
     'simple-pants': { name: 'Trousers', description: 'Simple pants in 3D (full 3D data)', file: 'simple-pants-3d.json' },
@@ -102,16 +109,33 @@
     toastSuccess(`Exported ${fmt.toUpperCase()}`);
   }
 
+  async function exportPNG() {
+    const base = patternName.replace(/\s+/g, '_') || 'pattern';
+    const blob = await patternToPNG(currentPattern);
+    if (!blob) { toastError('Nothing to export'); return; }
+    downloadBlob(`${base}.png`, blob);
+    toastSuccess('Exported PNG');
+  }
+
+  function doPrint() { printPattern(currentPattern, patternName || 'Pattern'); }
+
   function handleImport() {
-    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json';
+    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.dxf,.svg';
     input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0]; if (!file) return;
+      const ext = file.name.split('.').pop()?.toLowerCase();
       try {
-        const raw = JSON.parse(await file.text());
-        const data: Pattern = isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
+        const text = await file.text();
+        let data: Pattern;
+        if (ext === 'dxf') data = dxfToPattern(text, file.name.replace(/\.dxf$/i, ''));
+        else if (ext === 'svg') data = svgToPattern(text, file.name.replace(/\.svg$/i, ''));
+        else {
+          const raw = JSON.parse(text);
+          data = isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
+        }
         currentPattern = data; patternName = data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
         toastSuccess(`Imported "${data.name}"`);
-      } catch { toastError('Invalid pattern file'); }
+      } catch { toastError('Could not import file'); }
     };
     input.click();
   }
@@ -161,6 +185,7 @@
     if ((e.metaKey || e.ctrlKey) && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelectedPiece(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); handleCopy(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); handlePaste(); }
+    if (e.key === '?' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); showShortcuts = !showShortcuts; }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       let p = $pattern;
       let changed = false;
@@ -274,7 +299,9 @@
           <li><button onclick={handleExport}>JSON (.seamer.json)</button></li>
           <li><button onclick={() => exportAs('svg')}>SVG</button></li>
           <li><button onclick={() => exportAs('dxf')}>DXF</button></li>
+          <li><button onclick={exportPNG}>PNG</button></li>
           <li><button onclick={() => exportAs('csv')}>CSV (points)</button></li>
+          <li><button onclick={doPrint}>Print…</button></li>
         </ul>
       </div>
       <button class="btn btn-ghost btn-xs" onclick={handleNew}>New</button>
@@ -283,6 +310,10 @@
       <button class="btn btn-ghost btn-xs" onclick={() => showRightPanel = !showRightPanel} title="Toggle right panel">&#x25B6;</button>
       <button class="btn btn-xs" class:btn-active={showObjectBrowser} onclick={() => showObjectBrowser = !showObjectBrowser} title="Toggle object browser">
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">view_list</span>
+      </button>
+      <ErrorsPanel {currentPattern} />
+      <button class="btn btn-ghost btn-xs" onclick={() => showShortcuts = true} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
+        <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">keyboard</span>
       </button>
     </div>
   </div>
@@ -318,7 +349,7 @@
     </div>
 
     {#if showRightPanel}
-      <PropertyPanel {currentPattern} onchange={handlePatternUpdate} onclose={() => (showRightPanel = false)} {labelDisplay} onlabeldisplaychange={(v) => (labelDisplay = v)} />
+      <PropertyPanel {currentPattern} onchange={handlePatternUpdate} onclose={() => (showRightPanel = false)} {labelDisplay} onlabeldisplaychange={(v) => (labelDisplay = v)} ongrading={() => (showGrading = true)} />
     {/if}
   </div>
 
@@ -331,5 +362,9 @@
   {/if}
 </div>
 
+<KeyboardShortcuts bind:open={showShortcuts} />
+<WelcomeModal onshowshortcuts={() => (showShortcuts = true)} />
+
 <Toaster />
 <ConfirmDialog />
+{#if showGrading}<GradingOverlay {currentPattern} onclose={() => (showGrading = false)} />{/if}
