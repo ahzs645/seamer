@@ -72,7 +72,7 @@
         if (loaded) { currentPattern = loaded; patternName = loaded.name; pushUndo(structuredClone(loaded)); }
         pattern.set(currentPattern);
       } else {
-        await loadTemplate('tshirt-basic'); // TEMP
+        await loadTemplate('simple-pants'); // auto-load a garment to drape
       }
     })();
 
@@ -201,6 +201,21 @@
     toastSuccess('Scene cleared');
   }
 
+  /** Fill any arrays/fields a template may omit, so all components can render it safely. */
+  function normalizePattern(data: Pattern): Pattern {
+    return {
+      ...EMPTY_PATTERN,
+      ...data,
+      points: data.points ?? [], paths: data.paths ?? [], pieces: data.pieces ?? [],
+      seams: data.seams ?? [], variables: data.variables ?? [], materials: data.materials ?? [],
+      texts: data.texts ?? [], images: data.images ?? [],
+      layers: data.layers?.length ? data.layers : [{ id: 'default', name: 'Default', visible: true, locked: false, order: 0, style: null }],
+      currentLayerId: data.currentLayerId ?? 'default',
+      body: data.body ?? EMPTY_PATTERN.body,
+      settings3d: data.settings3d ?? EMPTY_PATTERN.settings3d
+    };
+  }
+
   async function loadTemplate(key: string) {
     const tpl = templatePatterns[key];
     if (!tpl) return;
@@ -210,8 +225,9 @@
       const raw = await res.json();
       let data: Pattern = isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
       data.id = crypto.randomUUID(); data.versionId = crypto.randomUUID(); data.isPublic = false;
+      data = normalizePattern(data);
       // recover parametric constructions from the baked template (no-op if already constrained / not recoverable)
-      // data = makeParametric(data); // TEMP-DISABLED
+      data = makeParametric(data);
       currentPattern = data; patternName = tpl.name || data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
     } catch {
       currentPattern = { ...EMPTY_PATTERN, name: tpl.name, description: tpl.description, enable3d: true, viewMode: 'both' };

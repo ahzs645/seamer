@@ -18,7 +18,7 @@ import { buildCylinders, type CylinderFrame } from '$lib/geometry/cylinders';
 import { prepareCloth, ClothSimulation, type PreparedCloth } from '$lib/sim/simulator';
 import { cylinderRefit } from '$lib/sim/cylinderRefit';
 import { requestClothDevice, isWebGPUAvailable } from '$lib/sim/webgpu/device';
-import { createGarmentMaterial, createAvatarMaterial, hasSeparateBack } from './materials';
+import { createGarmentMaterial, createAvatarMaterial, hasSeparateBack, disposeGarmentMaterial } from './materials';
 import { isDarkTheme, onThemeChange } from '$lib/utils/theme';
 
 export type RendererStatus = 'idle' | 'loading' | 'ready' | 'simulating' | 'error';
@@ -495,24 +495,37 @@ export class PatternRenderer {
       geo.setIndex(localIndex);
       const pieceMat = matById.get(piece.materialId);
       const separateBack = hasSeparateBack(pieceMat);
+      const srcPiece = pattern.pieces.find((p) => p.id === piece.pieceId);
+      const name = srcPiece?.name ?? 'Piece';
+      const hidden = !!srcPiece?.hidden; // object-browser visibility toggle
+
+      // Build a `uvLabel` attribute (0..1 across the piece's pattern bbox) and per-piece canvas
+      // badges, composited into the lit surface by the material shader — this is the default
+      // 'flat' look (deforms + shades with the cloth). Mirror instances (suffixed "#M") have a
+      // negated U, so pre-mirror the canvas text. Built unconditionally so toggling label mode is a
+      // cheap uniform/visibility flip rather than a full cloth rebuild (which would re-drape).
+      const { wMM, hMM } = this.addLabelUVs(geo, piece.uv, piece.count);
+      const mirror = piece.pieceId.includes('#M');
+      const faceLabelTex = this.makeBakedLabelTexture(`${name}\nface side`, wMM, hMM, mirror);
+      const backLabelTex = separateBack ? this.makeBakedLabelTexture(`${name}\nback side`, wMM, hMM, !mirror) : undefined;
+      const labelOpacity = this.showLabels && !hidden && this.labelMode === 'flat' ? 1 : 0;
+
       // Our cloth triangles wind with their geometric front face pointing INWARD, so the outward
       // surface the camera sees is the BackSide. For a separate back texture we therefore render the
       // FACE (front) texture on a BackSide mesh (shows outward) and the back texture on a FrontSide
       // mesh (shows inward). With a single double-sided material this doesn't matter (both sides same).
-      const mat = createGarmentMaterial(pieceMat, flat, separateBack ? { side: THREE.BackSide } : {});
+      const mat = createGarmentMaterial(pieceMat, flat, { side: separateBack ? THREE.BackSide : THREE.DoubleSide, labelTexture: faceLabelTex, labelOpacity });
       mat.wireframe = this.showTriangles;
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       mesh.frustumCulled = false;
-      const srcPiece = pattern.pieces.find((p) => p.id === piece.pieceId);
-      const hidden = !!srcPiece?.hidden; // object-browser visibility toggle
       mesh.visible = !hidden;
       this.clothGroup.add(mesh);
       // separate back side: a second mesh on the same (deforming) geometry, back faces only
       let backMesh: THREE.Mesh | undefined;
       if (separateBack) {
-        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true });
+        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true, labelTexture: backLabelTex, labelOpacity });
         backMat.wireframe = this.showTriangles;
         backMesh = new THREE.Mesh(geo, backMat);
         backMesh.castShadow = true; backMesh.receiveShadow = true; backMesh.frustumCulled = false;
@@ -522,13 +535,31 @@ export class PatternRenderer {
       }
       this.clothMeshes.push({ pieceId: piece.pieceId, start: piece.start, count: piece.count, geometry: geo, mesh, backMesh });
 
-      const name = srcPiece?.name ?? 'Piece';
+      // Camera-facing sprite badge for 'billboard' mode (hidden unless that mode is active).
       const { obj, aspect } = this.makeLabel(`${name} face side`);
-      obj.visible = this.showLabels && !hidden;
+      obj.visible = this.showLabels && !hidden && this.labelMode === 'billboard';
       this.clothGroup.add(obj);
       this.pieceLabels.push({ pieceId: piece.pieceId, obj, aspect });
     }
     this.applyClothPositions(this.prepared.simData.positions);
+  }
+
+  /** Add a per-piece `uvLabel` attribute (0..1 across the piece's pattern bbox); returns bbox size in mm. */
+  private addLabelUVs(geo: THREE.BufferGeometry, uv: Float32Array, count: number): { wMM: number; hMM: number } {
+    let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+    for (let i = 0; i < count; i++) {
+      const u = uv[i * 2], v = uv[i * 2 + 1];
+      if (u < uMin) uMin = u; if (u > uMax) uMax = u;
+      if (v < vMin) vMin = v; if (v > vMax) vMax = v;
+    }
+    const wMM = Math.max(1, uMax - uMin), hMM = Math.max(1, vMax - vMin);
+    const uvLabel = new Float32Array(count * 2);
+    for (let i = 0; i < count; i++) {
+      uvLabel[i * 2] = (uv[i * 2] - uMin) / wMM;
+      uvLabel[i * 2 + 1] = (uv[i * 2 + 1] - vMin) / hMM;
+    }
+    geo.setAttribute('uvLabel', new THREE.BufferAttribute(uvLabel, 2));
+    return { wMM, hMM };
   }
 
   private applyClothPositions(global: Float32Array) {
@@ -547,36 +578,11 @@ export class PatternRenderer {
       entry.geometry.computeVertexNormals();
       // bounding sphere not recomputed per frame: cloth meshes have frustumCulled = false.
 
-      // park the piece's label at its (live) centroid
+      // Flat (default) badges are baked into the material and need no per-frame work. Billboard
+      // sprites, if present, get parked at the piece's (live) centroid to face the camera.
       const label = this.pieceLabels.find((l) => l.pieceId === entry.pieceId);
       if (!label || entry.count === 0) continue;
-      const cen = new THREE.Vector3(cx / entry.count, cy / entry.count, cz / entry.count);
-      if (this.labelMode === 'flat' && label.obj instanceof THREE.Mesh) {
-        // orient the plane flat on the fabric using the surface normal nearest the centroid
-        // (local orientation at the label's spot), lifted slightly off the cloth.
-        const nattr = entry.geometry.getAttribute('normal') as THREE.BufferAttribute;
-        let nearest = 0, nbest = Infinity;
-        for (let i = 0; i < entry.count; i++) {
-          const dx = arr[i * 3] - cen.x, dy = arr[i * 3 + 1] - cen.y, dz = arr[i * 3 + 2] - cen.z;
-          const d = dx * dx + dy * dy + dz * dz;
-          if (d < nbest) { nbest = d; nearest = i; }
-        }
-        const n = new THREE.Vector3(nattr.getX(nearest), nattr.getY(nearest), nattr.getZ(nearest));
-        if (n.lengthSq() < 1e-9) n.set(0, 0, 1);
-        n.normalize();
-        // flip the normal toward the camera so the badge always faces the viewer and reads
-        // upright — otherwise back/side-facing pieces show the plane's reverse (mirrored, upside-down).
-        const px = arr[nearest * 3], py = arr[nearest * 3 + 1], pz = arr[nearest * 3 + 2];
-        if (n.x * (this.camera.position.x - px) + n.y * (this.camera.position.y - py) + n.z * (this.camera.position.z - pz) < 0) n.negate();
-        // sit the label on the local surface vertex, lifted 3mm along its normal
-        label.obj.position.set(px, py, pz).addScaledVector(n, 0.003);
-        const up = Math.abs(n.y) > 0.95 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(0, 1, 0);
-        const x = new THREE.Vector3().crossVectors(up, n).normalize();
-        const y = new THREE.Vector3().crossVectors(n, x).normalize();
-        label.obj.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, n));
-      } else {
-        label.obj.position.copy(cen);
-      }
+      label.obj.position.set(cx / entry.count, cy / entry.count, cz / entry.count);
     }
   }
 
@@ -584,10 +590,10 @@ export class PatternRenderer {
     for (const e of this.clothMeshes) {
       this.clothGroup.remove(e.mesh);
       e.geometry.dispose();
-      (e.mesh.material as THREE.Material).dispose();
+      disposeGarmentMaterial(e.mesh.material as THREE.Material);
     }
     this.clothMeshes = [];
-    for (const b of this.clothBackMeshes) { this.clothGroup.remove(b); (b.material as THREE.Material).dispose(); }
+    for (const b of this.clothBackMeshes) { this.clothGroup.remove(b); disposeGarmentMaterial(b.material as THREE.Material); }
     this.clothBackMeshes = [];
     for (const l of this.pieceLabels) {
       this.clothGroup.remove(l.obj);
@@ -631,56 +637,111 @@ export class PatternRenderer {
     return { tex, aspect: c.width / c.height };
   }
 
-  /** A piece label as either a camera-facing billboard sprite or a flat plane on the fabric. */
+  /** A camera-facing billboard sprite badge (used only in 'billboard' label mode). */
   private makeLabel(text: string): { obj: THREE.Object3D; aspect: number } {
     const { tex, aspect } = this.makeLabelTexture(text);
     const H = 0.035; // world height of the label (meters) — kept subtle, like the source
-    if (this.labelMode === 'flat') {
-      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
-      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(H * aspect, H), mat);
-      mesh.renderOrder = 999;
-      return { obj: mesh, aspect };
-    }
     const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: true });
     const sprite = new THREE.Sprite(mat);
     sprite.scale.set(H * aspect, H, 1);
     return { obj: sprite, aspect };
   }
 
-  /** Toggle the garment piece labels. */
-  setShowLabels(on: boolean): void {
-    this.showLabels = on;
-    for (const l of this.pieceLabels) {
-      const mesh = this.clothMeshes.find((e) => e.pieceId === l.pieceId)?.mesh;
-      l.obj.visible = on && (mesh ? mesh.visible : true);
-    }
+  /**
+   * Per-piece badge baked into the cloth surface, mirroring the original renderer's drawCenteredLabel:
+   * ~10mm text shrunk to fit within 90%×60% of the piece, two stacked lines on a translucent rounded
+   * plate. Drawn in the piece's pattern-bbox UV space (0..1); mirror instances pre-flip horizontally.
+   */
+  private makeBakedLabelTexture(text: string, wMM: number, hMM: number, mirror: boolean): THREE.CanvasTexture {
+    const lines = text.split('\n').map((s) => s.trim()).filter(Boolean);
+    const pxPerMM = Math.min(Math.max(1536 / Math.max(wMM, hMM), 1), 8);
+    const W = Math.max(8, Math.round(wMM * pxPerMM));
+    const H = Math.max(8, Math.round(hMM * pxPerMM));
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d')!;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    if (mirror) { ctx.translate(W, 0); ctx.scale(-1, 1); } // cancel the mirror instance's negated U
+
+    const font = 'Noto Sans, sans-serif';
+    const maxW = W * 0.9, maxH = H * 0.6;
+    let w = Math.max(10, 10 * pxPerMM); // ~10mm cap-height text, like the source
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const measure = () => { ctx.font = `300 ${w}px ${font}`; let m = 0; for (const ln of lines) m = Math.max(m, ctx.measureText(ln).width); return m; };
+    let textW = measure();
+    let lineH = w * 1.2;
+    let blockH = lineH * lines.length;
+    const k = Math.min(1, textW > 0 ? maxW / textW : 1, blockH > 0 ? maxH / blockH : 1);
+    if (k < 1) { w = Math.max(8, w * k); textW = measure(); lineH = w * 1.2; blockH = lineH * lines.length; }
+
+    const pad = Math.max(6, w * 0.35);
+    const bw = textW + pad * 2, bh = blockH + pad * 1.4;
+    const r = Math.max(4, Math.min(bw, bh) * 0.12);
+    const cx = W / 2, cy = H / 2;
+    this.roundRectPath(ctx, cx - bw / 2, cy - bh / 2, bw, bh, r);
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fill();
+    ctx.lineWidth = Math.max(1, Math.round(Math.max(1, w * 0.06)));
+    ctx.strokeStyle = '#000000';
+    ctx.stroke();
+    ctx.fillStyle = '#000000';
+    ctx.font = `300 ${w}px ${font}`;
+    let y = cy - blockH / 2 + lineH / 2;
+    for (const ln of lines) { ctx.fillText(ln, cx, y); y += lineH; }
+
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = 8;
+    tex.needsUpdate = true;
+    return tex;
   }
 
-  /** Switch label style between camera-facing (billboard) and pinned-to-fabric (flat). */
+  private roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+    const rr = Math.min(r, w / 2, h / 2);
+    if (typeof ctx.roundRect === 'function') { ctx.beginPath(); ctx.roundRect(x, y, w, h, rr); return; }
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  }
+
+  /** Toggle the garment piece labels on/off. */
+  setShowLabels(on: boolean): void {
+    this.showLabels = on;
+    this.applyLabelVisibility();
+  }
+
+  /** Switch label style between camera-facing (billboard) and baked-into-fabric (flat). */
   setLabelMode(mode: 'billboard' | 'flat'): void {
     if (mode === this.labelMode) return;
     this.labelMode = mode;
-    if (this.pattern) this.rebuildLabels(this.pattern);
+    this.applyLabelVisibility();
   }
 
-  private rebuildLabels(pattern: Pattern): void {
+  /**
+   * Show the right badge per mode without rebuilding: baked badges live in the material shader
+   * (toggled via the uLabelOpacity uniform), billboard badges are sprites (toggled via visibility).
+   */
+  private applyLabelVisibility(): void {
+    const flat = this.labelMode === 'flat';
+    for (const e of this.clothMeshes) {
+      const opacity = this.showLabels && e.mesh.visible && flat ? 1 : 0;
+      for (const m of [e.mesh.material, e.backMesh?.material]) {
+        const u = (m as THREE.Material | undefined)?.userData?.labelUniforms as { uLabelOpacity: { value: number } } | undefined;
+        if (u) u.uLabelOpacity.value = opacity;
+      }
+    }
     for (const l of this.pieceLabels) {
-      this.clothGroup.remove(l.obj);
-      const m = (l.obj as THREE.Sprite | THREE.Mesh).material as THREE.SpriteMaterial | THREE.MeshBasicMaterial;
-      (m.map as THREE.Texture | null)?.dispose();
-      m.dispose();
-      if (l.obj instanceof THREE.Mesh) l.obj.geometry.dispose();
+      const mesh = this.clothMeshes.find((e) => e.pieceId === l.pieceId)?.mesh;
+      l.obj.visible = this.showLabels && !flat && (mesh ? mesh.visible : true);
     }
-    this.pieceLabels = [];
-    for (const entry of this.clothMeshes) {
-      const name = pattern.pieces.find((p) => p.id === entry.pieceId)?.name ?? 'Piece';
-      const { obj, aspect } = this.makeLabel(`${name} face side`);
-      obj.visible = this.showLabels && entry.mesh.visible;
-      this.clothGroup.add(obj);
-      this.pieceLabels.push({ pieceId: entry.pieceId, obj, aspect });
-    }
-    if (this.prepared) this.applyClothPositions(this.lastClothPositions ?? this.prepared.simData.positions);
   }
+
   private lastClothPositions: Float32Array | null = null;
 
   setPose(name: string | null) {
@@ -1003,6 +1064,7 @@ export class PatternRenderer {
     this.simulating = false;
     cancelAnimationFrame(this.rafId);
     window.removeEventListener('resize', this.onResize);
+    this.themeUnsub();
     if (this.mode === 'arrange') this.exitArrangeMode();
     this.transform?.detach();
     this.transform?.dispose();

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import type { Pattern, Piece } from '$lib/types/pattern';
   import { buildSilhouette, type Silhouette } from '$lib/model/silhouette';
+  import { isDarkTheme, onThemeChange } from '$lib/utils/theme';
   import DrawingTools from '$lib/components/DrawingTools.svelte';
   import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
   import { toast } from '$lib/stores/toast';
@@ -33,6 +34,7 @@
 
   let canvasEl: HTMLCanvasElement;
   let ctx: CanvasRenderingContext2D | null = $state(null);
+  let isDark = $state(false); // follows the app theme (utils/theme); themes the canvas bg/grid
   let canvasW = $state(800);
   let canvasH = $state(600);
   let isPanning = $state(false);
@@ -105,12 +107,13 @@
     return null;
   }
   function materialOf(id: string) {
-    return currentPattern.materials.find((m) => m.id === id) ?? currentPattern.materials[0] ?? null;
+    const mats = currentPattern.materials ?? [];
+    return mats.find((m) => m.id === id) ?? mats[0] ?? null;
   }
 
   // ---- layers: visibility / lock --------------------------------------------
   function layerOf(layerId?: string) {
-    return currentPattern.layers.find((l) => l.id === (layerId ?? 'default'));
+    return (currentPattern.layers ?? []).find((l) => l.id === (layerId ?? 'default'));
   }
   const layerVisible = (layerId?: string) => layerOf(layerId)?.visible ?? true;
   const layerLocked = (layerId?: string) => layerOf(layerId)?.locked ?? false;
@@ -311,8 +314,10 @@
       }
     };
     window.addEventListener('keydown', onKey);
+    isDark = isDarkTheme();
+    const unsubTheme = onThemeChange(() => { isDark = isDarkTheme(); render(); });
     render();
-    return () => { observer.disconnect(); unsubZoom(); unsubPan(); unsubSelPc(); unsubSelPt(); unsubSelPath(); unsubTool(); window.removeEventListener('keydown', onKey); };
+    return () => { observer.disconnect(); unsubZoom(); unsubPan(); unsubSelPc(); unsubSelPt(); unsubSelPath(); unsubTool(); unsubTheme(); window.removeEventListener('keydown', onKey); };
   });
 
   let lastFitKey = '';
@@ -399,7 +404,7 @@
     if (!ctx) return;
     const c = ctx;
     c.clearRect(0, 0, canvasW, canvasH);
-    c.fillStyle = '#fafafa';
+    c.fillStyle = isDark ? '#15191e' : '#fafafa';
     c.fillRect(0, 0, canvasW, canvasH);
 
     if (currentPattern.showGrid) {
@@ -408,7 +413,7 @@
         const origin = toCanvas({ x: 0, y: 0 });
         const ox = ((origin.x % step) + step) % step;
         const oy = ((origin.y % step) + step) % step;
-        c.strokeStyle = '#ececec';
+        c.strokeStyle = isDark ? '#252b33' : '#ececec';
         c.lineWidth = 0.5;
         for (let x = ox; x < canvasW; x += step) { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, canvasH); c.stroke(); }
         for (let y = oy; y < canvasH; y += step) { c.beginPath(); c.moveTo(0, y); c.lineTo(canvasW, y); c.stroke(); }
@@ -540,7 +545,7 @@
           const len = ((notch.size as number) || currentPattern.defaultNotchSize || 6.35);
           const a = toCanvas({ x: px - ty * len, y: py + tx * len });
           const b = toCanvas({ x: px + ty * len, y: py - tx * len });
-          c.strokeStyle = '#1e293b'; c.lineWidth = 1.5; c.setLineDash([]);
+          c.strokeStyle = isDark ? '#cbd5e1' : '#1e293b'; c.lineWidth = 1.5; c.setLineDash([]);
           c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(b.x, b.y); c.stroke();
         }
       }

@@ -8,6 +8,10 @@ export interface GarmentMatOpts {
   side?: THREE.Side;
   /** use the material's backTexture slot instead of frontTexture */
   back?: boolean;
+  /** per-piece "Name / face side" badge baked into the lit surface (deforms + shades with the cloth) */
+  labelTexture?: THREE.Texture;
+  /** badge opacity (0 hides it); toggled live via mat.userData.labelUniforms.uLabelOpacity */
+  labelOpacity?: number;
 }
 
 /** True when this material wants its back face rendered with a different texture. */
@@ -67,7 +71,47 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
       }, undefined, () => {});
     }
   }
+
+  // Piece-name badge: composited into the lit diffuse colour using a per-piece `uvLabel` attribute
+  // (0..1 across the piece's pattern bbox). Because it lives in the surface shading — not a floating
+  // plane — it deforms with the cloth, shades under the scene lights, and tiles under the weave normal.
+  if (opts.labelTexture) {
+    const uniforms = {
+      uLabelMap: { value: opts.labelTexture },
+      uLabelOpacity: { value: opts.labelOpacity ?? 1 }
+    };
+    mat.userData.labelUniforms = uniforms;
+    // Distinguish the label-injected program from a plain garment program with identical parameters,
+    // so three's program cache doesn't hand a label-less material the label shader (or vice versa).
+    mat.customProgramCacheKey = () => 'garment-label';
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uLabelMap = uniforms.uLabelMap;
+      shader.uniforms.uLabelOpacity = uniforms.uLabelOpacity;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute vec2 uvLabel;\nvarying vec2 vUvLabel;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvUvLabel = uvLabel;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform sampler2D uLabelMap;\nuniform float uLabelOpacity;\nvarying vec2 vUvLabel;')
+        .replace('#include <map_fragment>', `#include <map_fragment>
+        {
+          vec4 lbl = texture2D(uLabelMap, vUvLabel);
+          vec3 lblLin = pow(lbl.rgb, vec3(2.2)); // sRGB canvas -> linear, matched to the lit pipeline
+          diffuseColor.rgb = mix(diffuseColor.rgb, lblLin, lbl.a * uLabelOpacity);
+        }`);
+    };
+  }
   return mat;
+}
+
+/** Dispose a garment material and the textures it owns (map/normal/alpha + baked label badge). */
+export function disposeGarmentMaterial(material: THREE.Material): void {
+  const m = material as THREE.MeshPhysicalMaterial;
+  m.map?.dispose();
+  m.normalMap?.dispose();
+  m.alphaMap?.dispose();
+  const u = m.userData?.labelUniforms as { uLabelMap: { value: THREE.Texture | null } } | undefined;
+  u?.uLabelMap.value?.dispose();
+  m.dispose();
 }
 
 /** Skin-like avatar material. */

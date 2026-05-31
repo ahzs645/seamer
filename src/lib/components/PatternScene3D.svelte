@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { Pattern } from '$lib/types/pattern';
   import { PatternRenderer, type RendererStatus, type SceneMode } from '$lib/scene/scene3d';
+  import { isDarkTheme, toggleTheme, applyStoredTheme } from '$lib/utils/theme';
 
   interface Props {
     currentPattern: Pattern;
@@ -27,6 +28,7 @@
   let selectedPiece = $state<string | null>(null);
   let gizmoMode = $state<'translate' | 'rotate'>('translate');
   let lightingMode = $state<string>('flat');
+  let dark = $state(false);
   const lightingTabs = [
     { id: 'flat', label: 'Flat' },
     { id: 'studio1', label: 'Studio 1' },
@@ -48,6 +50,8 @@
   }
 
   onMount(() => {
+    applyStoredTheme();
+    dark = isDarkTheme();
     renderer = new PatternRenderer(containerEl);
     webgpu = renderer.webgpuAvailable();
     renderer.onStatus = (s, msg) => { status = s; statusMessage = msg ?? ''; };
@@ -104,6 +108,9 @@
   function setGizmoMode(m: 'translate' | 'rotate') { gizmoMode = m; renderer?.setArrangeTransformMode(m); }
   function drapeFromArrangement() { renderer?.simulateFromArrangement(); }
   function setLighting(mode: string) { lightingMode = mode; renderer?.setLightingMode(mode); }
+  // Dark mode flips the app's DaisyUI data-theme; both the 3D scene and the 2D canvas observe it and
+  // re-theme themselves (see utils/theme), and all DaisyUI panels switch with it.
+  function toggleDark() { dark = toggleTheme() === 'dark'; }
   function setPose(p: string) { currentPose = p; renderer?.setPose(p); }
   function toggleTriangles() { showTriangles = !showTriangles; renderer?.setShowTriangles(showTriangles); }
   function toggleAvatar() { showAvatar = !showAvatar; renderer?.setAvatarVisible(showAvatar); }
@@ -142,7 +149,8 @@
     { label: 'Show triangles', icon: 'change_history', onClick: toggleTriangles, active: () => showTriangles, sep: true },
     { label: 'Show avatar', icon: 'person', onClick: toggleAvatar, active: () => showAvatar },
     { label: sceneMode === 'arrange' ? 'Exit arrange mode' : 'Arrange (A)', icon: 'scatter_plot', onClick: toggleArrangeMode, active: () => sceneMode === 'arrange', shortcut: 'A' },
-    { label: 'Download as OBJ', icon: 'download', onClick: downloadOBJ, sep: true }
+    { label: dark ? 'Light mode' : 'Dark mode', icon: dark ? 'light_mode' : 'dark_mode', onClick: toggleDark, active: () => dark, sep: true },
+    { label: 'Download as OBJ', icon: 'download', onClick: downloadOBJ }
   ]);
 </script>
 
