@@ -239,8 +239,39 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }`;
 }
 
-/** Cloth-vs-body collision using a CPU-built uniform grid. Accumulates into corrections. */
-export function bodyCollisionWGSL(cfg: SimConfig): string {
+/** Cloth-vs-body collision using a CPU-built uniform grid. Accumulates into corrections. When a piece
+ *  opts into `filterExternalCollisionsByClothNormal`, a contact is only applied if the body surface
+ *  faces the same way as the cloth's own normal (estimated from the particle's incident cloth
+ *  triangles) — this stops the cloth being pulled onto body backfaces in cavities (crotch, armpit). */
+export function bodyCollisionWGSL(cfg: SimConfig, maxIncident: number, withFilter: boolean): string {
+  const incidentStride = maxIncident + 1;
+  // The cloth-normal filter needs 2 extra storage buffers (clothTriangles, incidentTriangles), taking
+  // the shader to 9 storage buffers — above WebGPU's default per-stage limit of 8. The engine only
+  // passes withFilter=true when the device grants ≥9; otherwise we emit the plain 8-buffer shader.
+  const filterBindings = withFilter ? /* wgsl */ `
+@group(0) @binding(8) var<storage, read> clothTriangles: array<vec4u>;
+@group(0) @binding(9) var<storage, read> incidentTriangles: array<i32>;
+const maxIncident = ${maxIncident}u;
+const incidentStride = ${incidentStride}u;
+
+fn getNormalFilterFlag(particleIndex: u32) -> i32 {
+  return incidentTriangles[particleIndex * incidentStride];
+}
+fn computeClothNormal(particleIndex: u32) -> vec3f {
+  var accumulated = vec3f(0.0);
+  let base = particleIndex * incidentStride + 1u;
+  for (var slot = 0u; slot < maxIncident; slot++) {
+    let triIndex = incidentTriangles[base + slot];
+    if (triIndex < 0) { break; }
+    let tri = clothTriangles[u32(triIndex)];
+    let nrm = cross(positions[tri.y].xyz - positions[tri.x].xyz, positions[tri.z].xyz - positions[tri.x].xyz);
+    let l = length(nrm);
+    if (l > 1e-6) { accumulated += nrm / l; }
+  }
+  let al = length(accumulated);
+  if (al < 1e-5) { return vec3f(0.0); }
+  return accumulated / al;
+}` : '';
   return /* wgsl */ `
 struct GridParams {
   origin: vec3f,
@@ -256,6 +287,7 @@ struct GridParams {
 @group(0) @binding(5) var<storage, read> cellStart: array<u32>;
 @group(0) @binding(6) var<storage, read> cellTris: array<u32>;
 @group(0) @binding(7) var<uniform> grid: GridParams;
+${filterBindings}
 
 const thickness = ${cfg.simulationThickness}f;
 const friction = ${cfg.externalCollisionFriction}f;
@@ -299,6 +331,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   if (invMass <= 0.0) { return; }
   let pos = positions[index].xyz;
   let particleDelta = pos - lastPositions[index].xyz;
+
+  // Cloth-normal filter (per piece): when enabled, only collide with body surfaces that face the
+  // same way as this particle's cloth normal. flag sign flips the cloth normal (flipNormals pieces).
+  var wantsFilter = false;
+  var clothNormal = vec3f(0.0);
+${withFilter ? `  let filterFlag = getNormalFilterFlag(index);
+  wantsFilter = filterFlag != 0;
+  if (wantsFilter) {
+    let flipFactor = select(1.0, -1.0, filterFlag < 0);
+    clothNormal = computeClothNormal(index) * flipFactor;
+    if (length(clothNormal) < 1e-5) { wantsFilter = false; }
+  }` : ''}
 
   let gx = i32(floor((pos.x - grid.origin.x) / grid.cellSize));
   let gy = i32(floor((pos.y - grid.origin.y) / grid.cellSize));
@@ -347,6 +391,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   var apply = hasContact && bestPlane < thickness;
   if (bestPositive) { apply = apply && bestPlane >= 0.0; }
   if (apply && dot(particleDelta, bestNormal) >= 0.0) { apply = false; }
+  // Reject contacts where the body surface faces opposite the cloth's own normal (cavity backfaces).
+  if (apply && wantsFilter && dot(clothNormal, bestNormal) < 0.0) { apply = false; }
   if (apply) {
     let penetration = thickness - bestPlane;
     if (penetration > 0.0) {

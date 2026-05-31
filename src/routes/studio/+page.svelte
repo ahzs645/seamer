@@ -25,7 +25,7 @@
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
   import WelcomeModal from '$lib/components/WelcomeModal.svelte';
-  import { redraft, hasConstraints } from '$lib/solver/solve';
+  import { redraft, hasConstraints, makeParametric } from '$lib/solver/solve';
 
   let currentPattern = $state<Pattern>(structuredClone(EMPTY_PATTERN));
   let saved = $state(true);
@@ -40,6 +40,7 @@
   let showGrading = $state(false);
 
   const templatePatterns: Record<string, { name: string; description: string; file: string }> = {
+    'parametric-skirt': { name: 'Parametric Skirt ✨', description: 'Truly parametric: waist/hip/length variables re-draft the geometry; grades by size', file: 'parametric-skirt.json' },
     'simple-pants': { name: 'Trousers', description: 'Simple pants in 3D (full 3D data)', file: 'simple-pants-3d.json' },
     'flare-dress': { name: 'Fit & Flare Dress (imported)', description: 'Sleeveless fit and flare dress — converted from a 2D export', file: 'flare-dress.raw.json' },
     'pencil-skirt': { name: 'Pencil Skirt (3D)', description: 'Pencil skirt with waistband, multi-seam (full 3D data)', file: 'pencil-skirt.json' },
@@ -207,8 +208,10 @@
       const res = await fetch(`/templates/${tpl.file}`);
       if (!res.ok) throw new Error('Not found');
       const raw = await res.json();
-      const data: Pattern = isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
+      let data: Pattern = isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
       data.id = crypto.randomUUID(); data.versionId = crypto.randomUUID(); data.isPublic = false;
+      // recover parametric constructions from the baked template (no-op if already constrained / not recoverable)
+      data = makeParametric(data);
       currentPattern = data; patternName = tpl.name || data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
     } catch {
       currentPattern = { ...EMPTY_PATTERN, name: tpl.name, description: tpl.description, enable3d: true, viewMode: 'both' };

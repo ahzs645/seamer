@@ -51,6 +51,10 @@ export interface SimData {
   particleLayers: Uint32Array; // particleCount: collision layer (0 default)
   // Near-damping input:
   neighborIndices: Int32Array; // particleCount * 8, mesh-connected neighbours, -1 fill
+  // Body-collision cloth-normal filter: per particle, [flag, tri0, tri1, ...] with stride
+  // (maxIncidentTrianglesPerParticle+1). flag: 0 = no filter, +1 = filter, -1 = filter + flip normal.
+  incidentTriangles: Int32Array;
+  maxIncidentTrianglesPerParticle: number;
 }
 
 export interface ArrangedPiece {
@@ -393,10 +397,13 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
   // layer order; flipNormals encodes the triangle's outside sign). Looked up from settings3d.
   const LAYER_MASK = 0x7fffffff;
   const OUTSIDE_FLAG = 0x80000000;
-  const pieceMeta = (pieceId: string): { layer: number; flip: boolean } => {
+  const pieceMeta = (pieceId: string): { layer: number; flip: boolean; filterFlag: number } => {
     const pc = pattern.pieces.find((p) => p.id === pieceId.replace(/#M$/, ''));
     const layer = Math.min(LAYER_MASK, Math.max(0, (pc?.settings3d.collisionLayer ?? 0) >>> 0));
-    return { layer, flip: !!pc?.settings3d.flipNormals };
+    const flip = !!pc?.settings3d.flipNormals;
+    // Body-collision cloth-normal filter flag: 0 off, +1 on, -1 on+flip (per the original).
+    const filterFlag = pc?.settings3d.filterExternalCollisionsByClothNormal ? (flip ? -1 : 1) : 0;
+    return { layer, flip, filterFlag };
   };
 
   // Global cloth triangle list for self-collision: vec4u [a, b, c, meta]. meta packs the collision
@@ -406,17 +413,30 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
   for (const sp of simPieces) triCount += sp.triangles.length / 3;
   const triangles = new Uint32Array(triCount * 4);
   const particleLayers = new Uint32Array(total);
+  // Incident triangles for the body-collision cloth-normal filter: per particle a filter flag + the
+  // global indices of the cloth triangles it belongs to (used to estimate the cloth surface normal).
+  const MAX_INCIDENT = 8;
+  const incidentStride = MAX_INCIDENT + 1;
+  const incidentTriangles = new Int32Array(total * incidentStride).fill(-1);
+  const incidentCount = new Uint8Array(total); // filled slots per particle (excl. the flag slot)
   {
     let o = 0;
+    let triGlobal = 0;
     for (const sp of simPieces) {
-      const { layer, flip } = pieceMeta(sp.pieceId);
+      const { layer, flip, filterFlag } = pieceMeta(sp.pieceId);
       const meta = (layer & LAYER_MASK) | (flip ? OUTSIDE_FLAG : 0);
-      for (let k = 0; k < sp.count; k++) particleLayers[sp.start + k] = layer;
+      for (let k = 0; k < sp.count; k++) {
+        particleLayers[sp.start + k] = layer;
+        incidentTriangles[(sp.start + k) * incidentStride] = filterFlag; // slot 0 = flag
+      }
       for (let t = 0; t < sp.triangles.length; t += 3) {
-        triangles[o++] = sp.triangles[t];
-        triangles[o++] = sp.triangles[t + 1];
-        triangles[o++] = sp.triangles[t + 2];
-        triangles[o++] = meta;
+        const a = sp.triangles[t], b = sp.triangles[t + 1], c = sp.triangles[t + 2];
+        triangles[o++] = a; triangles[o++] = b; triangles[o++] = c; triangles[o++] = meta;
+        for (const v of [a, b, c]) {
+          const n = incidentCount[v];
+          if (n < MAX_INCIDENT) { incidentTriangles[v * incidentStride + 1 + n] = triGlobal; incidentCount[v] = n + 1; }
+        }
+        triGlobal++;
       }
     }
   }
@@ -435,6 +455,7 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
   return {
     particleCount: total, positions, arrangedPositions, positions2d, anchors,
     stretchColors, bendColors, seams, pieces: simPieces,
-    triangles, triangleCount: triCount, particleLayers, neighborIndices
+    triangles, triangleCount: triCount, particleLayers, neighborIndices,
+    incidentTriangles, maxIncidentTrianglesPerParticle: MAX_INCIDENT
   };
 }

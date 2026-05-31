@@ -67,6 +67,9 @@ export class ClothEngine {
   private hashPositions!: GPUBuffer;
   private nearTriangles!: GPUBuffer;
   private neighborIndices!: GPUBuffer;
+  private incidentTriangles!: GPUBuffer; // body-collision cloth-normal filter
+  private maxIncident: number;
+  private canFilter = false; // device has ≥9 storage buffers/stage -> body-collision normal filter on
 
   private integratePipe!: GPUComputePipeline;
   private distancePipe!: GPUComputePipeline;
@@ -112,6 +115,8 @@ export class ClothEngine {
     this.config = config;
     this.particleCount = sim.particleCount;
     this.triangleCount = sim.triangleCount;
+    this.maxIncident = sim.maxIncidentTrianglesPerParticle;
+    this.canFilter = (device.limits.maxStorageBuffersPerShaderStage ?? 8) >= 9 && this.maxIncident > 0;
     this.selfCollision = config.handleSelfCollisions && sim.triangleCount > 0;
     this.hashTableSize = config.internalHashTableMultiplier * Math.max(1, sim.triangleCount) + 1;
     this.anchorW = new Float32Array(this.particleCount);
@@ -157,6 +162,7 @@ export class ClothEngine {
     this.clothTriangles = this.buf(sim.triangles, STORAGE | COPY_DST);
     this.particleLayers = this.buf(sim.particleLayers, STORAGE | COPY_DST);
     this.neighborIndices = this.buf(sim.neighborIndices, STORAGE | COPY_DST);
+    this.incidentTriangles = this.buf(sim.incidentTriangles, STORAGE | COPY_DST);
     this.triangleCenters = d.createBuffer({ size: Math.max(16, this.triangleCount * 16), usage: STORAGE });
     this.hashTable = d.createBuffer({ size: this.hashTableSize * 4, usage: STORAGE });
     this.hashPositions = d.createBuffer({ size: Math.max(4, this.triangleCount * 4), usage: STORAGE });
@@ -198,7 +204,7 @@ export class ClothEngine {
     this.distancePipe = this.pipe(distanceConstraintWGSL(cfg));
     this.bendPipe = this.pipe(bendingConstraintWGSL(cfg));
     this.seamPipe = this.pipe(seamWGSL(cfg, seamMaxDisplacementSq(cfg)));
-    this.collisionPipe = this.pipe(bodyCollisionWGSL(cfg));
+    this.collisionPipe = this.pipe(bodyCollisionWGSL(cfg, this.maxIncident, this.canFilter));
     this.applyPipe = this.pipe(applyCorrectionsWGSL());
     this.resetPipe = this.pipe(resetCorrectionsWGSL());
     this.velocityPipe = this.pipe(velocityWGSL(cfg));
@@ -259,7 +265,11 @@ export class ClothEngine {
         { binding: 4, resource: e(this.bodyTriangles) },
         { binding: 5, resource: e(this.cellStart) },
         { binding: 6, resource: e(this.cellTris) },
-        { binding: 7, resource: e(this.gridUniform) }
+        { binding: 7, resource: e(this.gridUniform) },
+        ...(this.canFilter ? [
+          { binding: 8, resource: e(this.clothTriangles) },
+          { binding: 9, resource: e(this.incidentTriangles) }
+        ] : [])
       ]
     });
     this.applyBG = d.createBindGroup({
@@ -377,7 +387,11 @@ export class ClothEngine {
         { binding: 4, resource: { buffer: this.bodyTriangles } },
         { binding: 5, resource: { buffer: this.cellStart } },
         { binding: 6, resource: { buffer: this.cellTris } },
-        { binding: 7, resource: { buffer: this.gridUniform } }
+        { binding: 7, resource: { buffer: this.gridUniform } },
+        ...(this.canFilter ? [
+          { binding: 8, resource: { buffer: this.clothTriangles } },
+          { binding: 9, resource: { buffer: this.incidentTriangles } }
+        ] : [])
       ]
     });
   }
@@ -546,7 +560,7 @@ export class ClothEngine {
   dispose() {
     for (const b of [this.positions, this.velocities, this.lastPositions, this.correction, this.anchors, this.simParams, this.positions2d, this.dynamicConfig, this.seams,
       this.readback, this.bodyPositions, this.bodyTriangles, this.cellStart, this.cellTris, this.gridUniform,
-      this.clothTriangles, this.triangleCenters, this.particleLayers, this.hashTable, this.hashPositions, this.nearTriangles, this.neighborIndices]) {
+      this.clothTriangles, this.triangleCenters, this.particleLayers, this.hashTable, this.hashPositions, this.nearTriangles, this.neighborIndices, this.incidentTriangles]) {
       try { b?.destroy(); } catch { /* ignore */ }
     }
     for (const g of [...this.stretchGroups, ...this.bendGroups]) { g.edges.destroy(); g.props.destroy(); }
