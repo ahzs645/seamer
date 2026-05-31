@@ -25,7 +25,9 @@
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
   import WelcomeModal from '$lib/components/WelcomeModal.svelte';
-  import { redraft, hasConstraints, makeParametric } from '$lib/solver/solve';
+  import { redraft, hasConstraints, makeParametric, solvePoints, resolveVariables, captureAlterationDelta } from '$lib/solver/solve';
+  import AlterationsPanel from '$lib/components/AlterationsPanel.svelte';
+  import type { AlterationTrack, BezierHandle } from '$lib/types/pattern';
 
   let currentPattern = $state<Pattern>(structuredClone(EMPTY_PATTERN));
   let saved = $state(true);
@@ -38,6 +40,85 @@
   let showObjectBrowser = $state(false);
   let showShortcuts = $state(false);
   let showGrading = $state(false);
+  let showAlterations = $state(false);
+  // Alteration edit mode: while active, the canvas shows the (driver-specific) formula BASE with
+  // alterations suppressed and live re-drafting frozen, so dragging points sticks. Saving a sample
+  // captures delta = edited − base; on exit we restore the base draft and re-apply via redraft.
+  const SUPPRESS = '__alt_edit_suppress__';
+  let alterationEdit = $state<{
+    trackId: string; driverVariableId: string; driverValue: number;
+    base: Record<string, { x: number; y: number }>;
+    baseHandles: Record<string, BezierHandle>;
+    canonicalPoints: Pattern['points']; canonicalPaths: Pattern['paths'];
+  } | null>(null);
+
+  function handleMap(p: Pattern): Map<string, BezierHandle> {
+    const m = new Map<string, BezierHandle>();
+    for (const pa of p.paths) for (const pp of pa.pathPoints) if (pp.handle) m.set(`${pa.id}:${pp.id}`, pp.handle);
+    return m;
+  }
+  /** Formula base geometry at a driver value, with this pattern's alterations suppressed. */
+  function baseAtDriver(p: Pattern, driverVariableId: string, driverValue: number) {
+    const suppressed = { ...p, gradingProfile: { ...(p.gradingProfile ?? { sizes: [] }), previewAlterationTrackId: SUPPRESS } } as Pattern;
+    const scope = resolveVariables(suppressed, driverVariableId ? { [driverVariableId]: driverValue } : {});
+    return solvePoints(suppressed, scope);
+  }
+  function applyBaseToCanvas(driverValue: number) {
+    if (!alterationEdit) return;
+    const solved = baseAtDriver(currentPattern, alterationEdit.driverVariableId, driverValue);
+    const base: Record<string, { x: number; y: number }> = {};
+    for (const [id, pt] of solved) base[id] = { x: pt.x, y: pt.y };
+    const points = currentPattern.points.map((p) => (base[p.id] ? { ...p, x: base[p.id].x, y: base[p.id].y } : p));
+    alterationEdit = { ...alterationEdit, driverValue, base };
+    currentPattern = { ...currentPattern, points };
+    pattern.set(currentPattern);
+  }
+  function startAlterationEdit(trackId: string, driverValue: number) {
+    const track = currentPattern.gradingProfile?.alterationTracks?.find((t) => t.id === trackId);
+    if (!track?.driverVariableId) { toastError('Assign a driver variable first'); return; }
+    const canonicalPoints = $state.snapshot(currentPattern).points as Pattern['points'];
+    const canonicalPaths = $state.snapshot(currentPattern).paths as Pattern['paths'];
+    const baseHandlesMap = handleMap(currentPattern);
+    const baseHandles: Record<string, BezierHandle> = {};
+    for (const [k, h] of baseHandlesMap) baseHandles[k] = structuredClone($state.snapshot(h)) as BezierHandle;
+    // suppress alterations so the displayed base isn't double-counted, then show base@driver
+    const gp = { ...(currentPattern.gradingProfile ?? { sizes: [] }), previewAlterationTrackId: SUPPRESS };
+    currentPattern = { ...currentPattern, gradingProfile: gp };
+    alterationEdit = { trackId, driverVariableId: track.driverVariableId, driverValue, base: {}, baseHandles, canonicalPoints, canonicalPaths };
+    applyBaseToCanvas(driverValue);
+  }
+  function saveAlterationSample() {
+    if (!alterationEdit) return;
+    const { trackId, driverValue, base, baseHandles } = alterationEdit;
+    if (Math.abs(driverValue) <= 1e-6) { toastError('Cannot save a sample at driver value 0'); return; }
+    const baseMap = new Map(Object.entries(base));
+    const editedMap = new Map(currentPattern.points.map((p) => [p.id, { x: p.x, y: p.y }]));
+    const baseHandleMap = new Map(Object.entries(baseHandles));
+    const delta = captureAlterationDelta(baseMap, editedMap, baseHandleMap, handleMap(currentPattern));
+    if (!Object.keys(delta.points).length && !Object.keys(delta.handles).length) { toastError('No changes to capture — drag a point first'); return; }
+    const tracks = (currentPattern.gradingProfile?.alterationTracks ?? []).map((t) => {
+      if (t.id !== trackId) return t;
+      const samples = t.samples.filter((s) => Math.abs(s.driverValue - driverValue) > 1e-6);
+      samples.push({ id: `alt_sample_${crypto.randomUUID().slice(0, 8)}`, driverValue, deltaGeometry: delta });
+      samples.sort((a, b) => a.driverValue - b.driverValue);
+      return { ...t, samples };
+    });
+    currentPattern = { ...currentPattern, gradingProfile: { ...(currentPattern.gradingProfile ?? { sizes: [] }), alterationTracks: tracks } };
+    pattern.set(currentPattern);
+    const n = Object.keys(delta.points).length + Object.keys(delta.handles).length;
+    toastSuccess(`Saved sample at ${driverValue} (${n} point${n === 1 ? '' : 's'})`);
+    applyBaseToCanvas(driverValue); // reset canvas back to base so further edits are relative to base
+  }
+  function endAlterationEdit(cancel: boolean) {
+    if (!alterationEdit) return;
+    const { canonicalPoints, canonicalPaths } = alterationEdit;
+    const tracks = cancel ? undefined : currentPattern.gradingProfile?.alterationTracks;
+    const gp = { ...(currentPattern.gradingProfile ?? { sizes: [] }), previewAlterationTrackId: null, ...(tracks ? { alterationTracks: tracks } : {}) };
+    let next = { ...currentPattern, points: canonicalPoints, paths: canonicalPaths, gradingProfile: gp, hasChanged: true } as Pattern;
+    if (hasConstraints(next)) next = redraft(next);
+    alterationEdit = null;
+    currentPattern = next; saved = false; pattern.set(next);
+  }
 
   const templatePatterns: Record<string, { name: string; description: string; file: string }> = {
     'parametric-skirt': { name: 'Parametric Skirt ✨', description: 'Truly parametric: waist/hip/length variables re-draft the geometry; grades by size', file: 'parametric-skirt.json' },
@@ -88,8 +169,9 @@
 
   function handlePatternUpdate(updated: Pattern) {
     if (JSON.stringify(currentPattern) !== JSON.stringify(updated)) pushUndo($state.snapshot(currentPattern) as Pattern);
-    // live re-draft: recompute formula-constrained points from variables/measurements
-    if (hasConstraints(updated)) {
+    // live re-draft: recompute formula-constrained points from variables/measurements.
+    // Frozen during alteration edit mode so manual point drags stick (they become the captured delta).
+    if (hasConstraints(updated) && !alterationEdit) {
       const solved = redraft(updated);
       if (JSON.stringify(solved.points) !== JSON.stringify(updated.points) || JSON.stringify(solved.variables) !== JSON.stringify(updated.variables)) {
         updated = solved;
@@ -424,7 +506,7 @@
     </div>
 
     {#if showRightPanel}
-      <PropertyPanel {currentPattern} onchange={handlePatternUpdate} onclose={() => (showRightPanel = false)} {labelDisplay} onlabeldisplaychange={(v) => (labelDisplay = v)} ongrading={() => (showGrading = true)} />
+      <PropertyPanel {currentPattern} onchange={handlePatternUpdate} onclose={() => (showRightPanel = false)} {labelDisplay} onlabeldisplaychange={(v) => (labelDisplay = v)} ongrading={() => (showGrading = true)} onalterations={() => (showAlterations = true)} />
     {/if}
   </div>
 
@@ -443,3 +525,15 @@
 <Toaster />
 <ConfirmDialog />
 {#if showGrading}<GradingOverlay {currentPattern} onclose={() => (showGrading = false)} />{/if}
+{#if showAlterations}
+  <AlterationsPanel
+    {currentPattern}
+    onchange={handlePatternUpdate}
+    editState={alterationEdit}
+    onclose={() => (showAlterations = false)}
+    onstartedit={startAlterationEdit}
+    onsetdriver={applyBaseToCanvas}
+    onsavesample={saveAlterationSample}
+    onendedit={endAlterationEdit}
+  />
+{/if}

@@ -59,8 +59,7 @@ test('edge pivot toggle lets you rotate around either endpoint', async ({ page }
 	await expect(page.locator('span', { hasText: /^Properties for Edge/ })).toBeVisible();
 
 	// the Pivot control shows two endpoint buttons; the first (from) is active by default
-	const pivot = page.locator('div.join').filter({ has: page.locator('button.join-item') }).first();
-	const pivotButtons = pivot.locator('button.join-item');
+	const pivotButtons = page.getByTestId('edge-pivot').locator('button.join-item');
 	await expect(pivotButtons).toHaveCount(2);
 	await expect(pivotButtons.nth(0)).toHaveClass(/btn-active/);
 

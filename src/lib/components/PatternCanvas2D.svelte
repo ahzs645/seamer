@@ -20,6 +20,7 @@
     seamColor,
     polygonCentroid,
     pointInPolygon,
+    offsetPolygon,
     type Vec2,
     type PlacedPoint
   } from '$lib/utils/patternGeometry';
@@ -52,6 +53,40 @@
   let measureFrom: string | null = $state(null);
   let showSeams = $state(false); // manual "pin seams on" override; otherwise seams show with the seam tool
   let showBody = $state(true);
+
+  // Background reference image to trace over (local file; not persisted). Placed in world mm, centred
+  // on (bgX, bgY), `bgWidthMm` wide (height keeps aspect), drawn behind the pattern at `bgOpacity`.
+  let bgImage = $state<HTMLImageElement | null>(null);
+  let bgUrl: string | null = null;
+  let showBgControls = $state(false);
+  let bgOpacity = $state(0.5);
+  let bgWidthMm = $state(300);
+  let bgX = $state(0);
+  let bgY = $state(0);
+  function loadBgImage(e: Event) {
+    const file = (e.currentTarget as HTMLInputElement).files?.[0];
+    if (!file) return;
+    if (bgUrl) URL.revokeObjectURL(bgUrl);
+    bgUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { bgImage = img; render(); };
+    img.src = bgUrl;
+  }
+  function clearBgImage() {
+    if (bgUrl) { URL.revokeObjectURL(bgUrl); bgUrl = null; }
+    bgImage = null;
+    render();
+  }
+  // HPGL (plotter) vector overlay — parsed to polylines (mm), drawn offset by (bgX, bgY).
+  let hpglPolys = $state<Vec2[][] | null>(null);
+  async function loadHpgl(e: Event) {
+    const file = (e.currentTarget as HTMLInputElement).files?.[0];
+    if (!file) return;
+    const { parseHPGL } = await import('$lib/utils/hpgl');
+    hpglPolys = parseHPGL(await file.text());
+    render();
+  }
+  function clearHpgl() { hpglPolys = null; render(); }
   const isSeamToolActive = () => $selectedTool === 'seam' || $selectedTool === 'seam-single' || $selectedTool === 'seam-multi';
   // pen / create-piece in-progress point ids
   let penDraft = $state<string[]>([]);
@@ -407,6 +442,34 @@
     c.fillStyle = isDark ? '#15191e' : '#fafafa';
     c.fillRect(0, 0, canvasW, canvasH);
 
+    // background reference image (trace-over), behind the grid + pattern
+    if (bgImage && bgImage.naturalWidth > 0) {
+      const wPx = bgWidthMm * baseScale();
+      const hPx = wPx * (bgImage.naturalHeight / bgImage.naturalWidth);
+      const cc = toCanvas({ x: bgX, y: bgY });
+      c.save();
+      c.globalAlpha = bgOpacity;
+      c.imageSmoothingEnabled = true;
+      c.drawImage(bgImage, cc.x - wPx / 2, cc.y - hPx / 2, wPx, hPx);
+      c.restore();
+    }
+    if (hpglPolys && hpglPolys.length) {
+      c.save();
+      c.globalAlpha = bgOpacity;
+      c.strokeStyle = isDark ? '#7dd3fc' : '#0369a1';
+      c.lineWidth = 1;
+      for (const poly of hpglPolys) {
+        if (poly.length < 2) continue;
+        c.beginPath();
+        for (let i = 0; i < poly.length; i++) {
+          const cp = toCanvas({ x: poly[i].x + bgX, y: poly[i].y + bgY });
+          if (i === 0) c.moveTo(cp.x, cp.y); else c.lineTo(cp.x, cp.y);
+        }
+        c.stroke();
+      }
+      c.restore();
+    }
+
     if (currentPattern.showGrid) {
       const step = GRID_MM * baseScale();
       if (step > 4) {
@@ -483,6 +546,20 @@
         c.setLineDash([]);
       }
 
+      // seam allowance — a dashed offset of the boundary (outward, or inward if the piece is set so)
+      const sa = currentPattern.seamAllowance ?? 0;
+      if (sa > 0.05 && outline.length >= 3) {
+        const allow = offsetPolygon(outline, piece.seamAllowanceInside ? -sa : sa);
+        c.save();
+        c.strokeStyle = isSelected ? 'rgba(29,78,216,0.5)' : 'rgba(30,41,59,0.4)';
+        c.lineWidth = 1;
+        c.setLineDash([3, 3]);
+        tracePoly(c, allow, true);
+        c.stroke();
+        c.setLineDash([]);
+        c.restore();
+      }
+
       // grain line through centroid (magenta, like the source)
       const cen = polygonCentroid(outline);
       const o0 = tf({ x: 0, y: 0 });
@@ -542,11 +619,28 @@
           const py = poly[i - 1].y + (poly[i].y - poly[i - 1].y) * f;
           let tx = poly[i].x - poly[i - 1].x, ty = poly[i].y - poly[i - 1].y;
           const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+          const nx = -ty, ny = tx; // edge normal
           const len = ((notch.size as number) || currentPattern.defaultNotchSize || 6.35);
-          const a = toCanvas({ x: px - ty * len, y: py + tx * len });
-          const b = toCanvas({ x: px + ty * len, y: py - tx * len });
+          const type = (notch.type as string) || currentPattern.defaultNotchType || 'single';
           c.strokeStyle = isDark ? '#cbd5e1' : '#1e293b'; c.lineWidth = 1.5; c.setLineDash([]);
-          c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(b.x, b.y); c.stroke();
+          // one tick crossing the edge along its normal, offset `o` mm along the tangent
+          const tick = (o: number) => {
+            const a = toCanvas({ x: px + tx * o + nx * len, y: py + ty * o + ny * len });
+            const b = toCanvas({ x: px + tx * o - nx * len, y: py + ty * o - ny * len });
+            c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(b.x, b.y); c.stroke();
+          };
+          if (type === 'double') { tick(-len * 0.55); tick(len * 0.55); } // balance notch
+          else if (type === 'slit') { // shallow V pointing across the edge
+            const tip = toCanvas({ x: px, y: py });
+            const l = toCanvas({ x: px + tx * len * 0.6 + nx * len, y: py + ty * len * 0.6 + ny * len });
+            const r = toCanvas({ x: px - tx * len * 0.6 + nx * len, y: py - ty * len * 0.6 + ny * len });
+            c.beginPath(); c.moveTo(l.x, l.y); c.lineTo(tip.x, tip.y); c.lineTo(r.x, r.y); c.stroke();
+          } else if (type === 'tee') { // tick + a tangential crossbar at the edge (a plus)
+            tick(0);
+            const a = toCanvas({ x: px + tx * len, y: py + ty * len });
+            const b = toCanvas({ x: px - tx * len, y: py - ty * len });
+            c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(b.x, b.y); c.stroke();
+          } else tick(0); // single
         }
       }
     }
@@ -861,7 +955,7 @@
   function addNotch(piecePathId: string, position: number) {
     mutatePieces((ps) => ps.map((pc) => ({
       ...pc,
-      mainPaths: pc.mainPaths.map((pp) => pp.id === piecePathId ? { ...pp, notches: [...(pp.notches ?? []), { id: uid('Notch'), position, size: currentPattern.defaultNotchSize }] } : pp)
+      mainPaths: pc.mainPaths.map((pp) => pp.id === piecePathId ? { ...pp, notches: [...(pp.notches ?? []), { id: uid('Notch'), position, size: currentPattern.defaultNotchSize, type: currentPattern.defaultNotchType ?? 'single' }] } : pp)
     })));
     toast('Added notch', 'success');
   }
@@ -1413,7 +1507,40 @@
     onclick={() => { showBody = !showBody; render(); }}
   >Body</button>
   <button class="btn btn-xs btn-ghost" title="Fit pieces to view" onclick={() => { fitView(); render(); }}>Fit</button>
+  <button class="btn btn-xs" class:btn-active={!!bgImage || !!hpglPolys || showBgControls} title="Trace over a reference image or HPGL file" onclick={() => (showBgControls = !showBgControls)}>Trace</button>
 </div>
+
+{#if showBgControls}
+  <div class="absolute top-10 left-2 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-52">
+    <div class="flex items-center justify-between"><span class="font-bold">Trace overlay</span>
+      <button class="btn btn-ghost btn-xs btn-circle" aria-label="Close" onclick={() => (showBgControls = false)}>✕</button>
+    </div>
+    <div class="flex gap-1">
+      <label class="btn btn-xs flex-1">Image…
+        <input type="file" accept="image/*" class="hidden" onchange={loadBgImage} /></label>
+      <label class="btn btn-xs flex-1">HPGL…
+        <input type="file" accept=".hpgl,.plt,.hp,text/plain" class="hidden" onchange={loadHpgl} /></label>
+    </div>
+    {#if bgImage || hpglPolys}
+      <label class="flex flex-col gap-0.5"><span class="flex justify-between"><span>Opacity</span><span class="opacity-60">{bgOpacity.toFixed(2)}</span></span>
+        <input type="range" class="range range-xs" min="0.05" max="1" step="0.05" value={bgOpacity} oninput={(e) => { bgOpacity = parseFloat(e.currentTarget.value); render(); }} /></label>
+      {#if bgImage}
+        <label class="flex items-center justify-between gap-2">Width (mm)
+          <input type="number" step="10" class="input input-bordered input-xs w-20" value={bgWidthMm} oninput={(e) => { bgWidthMm = parseFloat(e.currentTarget.value) || 1; render(); }} /></label>
+      {/if}
+      <div class="grid grid-cols-2 gap-1">
+        <label class="flex items-center gap-1">X<input type="number" step="5" class="input input-bordered input-xs w-full" value={bgX} oninput={(e) => { bgX = parseFloat(e.currentTarget.value) || 0; render(); }} /></label>
+        <label class="flex items-center gap-1">Y<input type="number" step="5" class="input input-bordered input-xs w-full" value={bgY} oninput={(e) => { bgY = parseFloat(e.currentTarget.value) || 0; render(); }} /></label>
+      </div>
+      <div class="flex gap-1">
+        {#if bgImage}<button class="btn btn-xs btn-ghost flex-1" onclick={clearBgImage}>Remove image</button>{/if}
+        {#if hpglPolys}<button class="btn btn-xs btn-ghost flex-1" onclick={clearHpgl}>Remove HPGL</button>{/if}
+      </div>
+    {:else}
+      <p class="opacity-50 leading-tight">Trace over a reference photo/sketch or an HPGL/.plt plotter file. Not saved with the pattern.</p>
+    {/if}
+  </div>
+{/if}
 
 <DrawingTools />
 

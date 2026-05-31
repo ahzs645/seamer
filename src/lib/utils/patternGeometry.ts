@@ -240,7 +240,9 @@ export function pieceGeometrySignature(pattern: Pattern, piece: Piece): string {
   const outline = enc(pieceOutline(pattern, piece, paths, points, 4));
   const internals = pieceInternalPolylines(pattern, piece, paths, points, 4).map(enc).join('|');
   const g = piece.grainVector ?? { x: 0, y: 1 };
-  return `${outline}#${internals}#g${r(g.x)},${r(g.y)}#pd${piece.settings3d.particleDistance ?? ''}`;
+  // the mirror/fold line changes the 3D cloth (it reflects across it), so it must affect the signature
+  const mirror = piece.mainPaths.find((pp) => pp.isMirrorLine)?.id ?? '';
+  return `${outline}#${internals}#g${r(g.x)},${r(g.y)}#pd${piece.settings3d.particleDistance ?? ''}#m${mirror}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +523,39 @@ export function polygonCentroid(poly: Vec2[]): Vec2 {
   let y = 0;
   for (const p of poly) { x += p.x; y += p.y; }
   return { x: x / poly.length, y: y / poly.length };
+}
+
+/**
+ * Offset a closed polygon by `dist` mm using miter joins (for seam allowance). Positive `dist`
+ * grows the polygon outward, negative shrinks it inward — independent of vertex winding. Sharp
+ * corners are clamped by a miter limit so spikes don't blow up. Returns a new vertex per input vertex.
+ */
+export function offsetPolygon(poly: Vec2[], dist: number, miterLimit = 4): Vec2[] {
+  const n = poly.length;
+  if (n < 3 || dist === 0) return poly.map((p) => ({ ...p }));
+  let area = 0;
+  for (let i = 0; i < n; i++) { const a = poly[i], b = poly[(i + 1) % n]; area += a.x * b.y - b.x * a.y; }
+  const ccw = area > 0; // outward normal of a directed edge is to its right for a CCW loop
+  const unit = (x: number, y: number): Vec2 => { const l = Math.hypot(x, y) || 1; return { x: x / l, y: y / l }; };
+  const out: Vec2[] = [];
+  for (let i = 0; i < n; i++) {
+    const prev = poly[(i - 1 + n) % n], cur = poly[i], next = poly[(i + 1) % n];
+    const e0 = unit(cur.x - prev.x, cur.y - prev.y);
+    const e1 = unit(next.x - cur.x, next.y - cur.y);
+    const n0 = ccw ? { x: e0.y, y: -e0.x } : { x: -e0.y, y: e0.x };
+    const n1 = ccw ? { x: e1.y, y: -e1.x } : { x: -e1.y, y: e1.x };
+    const denom = 1 + (n0.x * n1.x + n0.y * n1.y);
+    let off: Vec2;
+    if (Math.abs(denom) < 1e-4) off = { x: n0.x * dist, y: n0.y * dist }; // near-180° edge
+    else {
+      off = { x: (dist * (n0.x + n1.x)) / denom, y: (dist * (n0.y + n1.y)) / denom };
+      const cap = Math.abs(dist) * miterLimit;
+      const ol = Math.hypot(off.x, off.y);
+      if (ol > cap && ol > 0) { off.x = (off.x * cap) / ol; off.y = (off.y * cap) / ol; }
+    }
+    out.push({ x: cur.x + off.x, y: cur.y + off.y });
+  }
+  return out;
 }
 
 export function pointInPolygon(p: Vec2, poly: Vec2[]): boolean {

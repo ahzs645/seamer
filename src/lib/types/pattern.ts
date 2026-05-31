@@ -97,10 +97,12 @@ export interface ConstrainablePath {
   mirrorLine?: string;
 }
 
+export type NotchType = 'single' | 'double' | 'slit' | 'tee';
 export interface Notch {
   id?: string;
   position?: number;
   size?: number;
+  type?: NotchType; // 'double'/'tee' read as balance notches
   [k: string]: unknown;
 }
 
@@ -321,6 +323,7 @@ export interface Pattern {
   lengthUnit: 'inch' | 'cm' | 'mm';
   angleUnit: 'degrees' | 'radians';
   defaultNotchSize: number; // mm
+  defaultNotchType?: NotchType; // glyph used for new notches
   isPublic: boolean;
   pointLabeling: 'numeric' | 'alphabetic' | string;
   pointPrefix: string;
@@ -413,6 +416,7 @@ export function createEmptyPattern(): Pattern {
     lengthUnit: 'inch',
     angleUnit: 'degrees',
     defaultNotchSize: 6.35,
+    defaultNotchType: 'single',
     isPublic: false,
     pointLabeling: 'numeric',
     pointPrefix: 'A',

@@ -2,7 +2,7 @@
 // formula-constrained points (offset / length+angle / sliding) in dependency order. Points without a
 // `constraint` keep their fixed x/y. Enables measurement-driven re-drafting and true grading.
 
-import type { Pattern, ConstrainablePoint, ConstrainablePath } from '$lib/types/pattern';
+import type { Pattern, ConstrainablePoint, ConstrainablePath, AlterationDelta, AlterationTrack, PathPoint, BezierHandle } from '$lib/types/pattern';
 import { evalExpr, referencedNames } from './formula';
 
 export type Scope = Record<string, number>;
@@ -220,15 +220,140 @@ export function hasConstraints(pattern: Pattern): boolean {
   return pattern.points.some((p) => !!p.constraint);
 }
 
-/** Return a copy of the pattern with variables resolved and constrained points recomputed. */
+// ---------------------------------------------------------------------------
+// Alterations (grading by example): point/handle deltas sampled at driver values, linearly interpolated.
+// Faithful port of the source — additive deltas, implicit zero sample, linear extrapolation past the ends.
+// ---------------------------------------------------------------------------
+
+const ALT_NEAR = 1e-6;
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const ZH = { v1: { x: 0, y: 0 }, v2: { x: 0, y: 0 } };
+
+export function emptyDelta(): AlterationDelta {
+  return { points: {}, handles: {} };
+}
+function cloneDelta(d: AlterationDelta): AlterationDelta {
+  return JSON.parse(JSON.stringify(d ?? emptyDelta()));
+}
+const handleKey = (pathId: string, pointId: string) => `${pathId}:${pointId}`;
+
+/** Linearly blend two deltas (union of keys; missing keys treated as zero). */
+function interpolateDelta(A: AlterationDelta, B: AlterationDelta, t: number): AlterationDelta {
+  const out = emptyDelta();
+  for (const id of new Set([...Object.keys(A.points), ...Object.keys(B.points)])) {
+    const a = A.points[id] ?? { x: 0, y: 0 }, b = B.points[id] ?? { x: 0, y: 0 };
+    out.points[id] = { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) };
+  }
+  for (const id of new Set([...Object.keys(A.handles), ...Object.keys(B.handles)])) {
+    const a = A.handles[id] ?? ZH, b = B.handles[id] ?? ZH;
+    out.handles[id] = {
+      v1: { x: lerp(a.v1.x, b.v1.x, t), y: lerp(a.v1.y, b.v1.y, t) },
+      v2: { x: lerp(a.v2.x, b.v2.x, t), y: lerp(a.v2.y, b.v2.y, t) }
+    };
+  }
+  return out;
+}
+
+/** The interpolated delta for a track at a given driver value (null if the track has no samples). */
+export function alterationDeltaAtDriver(track: AlterationTrack, driverValue: number): AlterationDelta | null {
+  const exact = track.samples.find((s) => Math.abs(s.driverValue - driverValue) <= ALT_NEAR);
+  if (exact) return cloneDelta(exact.deltaGeometry);
+  const s = [...track.samples];
+  if (!s.some((x) => Math.abs(x.driverValue) <= ALT_NEAR)) s.push({ id: 'implicit-zero', driverValue: 0, deltaGeometry: emptyDelta() });
+  s.sort((a, b) => a.driverValue - b.driverValue);
+  if (s.length < 2) return null;
+  let r = s[0], o = s[1];
+  if (driverValue <= s[0].driverValue) { r = s[0]; o = s[1]; }
+  else if (driverValue >= s[s.length - 1].driverValue) { r = s[s.length - 2]; o = s[s.length - 1]; }
+  else for (let i = 0; i < s.length - 1; i++) { if (driverValue >= s[i].driverValue && driverValue <= s[i + 1].driverValue) { r = s[i]; o = s[i + 1]; break; } }
+  const l = o.driverValue - r.driverValue;
+  const h = Math.abs(l) <= ALT_NEAR ? 0 : (driverValue - r.driverValue) / l;
+  return interpolateDelta(r.deltaGeometry, o.deltaGeometry, h);
+}
+
+/** Accumulate every enabled track's interpolated delta into one combined additive delta for `scope`. */
+export function combinedAlterationDelta(pattern: Pattern, scope: Scope): AlterationDelta {
+  const out = emptyDelta();
+  const gp = pattern.gradingProfile;
+  const tracks = gp?.alterationTracks ?? [];
+  if (!tracks.length) return out;
+  const preview = gp?.previewAlterationTrackId ?? null;
+  for (const track of tracks) {
+    if (preview && track.id !== preview) continue;
+    if (!track.enabled || !track.driverVariableId || track.samples.length === 0) continue;
+    const driverValue = scope[track.driverVariableId];
+    if (typeof driverValue !== 'number' || !isFinite(driverValue)) continue;
+    const d = alterationDeltaAtDriver(track, driverValue);
+    if (!d) continue;
+    for (const id of Object.keys(d.points)) {
+      const p = d.points[id]; const cur = out.points[id] ?? { x: 0, y: 0 };
+      out.points[id] = { x: cur.x + p.x, y: cur.y + p.y };
+    }
+    for (const id of Object.keys(d.handles)) {
+      const hd = d.handles[id]; const cur = out.handles[id] ?? { v1: { x: 0, y: 0 }, v2: { x: 0, y: 0 } };
+      out.handles[id] = {
+        v1: { x: cur.v1.x + hd.v1.x, y: cur.v1.y + hd.v1.y },
+        v2: { x: cur.v2.x + hd.v2.x, y: cur.v2.y + hd.v2.y }
+      };
+    }
+  }
+  return out;
+}
+
+/**
+ * Capture the delta between an edited geometry and a base (delta = edited − base), keeping only
+ * point/handle offsets above `threshold` mm — the inverse of applying a delta. `base`/`edited` are the
+ * solved point maps; handle offsets come straight off the paths' BezierHandles (already anchor-relative).
+ */
+export function captureAlterationDelta(
+  base: Map<string, Pt>,
+  edited: Map<string, Pt>,
+  baseHandles: Map<string, BezierHandle>,
+  editedHandles: Map<string, BezierHandle>,
+  threshold = ALT_NEAR
+): AlterationDelta {
+  const out = emptyDelta();
+  for (const [id, e] of edited) {
+    const b = base.get(id); if (!b) continue;
+    const dx = e.x - b.x, dy = e.y - b.y;
+    if (Math.hypot(dx, dy) > threshold) out.points[id] = { x: dx, y: dy };
+  }
+  for (const [key, e] of editedHandles) {
+    const b = baseHandles.get(key); if (!b) continue;
+    const d = { v1: { x: e.v1.x - b.v1.x, y: e.v1.y - b.v1.y }, v2: { x: e.v2.x - b.v2.x, y: e.v2.y - b.v2.y } };
+    if (Math.hypot(d.v1.x, d.v1.y) > threshold || Math.hypot(d.v2.x, d.v2.y) > threshold) out.handles[key] = d;
+  }
+  return out;
+}
+
+/** Return a copy of the pattern with variables resolved, constrained points recomputed, alterations applied. */
 export function applySolved(pattern: Pattern, scope: Scope): Pattern {
   const solved = solvePoints(pattern, scope);
+  const delta = combinedAlterationDelta(pattern, scope);
   const points: ConstrainablePoint[] = pattern.points.map((p) => {
     const s = solved.get(p.id);
-    return s ? { ...p, x: s.x, y: s.y } : p;
+    const dp = delta.points[p.id];
+    if (!s && !dp) return p;
+    const x = (s ? s.x : p.x) + (dp ? dp.x : 0);
+    const y = (s ? s.y : p.y) + (dp ? dp.y : 0);
+    return { ...p, x, y };
   });
+  // Apply handle deltas onto curve path points (offsets are anchor-relative, so add directly).
+  const hKeys = Object.keys(delta.handles);
+  const paths = hKeys.length
+    ? pattern.paths.map((pa) => {
+        let touched = false;
+        const pathPoints = pa.pathPoints.map((pp: PathPoint) => {
+          const hd = delta.handles[handleKey(pa.id, pp.id)];
+          if (!hd || !pp.handle) return pp;
+          touched = true;
+          return { ...pp, handle: { ...pp.handle, v1: { x: pp.handle.v1.x + hd.v1.x, y: pp.handle.v1.y + hd.v1.y }, v2: { x: pp.handle.v2.x + hd.v2.x, y: pp.handle.v2.y + hd.v2.y } } };
+        });
+        return touched ? { ...pa, pathPoints } : pa;
+      })
+    : pattern.paths;
   const variables = pattern.variables.map((v) => (v.name in scope ? { ...v, value: scope[v.name] } : v));
-  return { ...pattern, points, variables };
+  return { ...pattern, points, paths, variables };
 }
 
 /** Re-draft from the pattern's own variable values/formulas (live editing). */

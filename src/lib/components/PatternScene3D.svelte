@@ -59,7 +59,7 @@
   function patternKey(p: Pattern, sigs = pieceSigs(p)): string {
     return JSON.stringify({
       body: p.body,
-      pieces: p.pieces.map((pc) => ({ id: pc.id, g: sigs.get(pc.id), a: pc.settings3d.arrangement, f: pc.settings3d.frozen, h: pc.hidden })),
+      pieces: p.pieces.map((pc) => ({ id: pc.id, g: sigs.get(pc.id), a: pc.settings3d.arrangement, f: pc.settings3d.frozen, h: pc.hidden, fn: pc.settings3d.flipNormals, cl: pc.settings3d.collisionLayer, fc: pc.settings3d.filterExternalCollisionsByClothNormal })),
       seams: p.seams.length,
       mats: p.materials.map((m) => ({ id: m.id, c: m.frontTexture?.color, sw: m.stretchWarpValue, wf: m.stretchWeftValue, b: m.bendValue, w: m.weight }))
     });
@@ -81,6 +81,7 @@
       poses = renderer?.poseNames() ?? [];
       renderer?.setHighlightedPiece(selectedPieceId);
       applyLabelDisplay();
+      renderer?.setShowSeams(currentPattern.settings3d.showSeams ?? false);
     });
   });
 
@@ -108,6 +109,7 @@
         poses = renderer?.poseNames() ?? [];
         renderer?.setHighlightedPiece(selectedPieceId);
         applyLabelDisplay();
+        renderer?.setShowSeams(snapshot.settings3d.showSeams ?? false);
       });
     }, 350);
   });
@@ -153,6 +155,9 @@
     renderer?.setLabelMode(labelDisplay === 'flat' ? 'flat' : 'billboard');
   }
   $effect(() => { void labelDisplay; applyLabelDisplay(); });
+  // live-apply the "Show seams (3D)" toggle from the Properties panel
+  $effect(() => { const on = currentPattern.settings3d.showSeams ?? false; renderer?.setShowSeams(on); });
+  function setView(v: 'front' | 'back' | 'left' | 'right' | 'top' | 'reset') { renderer?.setCameraView(v); }
   function downloadOBJ() {
     if (!renderer) return;
     const obj = renderer.exportOBJ();
@@ -176,10 +181,12 @@
   // Simulation controls: expose the solver parameters (matches the source's "Simulation controls").
   let showSimPanel = $state(false);
   let simCfg = $state<SimConfig | null>(null);
+  let cameraFov = $state(54);
   function toggleSimPanel() {
     showSimPanel = !showSimPanel;
-    if (showSimPanel && renderer) simCfg = renderer.getSimConfig();
+    if (showSimPanel && renderer) { simCfg = renderer.getSimConfig(); cameraFov = renderer.getCameraFov(); }
   }
+  function setFov(v: number) { cameraFov = v; renderer?.setCameraFov(v); }
   function setSim(patch: Partial<SimConfig>) {
     if (!renderer || !simCfg) return;
     simCfg = { ...simCfg, ...patch };
@@ -306,6 +313,12 @@
         </label>
       {/each}
       <p class="opacity-50 leading-tight pt-1">Changes apply immediately; the drape is preserved.</p>
+      <div class="border-t border-base-300 pt-2">
+        <label class="flex flex-col gap-0.5">
+          <span class="flex justify-between"><span>Camera FOV</span><span class="opacity-60">{cameraFov.toFixed(0)}°</span></span>
+          <input type="range" class="range range-xs" min="20" max="90" step="1" value={cameraFov} oninput={(e) => setFov(parseFloat(e.currentTarget.value))} />
+        </label>
+      </div>
       <div class="border-t border-base-300 pt-2 space-y-1">
         <span class="font-bold">Frozen snapshot</span>
         {#if hasSnap}
@@ -323,6 +336,14 @@
       </div>
     </div>
   {/if}
+
+  <!-- Camera view presets -->
+  <div class="absolute top-2 right-2 z-10 join join-horizontal bg-base-200/85 backdrop-blur rounded-lg shadow">
+    {#each [['front', 'Front'], ['back', 'Back'], ['left', 'Left'], ['right', 'Right'], ['top', 'Top']] as [v, label]}
+      <button class="join-item btn btn-xs" title={`${label} view`} onclick={() => setView(v as 'front')}>{label[0]}</button>
+    {/each}
+    <button class="join-item btn btn-xs" title="Reset view" onclick={() => setView('reset')} aria-label="Reset view"><span class="material-symbols-rounded text-sm">refresh</span></button>
+  </div>
 
   <!-- Lighting-mode tabs + Save Image (mirrors the source's bottom bar) -->
   <div class="absolute bottom-2 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2">

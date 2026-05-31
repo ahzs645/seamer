@@ -4,8 +4,9 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
 	testDir: './e2e',
 	testMatch: '**/*.spec.ts',
-	timeout: 60_000,
-	expect: { timeout: 15_000 },
+	globalSetup: './e2e/global-setup.ts',
+	timeout: 90_000, // heavy three.js studio route compiles on first hit under a cold Vite server
+	expect: { timeout: 20_000 },
 	fullyParallel: false,
 	workers: 1, // single dev server on a fixed port — parallel workers race on it
 	retries: 1, // tolerate first-load flakiness (cold dev-server boot)

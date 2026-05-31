@@ -2,6 +2,7 @@
   import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize, PointConstraint } from '$lib/types/pattern';
   import { selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
   import FormulaDialog from '$lib/components/FormulaDialog.svelte';
+  import { toastSuccess, toastError } from '$lib/stores/toast';
 
   interface Props {
     currentPattern: Pattern;
@@ -10,9 +11,10 @@
     labelDisplay?: 'off' | 'billboard' | 'flat';
     onlabeldisplaychange?: (v: 'off' | 'billboard' | 'flat') => void;
     ongrading?: () => void;
+    onalterations?: () => void;
   }
 
-  let { currentPattern, onchange, onclose, labelDisplay = 'flat', onlabeldisplaychange, ongrading }: Props = $props();
+  let { currentPattern, onchange, onclose, labelDisplay = 'flat', onlabeldisplaychange, ongrading, onalterations }: Props = $props();
 
   const editingPoint = $derived<ConstrainablePoint | null>(
     $selectedPointIds.size === 1 ? currentPattern.points.find((p) => p.id === [...$selectedPointIds][0]) ?? null : null
@@ -104,6 +106,13 @@
   function removeMainPath(pp: PiecePath) {
     updatePiece((p) => ({ ...p, mainPaths: p.mainPaths.filter((x) => x.id !== pp.id) }));
   }
+  // Mark a boundary edge as the piece's mirror/fold line: the cloth is reflected across it for a
+  // symmetric whole (drafted as a half). One mirror line per piece, so enabling clears the others.
+  function toggleMirrorLine(pp: PiecePath) {
+    const enabling = !pp.isMirrorLine;
+    updatePiece((p) => ({ ...p, mainPaths: p.mainPaths.map((x) =>
+      x.id === pp.id ? { ...x, isMirrorLine: enabling } : (enabling ? { ...x, isMirrorLine: false } : x)) }));
+  }
 
   const sections = [
     { id: 'general', icon: 'edit', title: 'General' },
@@ -121,6 +130,57 @@
 
   function updatePattern(partial: Partial<Pattern>) {
     onchange({ ...currentPattern, ...partial, hasChanged: true });
+  }
+
+  // ---- Edge symmetry: mirror the selected edge across a chosen axis path ----
+  let mirrorAxisId = $state('');
+  // candidate axes: any other path with at least two points
+  const axisCandidates = $derived(
+    !editingEdge ? [] : currentPattern.paths.filter((p) => p.id !== editingEdge.path.id && p.pathPoints.length >= 2)
+  );
+  function reflectPt(px: number, py: number, ax: number, ay: number, bx: number, by: number) {
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1;
+    const t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    const projx = ax + t * dx, projy = ay + t * dy;
+    return { x: 2 * projx - px, y: 2 * projy - py };
+  }
+  function createMirror() {
+    if (!editingEdge) return;
+    const src = editingEdge.path;
+    const axis = currentPattern.paths.find((p) => p.id === mirrorAxisId);
+    if (!axis || axis.pathPoints.length < 2) { toastError('Pick an axis path with at least two points'); return; }
+    const ptById = new Map(currentPattern.points.map((p) => [p.id, p]));
+    const a = ptById.get(axis.pathPoints[0].id);
+    const b = ptById.get(axis.pathPoints[axis.pathPoints.length - 1].id);
+    if (!a || !b) { toastError('Axis endpoints not found'); return; }
+    const newPoints: ConstrainablePoint[] = [];
+    const newPathPoints: ConstrainablePath['pathPoints'] = [];
+    for (const pp of src.pathPoints) {
+      const sp = ptById.get(pp.id);
+      if (!sp) continue;
+      const r = reflectPt(sp.x, sp.y, a.x, a.y, b.x, b.y);
+      const id = uid('Point');
+      // explicit mirror constraint → solvePoints resolves it as reflect(source, axis ends) parametrically
+      newPoints.push({ id, name: `${sp.name}'`, x: r.x, y: r.y, layerId: sp.layerId, constraint: { type: 'mirror', source: sp.id, axisPath: axis.id } });
+      // reflect bezier handles too (a reflection reverses orientation → swap in/out tangents)
+      let handle = pp.handle;
+      if (pp.handle) {
+        const h = pp.handle;
+        const m1 = reflectPt(sp.x + h.v2.x, sp.y + h.v2.y, a.x, a.y, b.x, b.y);
+        const m2 = reflectPt(sp.x + h.v1.x, sp.y + h.v1.y, a.x, a.y, b.x, b.y);
+        handle = { ...h, v1: { x: m1.x - r.x, y: m1.y - r.y }, v2: { x: m2.x - r.x, y: m2.y - r.y } };
+      }
+      newPathPoints.push({ id, handle });
+    }
+    if (newPathPoints.length < 2) { toastError('Edge has too few points to mirror'); return; }
+    const newPath: ConstrainablePath = {
+      id: uid('Path'), name: `${src.name || 'Edge'} (mirror)`, layerId: src.layerId,
+      pathType: 'referenced', pathPoints: newPathPoints, version: 1,
+      referencedPath: src.id, mirrorLine: axis.id,
+      referencedFromPoint: src.pathPoints[0]?.id, referencedToPoint: src.pathPoints[src.pathPoints.length - 1]?.id
+    };
+    onchange({ ...currentPattern, points: [...currentPattern.points, ...newPoints], paths: [...currentPattern.paths, newPath], hasChanged: true });
+    toastSuccess(`Mirrored "${src.name || 'edge'}" across "${axis.name || 'axis'}"`);
   }
   function updateBody(partial: Partial<Pattern['body']>) {
     updatePattern({ body: { ...currentPattern.body, ...partial } });
@@ -197,7 +257,10 @@
   // ---- graded sizes ---------------------------------------------------------
   const SIZE_COLORS = ['#c91d1d', '#1d4ed8', '#15803d', '#a21caf', '#ea580c', '#0891b2'];
   const sizes = $derived(currentPattern.gradingProfile?.sizes ?? []);
-  function setSizes(next: Pattern['gradingProfile']) { updatePattern({ gradingProfile: next }); }
+  // Merge into the existing profile so alteration tracks / anchors aren't dropped.
+  function setSizes(next: Partial<Pattern['gradingProfile'] & object>) {
+    updatePattern({ gradingProfile: { ...(currentPattern.gradingProfile ?? { sizes: [] }), ...next } });
+  }
   function addSize() {
     const list = sizes;
     const size = { id: uid('size'), name: `Size ${list.length + 1}`, scale: 1 + list.length * 0.05, color: SIZE_COLORS[list.length % SIZE_COLORS.length] };
@@ -314,7 +377,7 @@
       <p class="text-xs opacity-60">{ed.from.name} → {ed.to.name}{ed.path.pathType === 'curve' ? ' · curve (edits the chord)' : ''}</p>
       <div class="flex flex-col gap-0.5">
         <span class="text-xs opacity-70">Pivot (this end stays fixed)</span>
-        <div class="join">
+        <div class="join" data-testid="edge-pivot">
           <button class="join-item btn btn-xs flex-1" class:btn-active={edgePivot === 'from'} onclick={() => (edgePivot = 'from')}>{ed.from.name}</button>
           <button class="join-item btn btn-xs flex-1" class:btn-active={edgePivot === 'to'} onclick={() => (edgePivot = 'to')}>{ed.to.name}</button>
         </div>
@@ -334,6 +397,20 @@
         <button class="btn btn-xs flex-1" title="Rotate +1°" onclick={() => edgeMove(edgeLenMm, edgeAngleDeg + 1)}>+1°</button>
       </div>
       <p class="text-[11px] opacity-50">Edits move <b>{edgePivot === 'from' ? ed.to.name : ed.from.name}</b> around the pivot <b>{edgePivot === 'from' ? ed.from.name : ed.to.name}</b>. Shared points reshape the adjoining edge too.</p>
+
+      <div class="border-t border-base-200 pt-2 space-y-1">
+        <span class="text-xs font-semibold flex items-center gap-1"><span class="material-symbols-rounded text-sm">flip</span>Mirror across an axis</span>
+        {#if axisCandidates.length === 0}
+          <p class="text-[11px] opacity-50">Draw another line to use as the mirror axis, then select this edge again.</p>
+        {:else}
+          <select class="select select-bordered select-xs w-full" value={mirrorAxisId} onchange={(e) => (mirrorAxisId = e.currentTarget.value)}>
+            <option value="">Choose axis line…</option>
+            {#each axisCandidates as ax}<option value={ax.id}>{ax.name || ax.id.slice(0, 8)}</option>{/each}
+          </select>
+          <button class="btn btn-xs btn-primary btn-block" disabled={!mirrorAxisId} onclick={createMirror}>Create mirrored edge</button>
+          <p class="text-[11px] opacity-50">Adds a referenced edge whose points stay reflected across the axis (a parametric symmetry constraint).</p>
+        {/if}
+      </div>
     </div>
   {/if}
 
@@ -385,6 +462,11 @@
                     <button class="font-bold text-sm cursor-pointer hover:text-accent text-left" onclick={() => selectPath(pp)}>{pathName(pp.path)}</button>
                     <span class="mx-1 text-xs opacity-70">({pointName(pp.from)} → {pointName(pp.to)})</span>
                     <div class="flex items-center ml-auto gap-1">
+                      {#if s.id === 'seam'}
+                        <button class="material-symbols-rounded text-base" class:text-error={pp.isMirrorLine} class:opacity-60={!pp.isMirrorLine}
+                          title={pp.isMirrorLine ? 'Mirror/fold line (on) — cloth reflects across this edge' : 'Mark as mirror/fold line'}
+                          onclick={() => toggleMirrorLine(pp)}>flip</button>
+                      {/if}
                       <button class="material-symbols-rounded text-base opacity-60" title="Condition">calculate</button>
                       <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove" onclick={() => removeMainPath(pp)}>delete</button>
                     </div>
@@ -414,6 +496,13 @@
               </div>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.settings3d.frozen}
                 onchange={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, frozen: e.currentTarget.checked } }))} /> Frozen (pinned)</label>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.settings3d.flipNormals}
+                onchange={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, flipNormals: e.currentTarget.checked } }))} /> Flip cloth normals</label>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.settings3d.filterExternalCollisionsByClothNormal}
+                onchange={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, filterExternalCollisionsByClothNormal: e.currentTarget.checked } }))} /> Body collision by normal</label>
+              <label class="flex items-center justify-between gap-2">Collision layer
+                <input type="number" min="0" step="1" class="input input-bordered input-xs w-16" value={piece.settings3d.collisionLayer}
+                  oninput={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, collisionLayer: Math.max(0, parseInt(e.currentTarget.value) || 0) } }))} /></label>
               <hr class="border-base-200" />
               {@render labelSetting()}
             {/if}
@@ -504,8 +593,13 @@
                 <label class="flex flex-col gap-0.5 w-16">Prefix
                   <input type="text" class="input input-bordered input-xs" value={currentPattern.pointPrefix} oninput={(e) => updatePattern({ pointPrefix: e.currentTarget.value })} /></label>
               </div>
-              <label class="flex flex-col gap-0.5">Default notch size
-                <span class="flex items-center gap-2"><input type="number" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(currentPattern.defaultNotchSize).toFixed(2)} oninput={(e) => updatePattern({ defaultNotchSize: fromUnit(parseFloat(e.currentTarget.value) || 0) })} /><span class="opacity-60">{unitLabel}</span></span></label>
+              <div class="flex gap-2">
+                <label class="flex flex-col gap-0.5 flex-1">Default notch size
+                  <span class="flex items-center gap-2"><input type="number" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(currentPattern.defaultNotchSize).toFixed(2)} oninput={(e) => updatePattern({ defaultNotchSize: fromUnit(parseFloat(e.currentTarget.value) || 0) })} /><span class="opacity-60">{unitLabel}</span></span></label>
+                <label class="flex flex-col gap-0.5">Notch type
+                  <select class="select select-bordered select-xs" value={currentPattern.defaultNotchType ?? 'single'} onchange={(e) => updatePattern({ defaultNotchType: e.currentTarget.value as 'single' | 'double' | 'tee' | 'slit' })}>
+                    <option value="single">Single</option><option value="double">Double (balance)</option><option value="tee">Tee</option><option value="slit">Slit</option></select></label>
+              </div>
               <hr class="border-base-200" />
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.showGrid} onchange={(e) => updatePattern({ showGrid: e.currentTarget.checked })} /> Show grid</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.snapToGrid} onchange={(e) => updatePattern({ snapToGrid: e.currentTarget.checked })} /> Snap to grid</label>
@@ -543,6 +637,7 @@
                 </div>
               {/if}
               {#if ongrading}<button class="btn btn-xs btn-outline w-full" onclick={ongrading}><span class="material-symbols-rounded text-base">table_chart</span> Sizes &amp; grading overlay…</button>{/if}
+              {#if onalterations}<button class="btn btn-xs btn-outline w-full mt-1" onclick={onalterations}><span class="material-symbols-rounded text-base">tune</span> Alterations (grade by example)…</button>{/if}
 
               <!-- Variables -->
               <h6 class="border-b-2 border-base-200 font-semibold pb-1 mt-3">Variables</h6>

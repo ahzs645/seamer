@@ -280,14 +280,24 @@ export function buildSavedCloth(piece: Piece): SavedCloth | null {
   };
 }
 
+// Source-matched thresholds (Dg1PbtmY.js): a fresh particle within `tol` of a saved one reuses its
+// drape verbatim; the whole-piece reuse is abandoned for a flat arranged seed once too much of the new
+// shape lies outside the saved footprint.
+const ARRANGED_FALLBACK_OUTSIDE_RATIO = 0.5;
+
 /**
  * Map a freshly triangulated mesh onto a piece's cached drape so a 2D-edited piece keeps the drape it
- * already had wherever its shape is unchanged. Each new particle inherits the settled 3D position of the
- * nearest saved 2D particle (within `tol` mm); particles with no nearby saved point — a region the edit
- * added — are left at the caller's flat-on-body `fallback3d`. Mirrors the original's
- * `tryReuseSavedPositions`: returns the reused positions plus the fraction of particles that matched, so
- * the caller can decide whether to anchor to the reused drape (high overlap) or re-drape (low overlap).
- * Returns null when there is no usable saved blob.
+ * already had wherever its shape is unchanged. Three-way seed, mirroring the original's
+ * `tryReuseSavedPositions`:
+ *   1. EXACT REUSE — a fresh particle within `tol` mm of a saved particle inherits its settled 3D
+ *      verbatim (the shape there is unchanged).
+ *   2. KNN-FROM-DRAPE — a particle in an ADDED region (no saved particle within `tol`) is estimated by
+ *      inverse-distance-weighting the K nearest saved particles' 3D, so the new area FOLLOWS the
+ *      existing drape instead of sitting flat-on-body.
+ *   3. OUTSIDE-RATIO FALLBACK — if too much of the new shape lies outside the saved 2D footprint
+ *      (≥ 0.5), the edit changed the piece too much to reuse coherently → return null so the caller
+ *      seeds from the fresh cylinder arrangement instead.
+ * Returns the seeded positions + the fraction of particles that EXACTLY matched (informational).
  *
  * `meshPoints` (from buildPieceCloth) and the blob's 2D are both the piece's local 2D in mm (the blob's
  * stride-5 x2d/y2d are positions2d×1000), so the nearest-neighbour test is a like-for-like comparison.
@@ -295,38 +305,72 @@ export function buildSavedCloth(piece: Piece): SavedCloth | null {
 export function reuseSavedDrape(
   meshPoints: Vec2[],
   savedPositions: number[] | undefined,
-  fallback3d: Float32Array,
   particleDistanceMm: number
 ): { positions3d: Float32Array; matchRatio: number } | null {
   if (!savedPositions || savedPositions.length < 15) return null;
   const m = Math.floor(savedPositions.length / 5);
   const n = meshPoints.length;
   if (n === 0 || m === 0) return null;
+
+  // saved 2D footprint (mm), padded by a particle-spacing margin, to gauge how much of the new shape is new
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let j = 0; j < m; j++) {
+    const x = savedPositions[j * 5], y = savedPositions[j * 5 + 1];
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+  }
+  const margin = Math.max(particleDistanceMm, 8);
+  minX -= margin; minY -= margin; maxX += margin; maxY += margin;
+
   const out = new Float32Array(n * 3);
-  const tol = Math.max(particleDistanceMm * 1.5, 8); // mm — generous enough that unmoved particles match
+  const tol = Math.max(particleDistanceMm * 1.5, 8); // mm — unmoved particles reuse exactly
   const tol2 = tol * tol;
+  const K = Math.min(3, m);
+  const kd = new Float64Array(K); // K nearest distances²
+  const ki = new Int32Array(K); // their saved indices
   let matched = 0;
+  let outside = 0;
+
   for (let i = 0; i < n; i++) {
     const px = meshPoints[i].x;
     const py = meshPoints[i].y;
-    let best = Infinity;
-    let bj = -1;
+    if (px < minX || px > maxX || py < minY || py > maxY) outside++;
+
+    // K nearest saved particles (insertion into a tiny sorted list)
+    for (let t = 0; t < K; t++) { kd[t] = Infinity; ki[t] = -1; }
     for (let j = 0; j < m; j++) {
       const dx = px - savedPositions[j * 5];
       const dy = py - savedPositions[j * 5 + 1];
       const d2 = dx * dx + dy * dy;
-      if (d2 < best) { best = d2; bj = j; }
+      if (d2 < kd[K - 1]) {
+        let t = K - 1;
+        while (t > 0 && kd[t - 1] > d2) { kd[t] = kd[t - 1]; ki[t] = ki[t - 1]; t--; }
+        kd[t] = d2; ki[t] = j;
+      }
     }
-    if (bj >= 0 && best <= tol2) {
-      out[i * 3] = savedPositions[bj * 5 + 2];
-      out[i * 3 + 1] = savedPositions[bj * 5 + 3];
-      out[i * 3 + 2] = savedPositions[bj * 5 + 4];
+
+    if (kd[0] <= tol2) {
+      const j = ki[0];
+      out[i * 3] = savedPositions[j * 5 + 2];
+      out[i * 3 + 1] = savedPositions[j * 5 + 3];
+      out[i * 3 + 2] = savedPositions[j * 5 + 4];
       matched++;
     } else {
-      out[i * 3] = fallback3d[i * 3];
-      out[i * 3 + 1] = fallback3d[i * 3 + 1];
-      out[i * 3 + 2] = fallback3d[i * 3 + 2];
+      // inverse-distance-weighted estimate from the K nearest settled particles
+      let wsum = 0, x = 0, y = 0, z = 0;
+      for (let t = 0; t < K; t++) {
+        const j = ki[t];
+        if (j < 0) continue;
+        const w = 1 / (Math.sqrt(kd[t]) + 1e-6);
+        wsum += w;
+        x += w * savedPositions[j * 5 + 2];
+        y += w * savedPositions[j * 5 + 3];
+        z += w * savedPositions[j * 5 + 4];
+      }
+      if (wsum > 0) { out[i * 3] = x / wsum; out[i * 3 + 1] = y / wsum; out[i * 3 + 2] = z / wsum; }
     }
   }
+
+  if (outside / n >= ARRANGED_FALLBACK_OUTSIDE_RATIO) return null;
   return { positions3d: out, matchRatio: matched / n };
 }

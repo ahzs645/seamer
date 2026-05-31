@@ -3,20 +3,28 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import {
-  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, type Vec2
+  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, offsetPolygon, type Vec2
 } from './patternGeometry';
 
-interface Poly { pts: Vec2[]; closed: boolean }
+type Layer = 'pattern' | 'seam-allowance' | 'internal';
+interface Poly { pts: Vec2[]; closed: boolean; layer: Layer }
 
 function collectPolylines(pattern: Pattern): Poly[] {
   const paths = indexPaths(pattern);
   const points = indexPoints(pattern);
+  const sa = pattern.seamAllowance ?? 0;
   const out: Poly[] = [];
   for (const piece of pattern.pieces) {
     const outline = pieceWorldOutline(pattern, piece, paths, points, 2);
-    if (outline.length >= 2) out.push({ pts: outline, closed: true });
+    if (outline.length >= 2) {
+      out.push({ pts: outline, closed: true, layer: 'pattern' });
+      // seam allowance: the cut line, offset from the stitch outline (outward, or inward if set)
+      if (sa > 0.05 && outline.length >= 3) {
+        out.push({ pts: offsetPolygon(outline, piece.seamAllowanceInside ? -sa : sa), closed: true, layer: 'seam-allowance' });
+      }
+    }
     for (const ip of pieceWorldInternalPolylines(pattern, piece, paths, points, 2)) {
-      if (ip.length >= 2) out.push({ pts: ip, closed: false });
+      if (ip.length >= 2) out.push({ pts: ip, closed: false, layer: 'internal' });
     }
   }
   return out;
@@ -40,9 +48,14 @@ export function patternToSVG(pattern: Pattern): string {
   // SVG y is down; pattern y is up → flip y about maxY
   const X = (x: number) => (x - b.minX + pad).toFixed(2);
   const Y = (y: number) => (b.maxY - y + pad).toFixed(2);
+  const style: Record<Layer, string> = {
+    'pattern': 'stroke="#000" stroke-width="0.5"',
+    'seam-allowance': 'stroke="#888" stroke-width="0.4" stroke-dasharray="3,2"',
+    'internal': 'stroke="#444" stroke-width="0.35" stroke-dasharray="2,2"'
+  };
   const paths = polys.map((p) => {
     const d = p.pts.map((v, i) => `${i === 0 ? 'M' : 'L'}${X(v.x)},${Y(v.y)}`).join(' ') + (p.closed ? ' Z' : '');
-    return `  <path d="${d}" fill="none" stroke="#000" stroke-width="0.5"/>`;
+    return `  <path d="${d}" fill="none" ${style[p.layer]}/>`;
   }).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${w.toFixed(1)}mm" height="${h.toFixed(1)}mm" viewBox="0 0 ${w.toFixed(1)} ${h.toFixed(1)}">
@@ -54,7 +67,7 @@ export function patternToDXF(pattern: Pattern): string {
   const polys = collectPolylines(pattern);
   const lines: string[] = ['0', 'SECTION', '2', 'ENTITIES'];
   for (const p of polys) {
-    lines.push('0', 'LWPOLYLINE', '8', 'pattern', '90', String(p.pts.length), '70', p.closed ? '1' : '0');
+    lines.push('0', 'LWPOLYLINE', '8', p.layer, '90', String(p.pts.length), '70', p.closed ? '1' : '0');
     for (const v of p.pts) lines.push('10', v.x.toFixed(3), '20', v.y.toFixed(3));
   }
   lines.push('0', 'ENDSEC', '0', 'EOF');

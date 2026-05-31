@@ -86,9 +86,13 @@ export class PatternRenderer {
   // Live "hold" strength. The original solver has NO per-frame anchor; ours softly guides saved
   // pieces toward the cached drape (the original solver's own equilibrium) so our approximate solve
   // doesn't drift/curl. 1.0 froze it to a still image; a gentle value lets physics breathe/settle
-  // while staying faithful to the source's shape. (Verified: 0.25 keeps the waistband within ~5mm of
-  // the source drape vs ~24mm fully free, while moving far more than the old rigid 1.0.)
-  private static readonly LIVE_ANCHOR = 0.25;
+  // while staying faithful to the source's shape. The source itself has NO anchor — but a fully free
+  // settle (scale 0) slides the garment ~18-30cm off equilibrium (our solver lacks the source's
+  // implicit grip), so a small hold is load-bearing. A headless anchor sweep showed a sharp cliff:
+  // every nonzero scale holds the drape within <0.2mm drift (plateaued), only scale 0 drifts; 0.08
+  // even had the LOWEST over-stretch (1.58 vs 0.25's 1.69). So we relax to 0.08 — ~3x more give /
+  // closer to the source's free feel, while staying comfortably on the held side of the cliff.
+  private static readonly LIVE_ANCHOR = 0.08;
   private liveAnchorScale = PatternRenderer.LIVE_ANCHOR; // restored after an interactive grab
 
   private pattern: Pattern | null = null;
@@ -444,6 +448,10 @@ export class PatternRenderer {
   /** Build or update the avatar + cloth for a pattern. */
   async setPattern(pattern: Pattern, changedPieces?: Set<string>): Promise<void> {
     this.pattern = pattern;
+    // Source parity (transferToScene's `wasSimulatorRunning`): capture whether a user-run sim was live
+    // BEFORE we stop+rebuild, so we can restart it afterwards. The source re-settles an edited piece
+    // ONLY if the sim was already running; a cold edit stays manual (press Simulate) — which we match.
+    const wasRunning = this.userSimulating;
     this.stopSimulation();
     // Track whether the body changed vs the one the cached drape was authored on.
     const bodyKey = JSON.stringify(pattern.body);
@@ -469,6 +477,12 @@ export class PatternRenderer {
       this.setLightingMode(pattern.settings3d.lightingMode || 'flat');
       this.rebuildCloth(pattern, changedPieces);
       this.onStatus('ready');
+      // If the sim was live when the edit landed, re-settle the rebuilt cloth (the edited region drapes
+      // instead of sitting at its seed). ~100 ms after the rebuild, matching the source's deferred
+      // restart. simulate() recreates the sim from the fresh `prepared` via ensureSim().
+      if (wasRunning && !this.disposed) {
+        setTimeout(() => { if (!this.disposed && !this.simulating) void this.simulate(); }, 100);
+      }
     } catch (e) {
       this.onStatus('error', e instanceof Error ? e.message : String(e));
     }
@@ -527,7 +541,8 @@ export class PatternRenderer {
       // outward face and the "back side" badge on the reverse. Built unconditionally so toggling
       // label mode is a cheap uniform flip rather than a full cloth rebuild (which would re-drape).
       const { face: faceLabelTex, back: backLabelTex } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
-      const labelFlipFace = piece.pieceId.includes('#M'); // mirror instances have reversed winding
+      // mirror instances have reversed winding; flipNormals also inverts the outward face — XOR them.
+      const labelFlipFace = piece.pieceId.includes('#M') !== !!srcPiece?.settings3d.flipNormals;
       const labelOpacity = this.showLabels && !hidden && this.labelMode === 'flat' ? 1 : 0;
 
       // Our cloth triangles wind with their geometric front face pointing INWARD, so the outward
@@ -615,10 +630,12 @@ export class PatternRenderer {
       if (!label || entry.count === 0) continue;
       label.obj.position.set(cx / entry.count, cy / entry.count, cz / entry.count);
     }
+    this.updateSeamLines(global);
   }
 
   private clearClothMeshes() {
     this.clearSnapshot(); // a ghost from the old drape would be stale once pieces rebuild
+    this.clearSeamLines();
     for (const e of this.clothMeshes) {
       this.clothGroup.remove(e.mesh);
       e.geometry.dispose();
@@ -982,10 +999,12 @@ export class PatternRenderer {
       geo.setIndex(piece.triangles.map((g) => g - piece.start));
       geo.computeVertexNormals();
       // Bake the same name badges as the drape view so pieces keep their labels while being moved.
-      const name = this.pattern!.pieces.find((p) => p.id === piece.pieceId)?.name ?? 'Piece';
+      const srcPiece = this.pattern!.pieces.find((p) => p.id === piece.pieceId);
+      const name = srcPiece?.name ?? 'Piece';
       const { face, back } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
       const labelOpacity = this.showLabels && this.labelMode === 'flat' ? 1 : 0;
-      const mat = createGarmentMaterial(matById.get(piece.materialId), flat, { labelTexture: face, labelTextureBack: back, labelOpacity, labelFlipFace: piece.pieceId.includes('#M') });
+      const labelFlipFace = piece.pieceId.includes('#M') !== !!srcPiece?.settings3d.flipNormals;
+      const mat = createGarmentMaterial(matById.get(piece.materialId), flat, { labelTexture: face, labelTextureBack: back, labelOpacity, labelFlipFace });
       mat.wireframe = this.showTriangles;
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
@@ -1202,6 +1221,89 @@ export class PatternRenderer {
 
   hasSnapshot(): boolean {
     return !!this.snapshotGroup;
+  }
+
+  // ---- 3D seam lines: thin segments connecting sewn particle pairs, toggled by "Show seams" ----
+  private seamLines: THREE.LineSegments | null = null;
+  private seamPairs: number[] = []; // flat [a0,b0,a1,b1,...] global particle indices
+  private showSeams3d = false;
+
+  private buildSeamLines(): void {
+    if (!this.prepared) return;
+    const s = this.prepared.simData.seams;
+    const n = this.prepared.simData.particleCount;
+    this.seamPairs = [];
+    for (let i = 0; i < n; i++) for (let j = 0; j < 4; j++) {
+      const p = s[i * 4 + j];
+      if (p > i) this.seamPairs.push(i, p); // partner > i dedupes the symmetric entry
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.seamPairs.length * 3), 3));
+    const mat = new THREE.LineBasicMaterial({ color: 0xff3b6b, transparent: true, opacity: 0.9 });
+    this.seamLines = new THREE.LineSegments(geo, mat);
+    this.seamLines.frustumCulled = false;
+    this.seamLines.renderOrder = 3;
+    this.clothGroup.add(this.seamLines);
+  }
+
+  private updateSeamLines(global: Float32Array): void {
+    if (!this.seamLines || !this.seamLines.visible) return;
+    const attr = this.seamLines.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    for (let k = 0; k < this.seamPairs.length; k++) {
+      const g = this.seamPairs[k];
+      arr[k * 3] = global[g * 4]; arr[k * 3 + 1] = global[g * 4 + 1]; arr[k * 3 + 2] = global[g * 4 + 2];
+    }
+    attr.needsUpdate = true;
+  }
+
+  private clearSeamLines(): void {
+    if (!this.seamLines) return;
+    this.clothGroup.remove(this.seamLines);
+    this.seamLines.geometry.dispose();
+    (this.seamLines.material as THREE.Material).dispose();
+    this.seamLines = null;
+    this.seamPairs = [];
+  }
+
+  /** Toggle the 3D seam overlay (lines between sewn edges). */
+  setShowSeams(on: boolean): void {
+    this.showSeams3d = on;
+    if (on && !this.seamLines) this.buildSeamLines();
+    if (this.seamLines) {
+      this.seamLines.visible = on;
+      if (on) this.updateSeamLines(this.lastClothPositions ?? this.prepared?.simData.positions ?? new Float32Array());
+    }
+  }
+
+  /** Snap the camera to an orthographic-style preset around the current target. */
+  setCameraView(view: 'front' | 'back' | 'left' | 'right' | 'top' | 'reset'): void {
+    if (view === 'reset') {
+      this.camera.position.set(0.5, 0.9, 1.6);
+      this.controls.target.set(0, 0.9, 0);
+      this.controls.update();
+      return;
+    }
+    const t = this.controls.target;
+    const dist = this.camera.position.distanceTo(t) || 1.8;
+    const off = new THREE.Vector3();
+    if (view === 'front') off.set(0, 0, dist);
+    else if (view === 'back') off.set(0, 0, -dist);
+    else if (view === 'left') off.set(-dist, 0, 0);
+    else if (view === 'right') off.set(dist, 0, 0);
+    else off.set(0, dist, 0.001); // top (tiny z avoids a degenerate up vector)
+    this.camera.position.copy(t).add(off);
+    this.camera.lookAt(t);
+    this.controls.update();
+  }
+
+  /** Camera field of view (degrees). */
+  getCameraFov(): number {
+    return this.camera.fov;
+  }
+  setCameraFov(deg: number): void {
+    this.camera.fov = Math.max(10, Math.min(120, deg));
+    this.camera.updateProjectionMatrix();
   }
 
   /** Capture the current 3D view as a PNG data URL. Renders a fresh frame first, then reads the

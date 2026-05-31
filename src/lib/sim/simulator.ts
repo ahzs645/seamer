@@ -62,25 +62,26 @@ export function prepareCloth(
       flipNormals: piece.settings3d.flipNormals
     });
 
-    // An edited piece that previously had a drape: keep that drape wherever the shape is unchanged
-    // (each fresh particle inherits the nearest saved particle's 3D), and fall back to the arranged
-    // placement for any region the edit added. High overlap ⇒ anchor to the reused drape so it holds;
-    // low overlap ⇒ treat it as a fresh arrangement to re-drape. boundaryLocal lets it proximity-sew
-    // onto neighbouring saved-drape pieces (which carry no explicit edgeParticles). Matches the source.
-    const reuse = edited ? reuseSavedDrape(cloth.mesh.points, piece.settings3d.savedPositions, arranged3d, cloth.particleDistanceMm) : null;
+    // An edited piece that previously had a drape: reuse that drape via the source's 3-way seed —
+    // exact-reuse where the shape is unchanged, KNN-from-drape for added area (so it follows the drape,
+    // not flat-on-body), and a null return (handled below) when too much of the shape is new. The
+    // reconstructed drape is coherent, so gently anchor (fromSaved) to hold it; boundaryLocal lets it
+    // proximity-sew onto neighbouring saved-drape pieces (which carry no explicit edgeParticles).
+    const reuse = edited ? reuseSavedDrape(cloth.mesh.points, piece.settings3d.savedPositions, cloth.particleDistanceMm) : null;
     if (reuse) {
       arranged.push({
         cloth,
         positions3d: reuse.positions3d,
         arranged3d,
         frozen: piece.settings3d.frozen,
-        fromSaved: reuse.matchRatio >= 0.7,
+        fromSaved: true,
         boundaryLocal: cloth.mesh.boundary
       });
       continue;
     }
 
-    // Never-draped (or low-overlap edit / fromArrangement): seed from the arrangement and simulate.
+    // Never-draped (or the edit changed the shape too much to reuse / fromArrangement): seed from the
+    // cylinder arrangement and simulate.
     arranged.push({ cloth, positions3d: arranged3d, frozen: piece.settings3d.frozen, fromSaved: false });
   }
   if (arranged.length === 0) return null;
