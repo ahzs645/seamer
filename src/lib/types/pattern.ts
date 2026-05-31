@@ -16,7 +16,10 @@ export interface Formula {
 export type PointConstraint =
   | { type: 'offset'; from: string; dxFormula: string; dyFormula: string; unit?: string }
   | { type: 'lengthAngle'; from: string; lengthFormula: string; angleFormula: string; lengthUnit?: string; angleUnit?: string }
-  | { type: 'sliding'; path: string; positionFormula: string; from?: string; unit?: string };
+  // sliding: a point ON a path, by a distance formula from an anchor, or by a fixed arc-length fraction
+  | { type: 'sliding'; path: string; positionFormula?: string; from?: string; unit?: string; fraction?: number }
+  // mirror: a point reflected across the line defined by `axisPath`'s endpoints (referenced/mirror copies)
+  | { type: 'mirror'; source: string; axisPath: string };
 
 export interface ConstrainablePoint {
   id: string;

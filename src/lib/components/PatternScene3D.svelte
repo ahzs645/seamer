@@ -25,6 +25,9 @@
   let showTriangles = $state(false);
   let showAvatar = $state(true);
   let sceneMode = $state<SceneMode>('view');
+  // Which piece-edit tool is active while sceneMode === 'arrange': the flat-layout "Arrange" tool, or
+  // the in-place "Move pieces" tool that drags the draped pieces and eases them back on Drape.
+  let arrangeKind = $state<'arrange' | 'manipulate' | null>(null);
   let selectedPiece = $state<string | null>(null);
   let gizmoMode = $state<'translate' | 'rotate'>('translate');
   let lightingMode = $state<string>('flat');
@@ -55,7 +58,7 @@
     renderer = new PatternRenderer(containerEl);
     webgpu = renderer.webgpuAvailable();
     renderer.onStatus = (s, msg) => { status = s; statusMessage = msg ?? ''; };
-    renderer.onModeChange = (m, piece) => { sceneMode = m; selectedPiece = piece; };
+    renderer.onModeChange = (m, piece) => { sceneMode = m; selectedPiece = piece; if (m === 'view') arrangeKind = null; };
     renderer.onSelectPiece = (id) => { onpieceselect?.(id); };
     renderer.onDrapeSettled = (savedByPiece) => { ondrapesettled?.(savedByPiece); };
     lastKey = patternKey(currentPattern);
@@ -102,8 +105,17 @@
   function reset() { renderer?.resetSimulation(); }
   function toggleArrangeMode() {
     if (!renderer) return;
-    if (sceneMode === 'arrange') renderer.exitArrangeMode();
-    else renderer.enterArrangeMode();
+    if (sceneMode === 'arrange' && arrangeKind === 'arrange') { renderer.exitArrangeMode(); return; }
+    if (sceneMode === 'arrange') renderer.exitArrangeMode(); // switching from the Move tool
+    renderer.enterArrangeMode();
+    arrangeKind = 'arrange';
+  }
+  function toggleManipulateMode() {
+    if (!renderer) return;
+    if (sceneMode === 'arrange' && arrangeKind === 'manipulate') { renderer.exitArrangeMode(); return; }
+    if (sceneMode === 'arrange') renderer.exitArrangeMode(); // switching from the Arrange tool
+    renderer.enterManipulateMode();
+    arrangeKind = 'manipulate';
   }
   function setGizmoMode(m: 'translate' | 'rotate') { gizmoMode = m; renderer?.setArrangeTransformMode(m); }
   function drapeFromArrangement() { renderer?.simulateFromArrangement(); }
@@ -138,6 +150,7 @@
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === 'a' || e.key === 'A') { e.preventDefault(); toggleArrangeMode(); }
+    if (e.key === 'm' || e.key === 'M') { e.preventDefault(); toggleManipulateMode(); }
   }
 
   // Right-side 3D control rail — Material Symbols icons + hover-to-expand labels, mirroring the
@@ -148,7 +161,8 @@
     { label: 'Reset simulation', icon: 'refresh', onClick: reset },
     { label: 'Show triangles', icon: 'change_history', onClick: toggleTriangles, active: () => showTriangles, sep: true },
     { label: 'Show avatar', icon: 'person', onClick: toggleAvatar, active: () => showAvatar },
-    { label: sceneMode === 'arrange' ? 'Exit arrange mode' : 'Arrange (A)', icon: 'scatter_plot', onClick: toggleArrangeMode, active: () => sceneMode === 'arrange', shortcut: 'A' },
+    { label: sceneMode === 'arrange' && arrangeKind === 'arrange' ? 'Exit arrange mode' : 'Arrange (A)', icon: 'scatter_plot', onClick: toggleArrangeMode, active: () => sceneMode === 'arrange' && arrangeKind === 'arrange', shortcut: 'A' },
+    { label: sceneMode === 'arrange' && arrangeKind === 'manipulate' ? 'Exit move mode' : 'Move pieces (M)', icon: 'open_with', onClick: toggleManipulateMode, active: () => sceneMode === 'arrange' && arrangeKind === 'manipulate', shortcut: 'M' },
     { label: dark ? 'Light mode' : 'Dark mode', icon: dark ? 'light_mode' : 'dark_mode', onClick: toggleDark, active: () => dark, sep: true },
     { label: 'Download as OBJ', icon: 'download', onClick: downloadOBJ }
   ]);
@@ -197,7 +211,7 @@
     {/each}
   </div>
 
-  <!-- Arrange-mode panel: select a piece, move/rotate it on or off the body, then drape -->
+  <!-- Piece-edit panel: select a piece, move/rotate it with the gizmo, then drape/settle -->
   {#if sceneMode === 'arrange'}
     <div class="absolute top-12 left-1/2 -translate-x-1/2 z-10 flex flex-col items-center gap-1">
       <div class="bg-base-200/90 backdrop-blur rounded-lg shadow px-3 py-2 flex items-center gap-2">
@@ -206,9 +220,12 @@
           <button class="join-item btn btn-xs" class:btn-active={gizmoMode === 'translate'} onclick={() => setGizmoMode('translate')}>Move</button>
           <button class="join-item btn btn-xs" class:btn-active={gizmoMode === 'rotate'} onclick={() => setGizmoMode('rotate')}>Rotate</button>
         </div>
-        <button class="btn btn-xs btn-primary" onclick={drapeFromArrangement}>Drape ▶</button>
-        <button class="btn btn-xs btn-ghost" onclick={toggleArrangeMode}>Cancel</button>
+        <button class="btn btn-xs btn-primary" onclick={drapeFromArrangement}>{arrangeKind === 'manipulate' ? 'Settle ▶' : 'Drape ▶'}</button>
+        <button class="btn btn-xs btn-ghost" onclick={() => renderer?.exitArrangeMode()}>Cancel</button>
       </div>
+      {#if arrangeKind === 'manipulate'}
+        <span class="text-[10px] opacity-60 bg-base-200/70 rounded px-2 py-0.5">Drag a piece off the body — Settle eases it back into place</span>
+      {/if}
     </div>
   {/if}
 

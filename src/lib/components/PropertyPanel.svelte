@@ -21,6 +21,39 @@
     $selectedPieceIds.size === 1 ? currentPattern.pieces.find((p) => p.id === [...$selectedPieceIds][0]) ?? null : null
   );
 
+  // A single selected boundary edge (its ConstrainablePath + two endpoints). Clicking a line in the
+  // 2D view selects it; this lets you retype the edge's length/angle (moves the `to` point in
+  // drafting space so the edge takes the requested length/angle relative to `from`).
+  const editingEdge = $derived.by<{ path: ConstrainablePath; from: ConstrainablePoint; to: ConstrainablePoint } | null>(() => {
+    if ($selectedPathIds.size !== 1) return null;
+    const pathId = [...$selectedPathIds][0];
+    const path = currentPattern.paths.find((p) => p.id === pathId);
+    if (!path) return null;
+    const byId = (id: string) => currentPattern.points.find((q) => q.id === id) ?? null;
+    for (const piece of currentPattern.pieces) {
+      if ($selectedPieceIds.size > 0 && !$selectedPieceIds.has(piece.id)) continue;
+      const pp = [...piece.mainPaths, ...piece.internalPaths].find((x) => x.path === pathId);
+      if (pp) { const from = byId(pp.from), to = byId(pp.to); if (from && to) return { path, from, to }; }
+    }
+    const pts = path.pathPoints;
+    if (pts.length >= 2) { const from = byId(pts[0].id), to = byId(pts[pts.length - 1].id); if (from && to) return { path, from, to }; }
+    return null;
+  });
+  const edgeLenMm = $derived(editingEdge ? Math.hypot(editingEdge.to.x - editingEdge.from.x, editingEdge.to.y - editingEdge.from.y) : 0);
+  const edgeAngleDeg = $derived(editingEdge ? (Math.atan2(editingEdge.to.y - editingEdge.from.y, editingEdge.to.x - editingEdge.from.x) * 180) / Math.PI : 0);
+  const edgeUnit = $derived(currentPattern.lengthUnit);
+  const edgeToDisp = (mm: number) => (edgeUnit === 'inch' ? mm / 25.4 : edgeUnit === 'cm' ? mm / 10 : mm);
+  const edgeToMm = (v: number) => (edgeUnit === 'inch' ? v * 25.4 : edgeUnit === 'cm' ? v * 10 : v);
+  function edgeMove(lenMm: number, angDeg: number) {
+    if (!editingEdge || !(lenMm > 0)) return;
+    const rad = (angDeg * Math.PI) / 180;
+    const nx = editingEdge.from.x + Math.cos(rad) * lenMm;
+    const ny = editingEdge.from.y + Math.sin(rad) * lenMm;
+    const toId = editingEdge.to.id;
+    const points = currentPattern.points.map((p) => (p.id === toId ? { ...p, x: nx, y: ny } : p));
+    onchange({ ...currentPattern, points, hasChanged: true });
+  }
+
   // which accordion section is open (Seam boundary open by default, like the source)
   let openSection = $state<string>('seam');
   function toggle(id: string) { openSection = openSection === id ? '' : id; }
@@ -255,13 +288,39 @@
 
 <div class="w-[340px] border-l bg-base-100 flex flex-col shrink-0 overflow-y-auto" data-tour-id="tour-properties">
   <div class="w-full bg-base-300 p-2 px-4 font-bold text-sm flex items-center sticky z-10 top-0 border-b-2 border-accent">
-    <span>Properties{editingPiece ? ' for Piece' : editingPoint ? ' for Point' : ' for Pattern'}</span>
+    <span>Properties{editingEdge ? ' for Edge' : editingPiece ? ' for Piece' : editingPoint ? ' for Point' : ' for Pattern'}</span>
     {#if onclose}
       <button class="ml-auto pt-1" type="button" title="Close properties" aria-label="Close properties" onclick={onclose}>
         <span class="material-symbols-rounded">close</span>
       </button>
     {/if}
   </div>
+
+  {#if editingEdge}
+    {@const ed = editingEdge}
+    <div class="bg-base-100 border-b-2 border-accent p-3 space-y-2 text-sm">
+      <h4 class="font-semibold text-accent flex items-center gap-1">
+        <span class="material-symbols-rounded text-base">straighten</span>
+        Edge: {ed.path.name || ed.path.id.slice(0, 8)}
+      </h4>
+      <p class="text-xs opacity-60">{ed.from.name} → {ed.to.name}{ed.path.pathType === 'curve' ? ' · curve (edits the chord)' : ''}</p>
+      <label class="flex flex-col gap-0.5">Length ({edgeUnit})
+        <input type="number" step="0.1" class="input input-bordered input-xs"
+          value={edgeToDisp(edgeLenMm).toFixed(2)}
+          onchange={(e) => edgeMove(edgeToMm(parseFloat(e.currentTarget.value) || 0), edgeAngleDeg)} /></label>
+      <label class="flex flex-col gap-0.5">Angle (°)
+        <input type="number" step="0.5" class="input input-bordered input-xs"
+          value={edgeAngleDeg.toFixed(2)}
+          onchange={(e) => edgeMove(edgeLenMm, parseFloat(e.currentTarget.value) || 0)} /></label>
+      <div class="flex gap-1">
+        <button class="btn btn-xs flex-1" title="Rotate -1°" onclick={() => edgeMove(edgeLenMm, edgeAngleDeg - 1)}>−1°</button>
+        <button class="btn btn-xs flex-1" title="Rotate -0.1°" onclick={() => edgeMove(edgeLenMm, edgeAngleDeg - 0.1)}>−0.1°</button>
+        <button class="btn btn-xs flex-1" title="Rotate +0.1°" onclick={() => edgeMove(edgeLenMm, edgeAngleDeg + 0.1)}>+0.1°</button>
+        <button class="btn btn-xs flex-1" title="Rotate +1°" onclick={() => edgeMove(edgeLenMm, edgeAngleDeg + 1)}>+1°</button>
+      </div>
+      <p class="text-[11px] opacity-50">Moves <b>{ed.to.name}</b> around <b>{ed.from.name}</b>. Select the edge from the adjoining piece to pivot the other end.</p>
+    </div>
+  {/if}
 
   {#if editingPiece}
     {@const piece = editingPiece}

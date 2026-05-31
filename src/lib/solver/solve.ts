@@ -3,7 +3,7 @@
 // `constraint` keep their fixed x/y. Enables measurement-driven re-drafting and true grading.
 
 import type { Pattern, ConstrainablePoint, ConstrainablePath } from '$lib/types/pattern';
-import { evalExpr } from './formula';
+import { evalExpr, referencedNames } from './formula';
 
 export type Scope = Record<string, number>;
 
@@ -17,6 +17,11 @@ export function resolveVariables(pattern: Pattern, overrides: Record<string, num
   for (const [name, value] of Object.entries(pattern.body?.fields ?? {})) scope[name] = value as number;
   const bind = (v: Pattern['variables'][number], val: number) => { scope[v.id] = val; if (v.name) scope[v.name] = val; };
 
+  // identifiers that count as a real dependency (other variables / body measurements)
+  const known = new Set<string>(Object.keys(pattern.body?.fields ?? {}));
+  for (const v of pattern.variables) { known.add(v.id); if (v.name) known.add(v.name); }
+  const isDerived = (f: string) => referencedNames(f).some((n) => known.has(n));
+
   const resolved = new Set<string>();
   let changed = true;
   let guard = pattern.variables.length + 3;
@@ -26,7 +31,13 @@ export function resolveVariables(pattern: Pattern, overrides: Record<string, num
       if (resolved.has(v.id)) continue;
       if (v.id in overrides) { bind(v, overrides[v.id]); resolved.add(v.id); changed = true; continue; }
       const f = v.valueFormula?.formula?.trim();
-      if (!f) { bind(v, v.value ?? 0); resolved.add(v.id); changed = true; continue; }
+      // Leaf/input variable (constant or no formula): use the cached `value` — it's the current value
+      // the baked geometry was resolved with (the user may have overridden the formula default).
+      if (!f || !isDerived(f)) {
+        bind(v, typeof v.value === 'number' ? v.value : (f ? evalExpr(f, scope) ?? 0 : 0));
+        resolved.add(v.id); changed = true; continue;
+      }
+      // Derived variable: evaluate its formula from its inputs (so edits/grading propagate).
       const r = evalExpr(f, scope);
       if (r !== null) { bind(v, r); resolved.add(v.id); changed = true; }
     }
@@ -99,10 +110,34 @@ function evalLen(formula: string, unit: string, scope: Scope, solved: Map<string
   return r === null ? null : r * unitToMm(unit);
 }
 function evalAngleDeg(formula: string, unit: string | undefined, scope: Scope, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): number | null {
-  const sub = subLengths(formula, 'mm', solved, pathById); // any path-length ref in an angle stays in mm
-  if (sub === null) return null;
-  const r = evalExpr(sub, scope);
+  let f = subLengths(formula, 'mm', solved, pathById); // any path-length ref in an angle stays in mm
+  if (f === null) return null;
+  if (/\.angle/.test(f)) {
+    // `PathId.angle` → the path's direction (first→last endpoint), in degrees
+    let ok = true;
+    f = f.replace(/([A-Za-z_$][\w$]*)\.angle/g, (_m, id) => {
+      const ends = axisEnds(pathById.get(id), solved);
+      if (!ends) { ok = false; return '0'; }
+      return String((Math.atan2(ends[1].y - ends[0].y, ends[1].x - ends[0].x) * 180) / Math.PI);
+    });
+    if (!ok) return null;
+  }
+  const r = evalExpr(f, scope);
   return r === null ? null : r * (unit === 'radians' ? 180 / Math.PI : 1);
+}
+
+/** Reflect P across the line through A and B. */
+function reflect(p: Pt, a: Pt, b: Pt): Pt {
+  const dx = b.x - a.x, dy = b.y - a.y, d = dx * dx + dy * dy || 1;
+  const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / d;
+  const px = a.x + t * dx, py = a.y + t * dy;
+  return { x: 2 * px - p.x, y: 2 * py - p.y };
+}
+/** The two endpoints (first/last solved pathPoints) defining a path's line, or null if unsolved. */
+function axisEnds(path: ConstrainablePath | undefined, solved: Map<string, Pt>): [Pt, Pt] | null {
+  if (!path || path.pathPoints.length < 2) return null;
+  const a = solved.get(path.pathPoints[0].id), b = solved.get(path.pathPoints[path.pathPoints.length - 1].id);
+  return a && b ? [a, b] : null;
 }
 
 /** Compute a constrained point's position, or null if its dependencies aren't solved yet. */
@@ -121,21 +156,29 @@ function constraintPos(cn: NonNullable<ConstrainablePoint['constraint']>, scope:
     const r = (ang * Math.PI) / 180;
     return { x: a.x + len * Math.cos(r), y: a.y + len * Math.sin(r) };
   }
-  // sliding: a distance (from an anchor) along a path's polyline
+  if (cn.type === 'mirror') {
+    const src = solved.get(cn.source); const ax = axisEnds(pathById.get(cn.axisPath), solved);
+    return src && ax ? reflect(src, ax[0], ax[1]) : null;
+  }
+  // sliding: a point on a path — by a fixed arc-length fraction, or a distance formula from an anchor
   const path = pathById.get(cn.path); if (!path) return null;
   const anchors = path.pathPoints.map((pp) => solved.get(pp.id));
   if (anchors.some((a) => !a)) return null;
-  const dist = evalLen(cn.positionFormula, cn.unit ?? 'mm', scope, solved, pathById);
+  const pts = anchors as Pt[];
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  if (cn.fraction != null) return pointAlong(pts, total * cn.fraction);
+  const dist = evalLen(cn.positionFormula ?? '0', cn.unit ?? 'mm', scope, solved, pathById);
   if (dist === null) return null;
   let base = 0;
   if (cn.from) {
     let cum = 0;
     for (let i = 1; i < path.pathPoints.length; i++) {
       if (path.pathPoints[i - 1].id === cn.from) { base = cum; break; }
-      cum += Math.hypot((anchors[i]! as Pt).x - (anchors[i - 1]! as Pt).x, (anchors[i]! as Pt).y - (anchors[i - 1]! as Pt).y);
+      cum += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
     }
   }
-  return pointAlong(anchors as Pt[], base + dist);
+  return pointAlong(pts, base + dist);
 }
 
 /** Solve every point's position given a variable scope. Fixed points keep x/y; constrained points compute. */
@@ -206,13 +249,37 @@ export function makeParametric(pattern: Pattern, tolMm = 1): Pattern {
   // candidate constructions per point (length+angle from line/curve paths; sliding from slidingPoints)
   const cand = new Map<string, Constraint[]>();
   const add = (pid: string, c: Constraint) => { if (baked.has(pid)) (cand.get(pid) ?? cand.set(pid, []).get(pid)!).push(c); };
+  // arc-length fraction (0..1) of a baked point projected onto a baked path's polyline
+  const bakedFraction = (path: ConstrainablePath, pid: string): number | null => {
+    const pts = path.pathPoints.map((pp) => baked.get(pp.id)); const t = baked.get(pid);
+    if (!t || pts.some((p) => !p)) return null;
+    let total = 0; const cum = [0];
+    for (let i = 1; i < pts.length; i++) { total += Math.hypot(pts[i]!.x - pts[i - 1]!.x, pts[i]!.y - pts[i - 1]!.y); cum.push(total); }
+    if (total === 0) return null;
+    let bestArc = 0, bestErr = Infinity;
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1]!, b = pts[i]!; const dx = b.x - a.x, dy = b.y - a.y, d = dx * dx + dy * dy || 1;
+      const tt = Math.max(0, Math.min(1, ((t.x - a.x) * dx + (t.y - a.y) * dy) / d));
+      const err = Math.hypot(t.x - (a.x + tt * dx), t.y - (a.y + tt * dy));
+      if (err < bestErr) { bestErr = err; bestArc = cum[i - 1] + tt * Math.hypot(dx, dy); }
+    }
+    return bestErr < 1 ? bestArc / total : null; // only if the point really lies on the path
+  };
+
   for (const pa of pattern.paths) {
     if ((pa.pathType === 'line' || pa.pathType === 'curve') && pa.basePoint && pa.pathPoints.length === 2 && pa.lengthFormula?.formula) {
       const other = pa.pathPoints.find((q) => q.id !== pa.basePoint);
       if (other) add(other.id, { type: 'lengthAngle', from: pa.basePoint, lengthFormula: pa.lengthFormula.formula, angleFormula: pa.angleFormula?.formula ?? '0', lengthUnit: pa.lengthFormula.unit, angleUnit: pa.angleFormula?.unit ?? 'degrees' });
     }
+    // mirror / referenced paths: each instance point is a reflection of an original point across mirrorLine
+    if (pa.pathType === 'referenced' && pa.mirrorLine && pa.referencedPath) {
+      const refPath = pathById.get(pa.referencedPath);
+      const sources = new Set<string>([...(refPath?.pathPoints.map((q) => q.id) ?? []), pa.referencedFromPoint!, pa.referencedToPoint!].filter(Boolean) as string[]);
+      for (const ip of pa.pathPoints) for (const s of sources) if (s !== ip.id) add(ip.id, { type: 'mirror', source: s, axisPath: pa.mirrorLine });
+    }
     for (const sp of pa.slidingPoints ?? []) {
       if (sp.positionFormula?.formula) add(sp.id, { type: 'sliding', path: pa.id, from: sp.positionFrom, positionFormula: sp.positionFormula.formula, unit: sp.positionFormula.unit });
+      else { const fr = bakedFraction(pa, sp.id); if (fr != null) add(sp.id, { type: 'sliding', path: pa.id, fraction: fr }); }
     }
   }
   if (cand.size === 0) return pattern;

@@ -339,6 +339,18 @@ export class PatternRenderer {
       // selecting/highlighting the picked piece so the 2D editor stays in sync
       this.setHighlightedPiece(entry.pieceId);
       this.onSelectPiece(entry.pieceId);
+
+      if (!this.simulating) {
+        // DEFAULT (no sim running): clicking a piece enters in-place "Move pieces" mode and selects it,
+        // showing the transform gizmo — i.e. arrange/drag, NOT a simulation. (The grab-to-pull below
+        // only runs while a sim is actually playing.) Matches the source: click a piece → move handles.
+        this.enterManipulateMode();
+        const idx = this.arrangeEntries.findIndex((e) => e.pieceId === entry.pieceId);
+        if (idx >= 0) this.selectArrange(idx);
+        return;
+      }
+
+      // A simulation is playing: click-drag grabs and pulls the live fabric.
       const pos = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
       let bestL = face.a;
       let bd = Infinity;
@@ -501,20 +513,17 @@ export class PatternRenderer {
 
       // Build a `uvLabel` attribute (0..1 across the piece's pattern bbox) and per-piece canvas
       // badges, composited into the lit surface by the material shader — this is the default
-      // 'flat' look (deforms + shades with the cloth). Mirror instances (suffixed "#M") have a
-      // negated U, so pre-mirror the canvas text. Built unconditionally so toggling label mode is a
-      // cheap uniform/visibility flip rather than a full cloth rebuild (which would re-drape).
-      const { wMM, hMM } = this.addLabelUVs(geo, piece.uv, piece.count);
-      const mirror = piece.pieceId.includes('#M');
-      const faceLabelTex = this.makeBakedLabelTexture(`${name}\nface side`, wMM, hMM, mirror);
-      const backLabelTex = separateBack ? this.makeBakedLabelTexture(`${name}\nback side`, wMM, hMM, !mirror) : undefined;
+      // 'flat' look (deforms + shades with the cloth). The shader picks the "face side" badge on the
+      // outward face and the "back side" badge on the reverse. Built unconditionally so toggling
+      // label mode is a cheap uniform flip rather than a full cloth rebuild (which would re-drape).
+      const { face: faceLabelTex, back: backLabelTex } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
       const labelOpacity = this.showLabels && !hidden && this.labelMode === 'flat' ? 1 : 0;
 
       // Our cloth triangles wind with their geometric front face pointing INWARD, so the outward
       // surface the camera sees is the BackSide. For a separate back texture we therefore render the
       // FACE (front) texture on a BackSide mesh (shows outward) and the back texture on a FrontSide
       // mesh (shows inward). With a single double-sided material this doesn't matter (both sides same).
-      const mat = createGarmentMaterial(pieceMat, flat, { side: separateBack ? THREE.BackSide : THREE.DoubleSide, labelTexture: faceLabelTex, labelOpacity });
+      const mat = createGarmentMaterial(pieceMat, flat, { side: separateBack ? THREE.BackSide : THREE.DoubleSide, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity });
       mat.wireframe = this.showTriangles;
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
@@ -525,7 +534,7 @@ export class PatternRenderer {
       // separate back side: a second mesh on the same (deforming) geometry, back faces only
       let backMesh: THREE.Mesh | undefined;
       if (separateBack) {
-        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true, labelTexture: backLabelTex, labelOpacity });
+        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity });
         backMat.wireframe = this.showTriangles;
         backMesh = new THREE.Mesh(geo, backMat);
         backMesh.castShadow = true; backMesh.receiveShadow = true; backMesh.frustumCulled = false;
@@ -560,6 +569,17 @@ export class PatternRenderer {
     }
     geo.setAttribute('uvLabel', new THREE.BufferAttribute(uvLabel, 2));
     return { wMM, hMM };
+  }
+
+  /** Set up uvLabel on `geo` and build the face/back name badges for a piece (back text is flipped
+   *  the opposite way so it reads correctly when viewed from the reverse face). */
+  private buildPieceLabelTextures(geo: THREE.BufferGeometry, uv: Float32Array, count: number, pieceId: string, name: string): { face: THREE.CanvasTexture; back: THREE.CanvasTexture } {
+    const { wMM, hMM } = this.addLabelUVs(geo, uv, count);
+    const mirror = pieceId.includes('#M'); // mirror instances have a negated U
+    return {
+      face: this.makeBakedLabelTexture(`${name}\nface side`, wMM, hMM, mirror),
+      back: this.makeBakedLabelTexture(`${name}\nback side`, wMM, hMM, !mirror)
+    };
   }
 
   private applyClothPositions(global: Float32Array) {
@@ -894,31 +914,53 @@ export class PatternRenderer {
     return this.mode;
   }
 
+  /** true while the piece-edit groups were seeded from the live drape (Move mode) vs the flat layout. */
+  private arrangeFromDrape = false;
+
   /** Enter arrange mode: show pieces flat-on-body, each individually selectable + movable. */
   enterArrangeMode(): void {
     if (this.mode === 'arrange' || !this.prepared || !this.pattern) return;
     this.stopSimulation();
+    this.arrangeFromDrape = false;
+    this.buildPieceEditGroups(this.prepared.simData.arrangedPositions); // stride-4 world (flat-on-body)
+  }
+
+  /**
+   * Enter "Move pieces" mode: each *draped* piece becomes an individually selectable rigid solid you
+   * can translate/rotate with the gizmo, in place on the body. Pressing Play (Drape) eases the moved
+   * pieces back to the settled drape — they "fly back" because the sim's anchors stay at that drape.
+   */
+  enterManipulateMode(): void {
+    if (this.mode === 'arrange' || !this.prepared || !this.pattern) return;
+    this.stopSimulation();
+    this.arrangeFromDrape = true;
+    // Seed from the freshest drape: the live sim if any, else the last applied positions, else cached.
+    const base = this.sim?.positions ?? this.lastClothPositions ?? this.prepared.simData.positions;
+    this.buildPieceEditGroups(base);
+  }
+
+  /** Build the per-piece movable groups (centroid origin + local geometry) from stride-4 `base`. */
+  private buildPieceEditGroups(base: Float32Array): void {
     this.mode = 'arrange';
-    this.clothGroup.visible = false; // hide the draped meshes
+    this.clothGroup.visible = false; // hide the live (single) draped meshes while editing per-piece
     this.scene.add(this.arrangeGroup);
 
-    const arranged = this.prepared.simData.arrangedPositions; // stride-4 world (flat-on-body)
-    const flat = this.pattern.settings3d.lightingMode === 'flat';
+    const flat = this.pattern!.settings3d.lightingMode === 'flat';
     const matById = new Map<string, Material>();
-    for (const m of this.pattern.materials) matById.set(m.id, m);
+    for (const m of this.pattern!.materials) matById.set(m.id, m);
 
-    for (const piece of this.prepared.simData.pieces) {
+    for (const piece of this.prepared!.simData.pieces) {
       const c = new THREE.Vector3();
       for (let i = 0; i < piece.count; i++) {
         const g = piece.start + i;
-        c.x += arranged[g * 4]; c.y += arranged[g * 4 + 1]; c.z += arranged[g * 4 + 2];
+        c.x += base[g * 4]; c.y += base[g * 4 + 1]; c.z += base[g * 4 + 2];
       }
       c.multiplyScalar(1 / Math.max(1, piece.count));
       const baseLocal = new Float32Array(piece.count * 3);
       const pos = new Float32Array(piece.count * 3);
       for (let i = 0; i < piece.count; i++) {
         const g = piece.start + i;
-        const lx = arranged[g * 4] - c.x, ly = arranged[g * 4 + 1] - c.y, lz = arranged[g * 4 + 2] - c.z;
+        const lx = base[g * 4] - c.x, ly = base[g * 4 + 1] - c.y, lz = base[g * 4 + 2] - c.z;
         baseLocal[i * 3] = lx; baseLocal[i * 3 + 1] = ly; baseLocal[i * 3 + 2] = lz;
         pos[i * 3] = lx; pos[i * 3 + 1] = ly; pos[i * 3 + 2] = lz;
       }
@@ -927,7 +969,11 @@ export class PatternRenderer {
       geo.setAttribute('uv', new THREE.BufferAttribute(piece.uv.slice(), 2));
       geo.setIndex(piece.triangles.map((g) => g - piece.start));
       geo.computeVertexNormals();
-      const mat = createGarmentMaterial(matById.get(piece.materialId), flat);
+      // Bake the same name badges as the drape view so pieces keep their labels while being moved.
+      const name = this.pattern!.pieces.find((p) => p.id === piece.pieceId)?.name ?? 'Piece';
+      const { face, back } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
+      const labelOpacity = this.showLabels && this.labelMode === 'flat' ? 1 : 0;
+      const mat = createGarmentMaterial(matById.get(piece.materialId), flat, { labelTexture: face, labelTextureBack: back, labelOpacity });
       mat.wireframe = this.showTriangles;
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
@@ -936,7 +982,7 @@ export class PatternRenderer {
       const group = new THREE.Group();
       group.position.copy(c);
       group.add(mesh);
-      group.visible = !this.pattern.pieces.find((p) => p.id === piece.pieceId)?.hidden;
+      group.visible = !this.pattern!.pieces.find((p) => p.id === piece.pieceId)?.hidden;
       this.arrangeGroup.add(group);
       this.arrangeEntries.push({ pieceId: piece.pieceId, start: piece.start, count: piece.count, group, mesh, baseLocal });
     }
@@ -950,7 +996,6 @@ export class PatternRenderer {
       this.scene.add(this.transform.getHelper());
     }
     this.selectArrange(-1);
-    this.onModeChange('arrange', null);
   }
 
   /** Select an arrange piece by index (-1 clears). Highlights it and attaches the gizmo. */
@@ -1003,31 +1048,42 @@ export class PatternRenderer {
     for (const e of this.arrangeEntries) {
       this.arrangeGroup.remove(e.group);
       e.mesh.geometry.dispose();
-      (e.mesh.material as THREE.Material).dispose();
+      disposeGarmentMaterial(e.mesh.material as THREE.Material);
     }
     this.arrangeEntries = [];
     this.scene.remove(this.arrangeGroup);
     this.clothGroup.visible = true;
     this.mode = 'view';
+    this.arrangeFromDrape = false;
     this.onModeChange('view', null);
   }
 
-  /** Drape from the current arrangement: seed the sim with the moved pieces and free-simulate. */
+  /** Drape from the current arrangement: seed the sim with the moved pieces and simulate. */
   async simulateFromArrangement(): Promise<void> {
     if (this.mode !== 'arrange' || !this.prepared) return;
+    const fromDrape = this.arrangeFromDrape;
     const seed = this.arrangedSeed();
     this.exitArrangeMode();
     const sim = await this.ensureSim();
     if (!sim) { this.applyClothPositions(seed); return; }
     sim.resetTo(seed);
     this.applyClothPositions(seed);
-    // Drape freely from the user's arrangement (no cached drape applies); self-collision off avoids
-    // the free-settle curl, matching the interactive-drag behaviour.
-    sim.setAnchorScale(0);
-    sim.setSelfCollision(false);
+    if (fromDrape) {
+      // Move mode: the anchors still target the settled drape, so a soft hold eases the displaced
+      // pieces back into place — they "fly back" — then the live sim keeps running until stopped.
+      sim.setSelfCollision(true);
+      sim.setAnchorScale(PatternRenderer.LIVE_ANCHOR);
+      this.liveAnchorScale = PatternRenderer.LIVE_ANCHOR;
+      this.userSimulating = true; // stays live across grabs; Stop bakes the result
+    } else {
+      // Flat-arrangement drape: free settle from the user's layout (no cached drape applies);
+      // self-collision off avoids the free-settle curl, matching the interactive-drag behaviour.
+      sim.setAnchorScale(0);
+      sim.setSelfCollision(false);
+      this.userSimulating = false; // one-shot settle: grab→freeze on release
+    }
     this.bodyDirty = false;
     this.adaptFramesLeft = 0;
-    this.userSimulating = false; // arrangement drape is a one-shot settle: grab→freeze on release
     this.simulating = true;
     this.onStatus('simulating');
     void this.runSimLoop();

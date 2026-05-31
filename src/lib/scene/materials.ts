@@ -10,6 +10,8 @@ export interface GarmentMatOpts {
   back?: boolean;
   /** per-piece "Name / face side" badge baked into the lit surface (deforms + shades with the cloth) */
   labelTexture?: THREE.Texture;
+  /** "Name / back side" badge shown on the reverse face (read-correct from behind); falls back to labelTexture */
+  labelTextureBack?: THREE.Texture;
   /** badge opacity (0 hides it); toggled live via mat.userData.labelUniforms.uLabelOpacity */
   labelOpacity?: number;
 }
@@ -78,6 +80,7 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
   if (opts.labelTexture) {
     const uniforms = {
       uLabelMap: { value: opts.labelTexture },
+      uLabelMapBack: { value: opts.labelTextureBack ?? opts.labelTexture },
       uLabelOpacity: { value: opts.labelOpacity ?? 1 }
     };
     mat.userData.labelUniforms = uniforms;
@@ -86,15 +89,18 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
     mat.customProgramCacheKey = () => 'garment-label';
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uLabelMap = uniforms.uLabelMap;
+      shader.uniforms.uLabelMapBack = uniforms.uLabelMapBack;
       shader.uniforms.uLabelOpacity = uniforms.uLabelOpacity;
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nattribute vec2 uvLabel;\nvarying vec2 vUvLabel;')
         .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvUvLabel = uvLabel;');
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nuniform sampler2D uLabelMap;\nuniform float uLabelOpacity;\nvarying vec2 vUvLabel;')
+        .replace('#include <common>', '#include <common>\nuniform sampler2D uLabelMap;\nuniform sampler2D uLabelMapBack;\nuniform float uLabelOpacity;\nvarying vec2 vUvLabel;')
         .replace('#include <map_fragment>', `#include <map_fragment>
         {
-          vec4 lbl = texture2D(uLabelMap, vUvLabel);
+          // Cloth fronts wind inward, so the outward (fabric face) surface is back-facing: show the
+          // "face side" badge there, and the read-correct "back side" badge on the reverse.
+          vec4 lbl = gl_FrontFacing ? texture2D(uLabelMapBack, vUvLabel) : texture2D(uLabelMap, vUvLabel);
           vec3 lblLin = pow(lbl.rgb, vec3(2.2)); // sRGB canvas -> linear, matched to the lit pipeline
           diffuseColor.rgb = mix(diffuseColor.rgb, lblLin, lbl.a * uLabelOpacity);
         }`);
@@ -109,8 +115,9 @@ export function disposeGarmentMaterial(material: THREE.Material): void {
   m.map?.dispose();
   m.normalMap?.dispose();
   m.alphaMap?.dispose();
-  const u = m.userData?.labelUniforms as { uLabelMap: { value: THREE.Texture | null } } | undefined;
+  const u = m.userData?.labelUniforms as { uLabelMap: { value: THREE.Texture | null }; uLabelMapBack: { value: THREE.Texture | null } } | undefined;
   u?.uLabelMap.value?.dispose();
+  if (u && u.uLabelMapBack.value !== u.uLabelMap.value) u.uLabelMapBack.value?.dispose();
   m.dispose();
 }
 
