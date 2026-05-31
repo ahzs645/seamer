@@ -16,6 +16,7 @@ import type { Pattern, Material } from '$lib/types/pattern';
 import { AvatarController } from '$lib/model/avatarController';
 import { buildCylinders, type CylinderFrame } from '$lib/geometry/cylinders';
 import { prepareCloth, ClothSimulation, type PreparedCloth } from '$lib/sim/simulator';
+import { SIM_CONFIG, type SimConfig } from '$lib/sim/config';
 import { cylinderRefit } from '$lib/sim/cylinderRefit';
 import { requestClothDevice, isWebGPUAvailable } from '$lib/sim/webgpu/device';
 import { createGarmentMaterial, createAvatarMaterial, hasSeparateBack, disposeGarmentMaterial } from './materials';
@@ -320,8 +321,12 @@ export class PatternRenderer {
       if (ev.button !== 0) return;
       // Arrange mode: click a piece to select it (the gizmo handles its own drags). Don't grab/pull.
       if (this.mode === 'arrange') {
-        if (this.transform && this.transform.axis) return; // clicking a gizmo handle -> let it drag
+        if (this.transform && (this.transform.dragging || this.transform.axis)) return; // gizmo handle -> let it drag
         setNdc(ev);
+        // A piece just moved by the gizmo only has its world matrix updated at render time; force it
+        // current (and refresh bounds) so the raycast hits the piece at its NEW location.
+        this.arrangeGroup.updateMatrixWorld(true);
+        for (const e of this.arrangeEntries) e.mesh.geometry.computeBoundingSphere();
         this.raycaster.setFromCamera(ndc, this.camera);
         const hits = this.raycaster.intersectObjects(this.arrangeEntries.map((e) => e.mesh), false);
         const idx = hits[0] ? this.arrangeEntries.findIndex((e) => e.mesh === hits[0].object) : -1;
@@ -437,7 +442,7 @@ export class PatternRenderer {
   };
 
   /** Build or update the avatar + cloth for a pattern. */
-  async setPattern(pattern: Pattern): Promise<void> {
+  async setPattern(pattern: Pattern, changedPieces?: Set<string>): Promise<void> {
     this.pattern = pattern;
     this.stopSimulation();
     // Track whether the body changed vs the one the cached drape was authored on.
@@ -462,7 +467,7 @@ export class PatternRenderer {
       }
       this.applyCameraFromSettings(pattern);
       this.setLightingMode(pattern.settings3d.lightingMode || 'flat');
-      this.rebuildCloth(pattern);
+      this.rebuildCloth(pattern, changedPieces);
       this.onStatus('ready');
     } catch (e) {
       this.onStatus('error', e instanceof Error ? e.message : String(e));
@@ -477,8 +482,9 @@ export class PatternRenderer {
     this.controls.update();
   }
 
-  /** Triangulate + arrange the garment and (re)build the static cloth meshes. */
-  private rebuildCloth(pattern: Pattern) {
+  /** Triangulate + arrange the garment and (re)build the static cloth meshes.
+   *  `changedPieces` (pieces whose 2D shape was just edited) re-triangulate from live geometry. */
+  private rebuildCloth(pattern: Pattern, changedPieces?: Set<string>) {
     if (this.mode === 'arrange') this.exitArrangeMode(); // stale arrange meshes reference old pieces
     this.clearClothMeshes();
     this.sim?.dispose();
@@ -495,7 +501,7 @@ export class PatternRenderer {
     // later body edit these are the OLD frames the cylinder re-fit projects from. (Keep them across a
     // dirty rebuild — don't overwrite with the new-body frames.)
     if (!this.bodyDirty || !this.baseCylinders) this.baseCylinders = this.cylinders;
-    this.prepared = prepareCloth({ pattern, avatarVertices: verts, avatarIndices: indices, cylinders: this.cylinders });
+    this.prepared = prepareCloth({ pattern, avatarVertices: verts, avatarIndices: indices, cylinders: this.cylinders }, { changedPieces });
     if (!this.prepared) return;
 
     const flat = pattern.settings3d.lightingMode === 'flat';
@@ -612,6 +618,7 @@ export class PatternRenderer {
   }
 
   private clearClothMeshes() {
+    this.clearSnapshot(); // a ghost from the old drape would be stale once pieces rebuild
     for (const e of this.clothMeshes) {
       this.clothGroup.remove(e.mesh);
       e.geometry.dispose();
@@ -1115,6 +1122,94 @@ export class PatternRenderer {
       (e.mesh.material as THREE.MeshPhysicalMaterial).wireframe = v;
       if (e.backMesh) (e.backMesh.material as THREE.MeshPhysicalMaterial).wireframe = v;
     }
+  }
+
+  /** Live snapshot of the solver config (the panel reads this to seed its controls). */
+  getSimConfig(): SimConfig {
+    return { ...SIM_CONFIG };
+  }
+
+  /**
+   * Update solver parameters. Anchor/self-collision are uniform writes (apply live); the rest are
+   * baked into the compute shaders at build time, so we rebuild the sim from the current drape and
+   * resume — the cloth keeps its shape and the new params take effect immediately.
+   */
+  async setSimConfig(partial: Partial<SimConfig>): Promise<void> {
+    Object.assign(SIM_CONFIG, partial);
+    if (this.sim) this.sim.setSelfCollision(SIM_CONFIG.handleSelfCollisions);
+    // Params that change shader code need a rebuilt engine; preserve the live positions across it.
+    const bakedKeys: (keyof SimConfig)[] = ['gravity', 'globalDamping', 'localDamping', 'nearDamping', 'simulationThickness', 'edgeThickness', 'seamStrength', 'selfCollisionFriction', 'externalCollisionFriction', 'seamIterations', 'handleExternalCollisions'];
+    if (!this.sim || !bakedKeys.some((k) => k in partial)) return;
+    const pos = this.sim.positions.slice();
+    const wasSim = this.simulating;
+    this.simulating = false; // halt the loop without firing onDrapeSettled
+    await Promise.resolve();
+    this.sim.dispose();
+    this.sim = null;
+    const sim = await this.ensureSim();
+    if (!sim) return;
+    sim.resetTo(pos);
+    this.applyClothPositions(pos);
+    sim.setSelfCollision(SIM_CONFIG.handleSelfCollisions);
+    if (wasSim) {
+      sim.setAnchorScale(this.liveAnchorScale);
+      this.simulating = true;
+      this.userSimulating = true;
+      this.onStatus('simulating');
+      void this.runSimLoop();
+    }
+  }
+
+  // ---- Frozen snapshot: a translucent "ghost" of the drape at a moment, as a reference overlay ----
+  private snapshotGroup: THREE.Group | null = null;
+
+  /** Freeze the current drape as a translucent ghost reference (replaces any previous one). */
+  freezeSnapshot(opacity = 0.35): void {
+    this.clearSnapshot();
+    if (!this.clothMeshes.length) return;
+    const group = new THREE.Group();
+    for (const e of this.clothMeshes) {
+      const src = e.geometry.getAttribute('position') as THREE.BufferAttribute;
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute((src.array as Float32Array).slice(), 3));
+      if (e.geometry.index) geo.setIndex(Array.from(e.geometry.index.array as ArrayLike<number>));
+      geo.computeVertexNormals();
+      const mat = new THREE.MeshStandardMaterial({ color: 0x4f9cff, transparent: true, opacity, depthWrite: false, side: THREE.DoubleSide, roughness: 0.85, metalness: 0 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 2;
+      group.add(mesh);
+    }
+    this.scene.add(group);
+    this.snapshotGroup = group;
+  }
+
+  clearSnapshot(): void {
+    if (!this.snapshotGroup) return;
+    this.scene.remove(this.snapshotGroup);
+    for (const c of this.snapshotGroup.children) {
+      const m = c as THREE.Mesh;
+      m.geometry.dispose();
+      (m.material as THREE.Material).dispose();
+    }
+    this.snapshotGroup = null;
+  }
+
+  setSnapshotOpacity(o: number): void {
+    if (!this.snapshotGroup) return;
+    for (const c of this.snapshotGroup.children) ((c as THREE.Mesh).material as THREE.MeshStandardMaterial).opacity = o;
+  }
+
+  hasSnapshot(): boolean {
+    return !!this.snapshotGroup;
+  }
+
+  /** Capture the current 3D view as a PNG data URL. Renders a fresh frame first, then reads the
+   *  canvas in the same tick (so it works without preserveDrawingBuffer). */
+  captureImage(): string {
+    if (this.composer && this.postEnabled) this.composer.render();
+    else this.renderer.render(this.scene, this.camera);
+    return this.renderer.domElement.toDataURL('image/png');
   }
 
   /** Export the avatar + draped garment as an OBJ download. */

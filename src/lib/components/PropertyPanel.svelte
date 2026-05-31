@@ -44,13 +44,21 @@
   const edgeUnit = $derived(currentPattern.lengthUnit);
   const edgeToDisp = (mm: number) => (edgeUnit === 'inch' ? mm / 25.4 : edgeUnit === 'cm' ? mm / 10 : mm);
   const edgeToMm = (v: number) => (edgeUnit === 'inch' ? v * 25.4 : edgeUnit === 'cm' ? v * 10 : v);
+  // Which endpoint stays fixed while editing. 'from' (default) moves `to`; 'to' moves `from`.
+  // The displayed length/angle always describe the from→to vector, so the angle field reads the
+  // same regardless of pivot — flipping the pivot just chooses which end the edit rotates around.
+  let edgePivot = $state<'from' | 'to'>('from');
   function edgeMove(lenMm: number, angDeg: number) {
     if (!editingEdge || !(lenMm > 0)) return;
     const rad = (angDeg * Math.PI) / 180;
-    const nx = editingEdge.from.x + Math.cos(rad) * lenMm;
-    const ny = editingEdge.from.y + Math.sin(rad) * lenMm;
-    const toId = editingEdge.to.id;
-    const points = currentPattern.points.map((p) => (p.id === toId ? { ...p, x: nx, y: ny } : p));
+    const dx = Math.cos(rad) * lenMm, dy = Math.sin(rad) * lenMm;
+    let moveId: string, nx: number, ny: number;
+    if (edgePivot === 'from') {
+      moveId = editingEdge.to.id; nx = editingEdge.from.x + dx; ny = editingEdge.from.y + dy;
+    } else {
+      moveId = editingEdge.from.id; nx = editingEdge.to.x - dx; ny = editingEdge.to.y - dy;
+    }
+    const points = currentPattern.points.map((p) => (p.id === moveId ? { ...p, x: nx, y: ny } : p));
     onchange({ ...currentPattern, points, hasChanged: true });
   }
 
@@ -304,6 +312,13 @@
         Edge: {ed.path.name || ed.path.id.slice(0, 8)}
       </h4>
       <p class="text-xs opacity-60">{ed.from.name} → {ed.to.name}{ed.path.pathType === 'curve' ? ' · curve (edits the chord)' : ''}</p>
+      <div class="flex flex-col gap-0.5">
+        <span class="text-xs opacity-70">Pivot (this end stays fixed)</span>
+        <div class="join">
+          <button class="join-item btn btn-xs flex-1" class:btn-active={edgePivot === 'from'} onclick={() => (edgePivot = 'from')}>{ed.from.name}</button>
+          <button class="join-item btn btn-xs flex-1" class:btn-active={edgePivot === 'to'} onclick={() => (edgePivot = 'to')}>{ed.to.name}</button>
+        </div>
+      </div>
       <label class="flex flex-col gap-0.5">Length ({edgeUnit})
         <input type="number" step="0.1" class="input input-bordered input-xs"
           value={edgeToDisp(edgeLenMm).toFixed(2)}
@@ -318,7 +333,7 @@
         <button class="btn btn-xs flex-1" title="Rotate +0.1°" onclick={() => edgeMove(edgeLenMm, edgeAngleDeg + 0.1)}>+0.1°</button>
         <button class="btn btn-xs flex-1" title="Rotate +1°" onclick={() => edgeMove(edgeLenMm, edgeAngleDeg + 1)}>+1°</button>
       </div>
-      <p class="text-[11px] opacity-50">Moves <b>{ed.to.name}</b> around <b>{ed.from.name}</b>. Select the edge from the adjoining piece to pivot the other end.</p>
+      <p class="text-[11px] opacity-50">Edits move <b>{edgePivot === 'from' ? ed.to.name : ed.from.name}</b> around the pivot <b>{edgePivot === 'from' ? ed.from.name : ed.to.name}</b>. Shared points reshape the adjoining edge too.</p>
     </div>
   {/if}
 

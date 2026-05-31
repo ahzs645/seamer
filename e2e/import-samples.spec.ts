@@ -4,12 +4,13 @@ import { test, expect, type Page } from '@playwright/test';
 // parsed by the real app code; we assert the resulting toast + that the 2D canvas has geometry.
 
 async function openStudio(page: Page) {
-	await page.goto('/studio');
+	// domcontentloaded (not 'load') so a cold Vite server compiling three.js doesn't hang the nav
+	await page.goto('/studio', { waitUntil: 'domcontentloaded' });
 	// dismiss the one-time welcome modal if it appears
 	const getStarted = page.getByRole('button', { name: 'Get started' });
 	if (await getStarted.isVisible().catch(() => false)) await getStarted.click();
-	// wait for the studio header to be ready
-	await expect(page.getByText('Pattern Studio')).toBeVisible();
+	// the pattern-name input is always present (no responsive hiding) → a robust readiness signal
+	await expect(page.getByPlaceholder('Pattern name...')).toBeVisible();
 }
 
 async function importSample(page: Page, label: string) {

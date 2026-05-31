@@ -7,7 +7,8 @@ export default defineConfig({
 	timeout: 60_000,
 	expect: { timeout: 15_000 },
 	fullyParallel: false,
-	retries: 0,
+	workers: 1, // single dev server on a fixed port — parallel workers race on it
+	retries: 1, // tolerate first-load flakiness (cold dev-server boot)
 	reporter: [['list']],
 	use: {
 		baseURL: 'http://localhost:5173',

@@ -5,7 +5,9 @@ const SAFE = /^[\w\s+\-*/().,%]*$/;
 
 /** Evaluate `expr` with the given numeric scope. Returns null on any error/non-finite result. */
 export function evalExpr(expr: string, scope: Record<string, number>): number | null {
-  const src = (expr ?? '').trim();
+  // The source wraps variable/path refs in braces — `{var_id}+4`, `{Path_id.length}`. They carry no
+  // arithmetic meaning, so drop them before evaluating (otherwise the SAFE check rejects the formula).
+  const src = (expr ?? '').replace(/[{}]/g, '').trim();
   if (!src) return null;
   if (!SAFE.test(src)) return null;
   // only valid JS identifiers can be bound as function args

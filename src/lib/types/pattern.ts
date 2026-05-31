@@ -19,7 +19,10 @@ export type PointConstraint =
   // sliding: a point ON a path, by a distance formula from an anchor, or by a fixed arc-length fraction
   | { type: 'sliding'; path: string; positionFormula?: string; from?: string; unit?: string; fraction?: number }
   // mirror: a point reflected across the line defined by `axisPath`'s endpoints (referenced/mirror copies)
-  | { type: 'mirror'; source: string; axisPath: string };
+  | { type: 'mirror'; source: string; axisPath: string }
+  // intersection: a point at the crossing of two rays, each from an anchor at a formula-driven angle
+  // (the source draws direction-only paths — basePoint + angle, no length — that meet at this point)
+  | { type: 'intersection'; a: string; aAngleFormula: string; b: string; bAngleFormula: string; aAngleUnit?: string; bAngleUnit?: string };
 
 export interface ConstrainablePoint {
   id: string;
@@ -49,6 +52,7 @@ export interface Variable {
   isVisible: boolean;
   options: unknown[];
   unitType: string;
+  overrideValue?: string | number | null; // transient: enum option / value forced by a loaded grade anchor
 }
 
 /** Cubic Bézier control tangents stored on a curve path point (offsets in mm, relative to anchor). */
@@ -261,8 +265,43 @@ export interface GradeSize {
   color: string; // overlay swatch colour
   values?: Record<string, number>; // per-size variable value overrides (variableId -> value) for true grading
 }
+/**
+ * Grading-by-example ("alterations"). A track picks a numeric *driver* variable and stores point/handle
+ * position deltas sampled at discrete driver values; the geometry morphs by linearly interpolating those
+ * deltas as the driver changes (the formula solver gives the base shape, alterations add the sculpted
+ * deviation). Faithful to the source: additive deltas, implicit zero sample, clamp past the end samples.
+ */
+export interface AlterationDelta {
+  points: Record<string, { x: number; y: number }>; // pointId -> position offset (mm)
+  handles: Record<string, { v1: { x: number; y: number }; v2: { x: number; y: number } }>; // `${pathId}:${pointId}` -> handle offset
+}
+export interface AlterationSample {
+  id: string;
+  driverValue: number;
+  deltaGeometry: AlterationDelta;
+}
+export interface AlterationTrack {
+  id: string;
+  name: string;
+  enabled: boolean;
+  driverVariableId: string | null; // the numeric Variable whose value drives this alteration
+  samples: AlterationSample[]; // kept sorted by driverValue
+}
+/** A named baseline state you edit relative to, optionally bound to enum "category" selections. */
+export interface GradeAnchor {
+  id: string;
+  name: string;
+  driverValue: number;
+  categories: Record<string, string>; // enum variableId -> selected option (multi-axis grading)
+  geometry: AlterationDelta; // baseline geometry snapshot (offsets from the formula base)
+}
 export interface GradingProfile {
   sizes: GradeSize[];
+  alterationTracks?: AlterationTrack[];
+  anchors?: GradeAnchor[];
+  mainDriverVariableId?: string | null; // default driver for new tracks / anchor capture
+  categoryVariableIds?: string[]; // enum variables used as grading axes
+  previewAlterationTrackId?: string | null; // transient: when set, only this track applies (UI preview)
 }
 
 export interface PatternImage {

@@ -4,7 +4,7 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import type { CylinderFrame } from '$lib/geometry/cylinders';
-import { buildPieceCloth, buildSavedCloth } from '$lib/geometry/boundary';
+import { buildPieceCloth, buildSavedCloth, reuseSavedDrape } from '$lib/geometry/boundary';
 import { arrangeParticles } from '$lib/geometry/arrangement';
 import { buildSimData, type SimData, type ArrangedPiece } from './build';
 import { buildBodyGrid, type BodyGrid } from './bodyGrid';
@@ -27,16 +27,25 @@ export interface PrepareInit {
 
 /** GPU-free: triangulate + arrange every dynamic piece, assemble sim data + body collision grid.
  *  `fromArrangement` forces the source's literal pipeline: ignore the cached drape blob, triangulate
- *  the piece fresh and seed from its cylinder arrangement, so the solver drapes it live (no anchor). */
-export function prepareCloth(init: PrepareInit, opts: { fromArrangement?: boolean } = {}): PreparedCloth | null {
+ *  the piece fresh and seed from its cylinder arrangement, so the solver drapes it live (no anchor).
+ *  `changedPieces` lists pieces whose 2D shape was just edited: those re-triangulate from the live
+ *  mainPaths (so the edit shows) and reuse the cached drape only where the new mesh still overlaps it,
+ *  while every unedited piece keeps building from its frozen savedPositions blob. */
+export function prepareCloth(
+  init: PrepareInit,
+  opts: { fromArrangement?: boolean; changedPieces?: Set<string> } = {}
+): PreparedCloth | null {
   const { pattern, cylinders } = init;
   const arranged: ArrangedPiece[] = [];
   for (const piece of pattern.pieces) {
     if (piece.type !== 'dynamic' || piece.settings3d.enable3d === false) continue;
+    const edited = opts.changedPieces?.has(piece.id) ?? false;
 
     // If a settled drape was cached, build the mesh DIRECTLY from those particles (their 2D for
     // topology + UV, their 3D as the drape) — reproduces the original render with no mapping error.
-    const savedCloth = opts.fromArrangement ? null : buildSavedCloth(piece);
+    // BUT if this piece's 2D shape was just edited, skip the frozen blob and re-triangulate from the
+    // live mainPaths below, so the new shape actually shows in 3D.
+    const savedCloth = (opts.fromArrangement || edited) ? null : buildSavedCloth(piece);
     if (savedCloth) {
       // also compute the flat-on-body placement for the same particles (used by "Arrange")
       const arranged3d = arrangeParticles(savedCloth.cloth.mesh.points, piece.settings3d.arrangement, cylinders.get(piece.settings3d.arrangement.cylinderName) ?? null, {
@@ -46,13 +55,33 @@ export function prepareCloth(init: PrepareInit, opts: { fromArrangement?: boolea
       continue;
     }
 
-    // Otherwise triangulate the piece boundary and arrange it on its body cylinder, then simulate.
+    // Triangulate the piece boundary from its live mainPaths and arrange it on its body cylinder.
     const cloth = buildPieceCloth(pattern, piece);
     if (!cloth || cloth.mesh.points.length < 3) continue;
-    const positions3d = arrangeParticles(cloth.mesh.points, piece.settings3d.arrangement, cylinders.get(piece.settings3d.arrangement.cylinderName) ?? null, {
+    const arranged3d = arrangeParticles(cloth.mesh.points, piece.settings3d.arrangement, cylinders.get(piece.settings3d.arrangement.cylinderName) ?? null, {
       flipNormals: piece.settings3d.flipNormals
     });
-    arranged.push({ cloth, positions3d, frozen: piece.settings3d.frozen, fromSaved: false });
+
+    // An edited piece that previously had a drape: keep that drape wherever the shape is unchanged
+    // (each fresh particle inherits the nearest saved particle's 3D), and fall back to the arranged
+    // placement for any region the edit added. High overlap ⇒ anchor to the reused drape so it holds;
+    // low overlap ⇒ treat it as a fresh arrangement to re-drape. boundaryLocal lets it proximity-sew
+    // onto neighbouring saved-drape pieces (which carry no explicit edgeParticles). Matches the source.
+    const reuse = edited ? reuseSavedDrape(cloth.mesh.points, piece.settings3d.savedPositions, arranged3d, cloth.particleDistanceMm) : null;
+    if (reuse) {
+      arranged.push({
+        cloth,
+        positions3d: reuse.positions3d,
+        arranged3d,
+        frozen: piece.settings3d.frozen,
+        fromSaved: reuse.matchRatio >= 0.7,
+        boundaryLocal: cloth.mesh.boundary
+      });
+      continue;
+    }
+
+    // Never-draped (or low-overlap edit / fromArrangement): seed from the arrangement and simulate.
+    arranged.push({ cloth, positions3d: arranged3d, frozen: piece.settings3d.frozen, fromSaved: false });
   }
   if (arranged.length === 0) return null;
   const simData = buildSimData(pattern, arranged);

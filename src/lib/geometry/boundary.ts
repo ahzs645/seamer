@@ -279,3 +279,54 @@ export function buildSavedCloth(piece: Piece): SavedCloth | null {
     boundaryParticles: [...boundarySet]
   };
 }
+
+/**
+ * Map a freshly triangulated mesh onto a piece's cached drape so a 2D-edited piece keeps the drape it
+ * already had wherever its shape is unchanged. Each new particle inherits the settled 3D position of the
+ * nearest saved 2D particle (within `tol` mm); particles with no nearby saved point — a region the edit
+ * added — are left at the caller's flat-on-body `fallback3d`. Mirrors the original's
+ * `tryReuseSavedPositions`: returns the reused positions plus the fraction of particles that matched, so
+ * the caller can decide whether to anchor to the reused drape (high overlap) or re-drape (low overlap).
+ * Returns null when there is no usable saved blob.
+ *
+ * `meshPoints` (from buildPieceCloth) and the blob's 2D are both the piece's local 2D in mm (the blob's
+ * stride-5 x2d/y2d are positions2d×1000), so the nearest-neighbour test is a like-for-like comparison.
+ */
+export function reuseSavedDrape(
+  meshPoints: Vec2[],
+  savedPositions: number[] | undefined,
+  fallback3d: Float32Array,
+  particleDistanceMm: number
+): { positions3d: Float32Array; matchRatio: number } | null {
+  if (!savedPositions || savedPositions.length < 15) return null;
+  const m = Math.floor(savedPositions.length / 5);
+  const n = meshPoints.length;
+  if (n === 0 || m === 0) return null;
+  const out = new Float32Array(n * 3);
+  const tol = Math.max(particleDistanceMm * 1.5, 8); // mm — generous enough that unmoved particles match
+  const tol2 = tol * tol;
+  let matched = 0;
+  for (let i = 0; i < n; i++) {
+    const px = meshPoints[i].x;
+    const py = meshPoints[i].y;
+    let best = Infinity;
+    let bj = -1;
+    for (let j = 0; j < m; j++) {
+      const dx = px - savedPositions[j * 5];
+      const dy = py - savedPositions[j * 5 + 1];
+      const d2 = dx * dx + dy * dy;
+      if (d2 < best) { best = d2; bj = j; }
+    }
+    if (bj >= 0 && best <= tol2) {
+      out[i * 3] = savedPositions[bj * 5 + 2];
+      out[i * 3 + 1] = savedPositions[bj * 5 + 3];
+      out[i * 3 + 2] = savedPositions[bj * 5 + 4];
+      matched++;
+    } else {
+      out[i * 3] = fallback3d[i * 3];
+      out[i * 3 + 1] = fallback3d[i * 3 + 1];
+      out[i * 3 + 2] = fallback3d[i * 3 + 2];
+    }
+  }
+  return { positions3d: out, matchRatio: matched / n };
+}

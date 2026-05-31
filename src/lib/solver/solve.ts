@@ -92,6 +92,7 @@ function pathLengthMm(path: ConstrainablePath, solved: Map<string, Pt>): number 
 
 /** Replace `PathId.length` tokens with the path's length expressed in `unit`. null if unresolvable yet. */
 function subLengths(formula: string, unit: string, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): string | null {
+  formula = formula.replace(/[{}]/g, ''); // source wraps `{Path_id.length}` in braces
   if (!/\.length/.test(formula)) return formula;
   let ok = true;
   const r = formula.replace(/([A-Za-z_$][\w$]*)\.length/g, (_m, id) => {
@@ -159,6 +160,18 @@ function constraintPos(cn: NonNullable<ConstrainablePoint['constraint']>, scope:
   if (cn.type === 'mirror') {
     const src = solved.get(cn.source); const ax = axisEnds(pathById.get(cn.axisPath), solved);
     return src && ax ? reflect(src, ax[0], ax[1]) : null;
+  }
+  if (cn.type === 'intersection') {
+    const pa = solved.get(cn.a), pb = solved.get(cn.b); if (!pa || !pb) return null;
+    const aDeg = evalAngleDeg(cn.aAngleFormula, cn.aAngleUnit ?? 'degrees', scope, solved, pathById);
+    const bDeg = evalAngleDeg(cn.bAngleFormula, cn.bAngleUnit ?? 'degrees', scope, solved, pathById);
+    if (aDeg === null || bDeg === null) return null;
+    const ar = (aDeg * Math.PI) / 180, br = (bDeg * Math.PI) / 180;
+    const d1x = Math.cos(ar), d1y = Math.sin(ar), d2x = Math.cos(br), d2y = Math.sin(br);
+    const den = d1x * d2y - d1y * d2x; if (Math.abs(den) < 1e-9) return null; // parallel rays
+    // pa + t·d1 = pb + s·d2  →  solve for t
+    const t = ((pb.x - pa.x) * d2y - (pb.y - pa.y) * d2x) / den;
+    return { x: pa.x + t * d1x, y: pa.y + t * d1y };
   }
   // sliding: a point on a path — by a fixed arc-length fraction, or a distance formula from an anchor
   const path = pathById.get(cn.path); if (!path) return null;
@@ -282,6 +295,22 @@ export function makeParametric(pattern: Pattern, tolMm = 1): Pattern {
       else { const fr = bakedFraction(pa, sp.id); if (fr != null) add(sp.id, { type: 'sliding', path: pa.id, fraction: fr }); }
     }
   }
+
+  // Ray intersections: the source draws direction-only paths (basePoint + angleFormula, no length) that
+  // meet at a constructed point. Collect, per point, the angle-only rays it terminates; any two of them
+  // give an intersection candidate (disambiguation below keeps the pair that reproduces the baked point).
+  const rays = new Map<string, { from: string; angleFormula: string; angleUnit?: string }[]>();
+  for (const pa of pattern.paths) {
+    if ((pa.pathType === 'line' || pa.pathType === 'curve') && pa.basePoint && pa.pathPoints.length === 2 && pa.angleFormula?.formula && !pa.lengthFormula?.formula) {
+      const other = pa.pathPoints.find((q) => q.id !== pa.basePoint);
+      if (other) (rays.get(other.id) ?? rays.set(other.id, []).get(other.id)!).push({ from: pa.basePoint, angleFormula: pa.angleFormula.formula, angleUnit: pa.angleFormula.unit });
+    }
+  }
+  for (const [pid, rs] of rays) {
+    if (rs.length < 2) continue;
+    for (let i = 0; i < rs.length; i++) for (let j = i + 1; j < rs.length; j++)
+      add(pid, { type: 'intersection', a: rs[i].from, aAngleFormula: rs[i].angleFormula, aAngleUnit: rs[i].angleUnit, b: rs[j].from, bAngleFormula: rs[j].angleFormula, bAngleUnit: rs[j].angleUnit });
+  }
   if (cand.size === 0) return pattern;
 
   // iterative disambiguation: solve points whose deps are ready, choosing the candidate matching baked
@@ -289,20 +318,48 @@ export function makeParametric(pattern: Pattern, tolMm = 1): Pattern {
   const chosen = new Map<string, Constraint>();
   for (const p of pattern.points) if (!cand.has(p.id)) sol.set(p.id, baked.get(p.id)!);
 
-  let changed = true, guard = pattern.points.length + 8;
-  while (changed && guard-- > 0) {
-    changed = false;
+  // One greedy sweep: solve every still-unsolved candidate point whose deps are ready, choosing the
+  // candidate that best reproduces the baked position. Returns true if anything new was solved.
+  const greedyPass = (): boolean => {
+    let any = false, changed = true, guard = pattern.points.length + 8;
+    while (changed && guard-- > 0) {
+      changed = false;
+      for (const [pid, cands] of cand) {
+        if (sol.has(pid)) continue;
+        let best: Pt | null = null, bestErr = tolMm, bestC: Constraint | null = null;
+        for (const c of cands) {
+          const pos = constraintPos(c, scope, sol, pathById);
+          if (!pos) continue;
+          const err = Math.hypot(pos.x - baked.get(pid)!.x, pos.y - baked.get(pid)!.y);
+          if (err < bestErr) { bestErr = err; best = pos; bestC = c; }
+        }
+        if (best && bestC) { sol.set(pid, best); chosen.set(pid, bestC); changed = true; any = true; }
+      }
+    }
+    return any;
+  };
+
+  // Cascade with baked fallback. A point that can't be recovered must not silently block its entire
+  // downstream subtree (the cause of the deep-chain stalls). So: run the greedy sweep; when it stalls,
+  // find the unsolved candidate points that ARE determined now (≥1 candidate evaluates to a position)
+  // but didn't reproduce baked within tol — these are genuinely unrecoverable. Seed them with their
+  // baked position as fixed anchors (NOT added to `chosen`, so they stay plain fixed points, exact at
+  // base) and sweep again: their dependents, previously blocked, can now recover. Repeat until every
+  // candidate point is either recovered or pinned. If only undetermined (dep-missing / cyclic) points
+  // remain, pin them all to break the cycle and do a final sweep.
+  let outerGuard = pattern.points.length + 4;
+  while (outerGuard-- > 0) {
+    greedyPass();
+    let determined: string[] | null = null, undetermined = false;
     for (const [pid, cands] of cand) {
       if (sol.has(pid)) continue;
-      let best: Pt | null = null, bestErr = tolMm, bestC: Constraint | null = null;
-      for (const c of cands) {
-        const pos = constraintPos(c, scope, sol, pathById);
-        if (!pos) continue;
-        const err = Math.hypot(pos.x - baked.get(pid)!.x, pos.y - baked.get(pid)!.y);
-        if (err < bestErr) { bestErr = err; best = pos; bestC = c; }
-      }
-      if (best && bestC) { sol.set(pid, best); chosen.set(pid, bestC); changed = true; }
+      const evaluable = cands.some((c) => constraintPos(c, scope, sol, pathById) !== null);
+      if (evaluable) (determined ??= []).push(pid);
+      else undetermined = true;
     }
+    if (determined) { for (const pid of determined) sol.set(pid, baked.get(pid)!); continue; }
+    if (undetermined) { for (const [pid] of cand) if (!sol.has(pid)) sol.set(pid, baked.get(pid)!); greedyPass(); }
+    break;
   }
   if (chosen.size === 0) return pattern;
 

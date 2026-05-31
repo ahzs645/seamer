@@ -10,8 +10,9 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function openStudio(page: Page) {
-	await page.goto('/studio');
-	await expect(page.getByText('Pattern Studio')).toBeVisible();
+	// domcontentloaded (not 'load') so a cold Vite server compiling three.js doesn't hang the nav
+	await page.goto('/studio', { waitUntil: 'domcontentloaded' });
+	await expect(page.getByPlaceholder('Pattern name...')).toBeVisible();
 }
 
 async function importRectangle(page: Page) {
@@ -43,6 +44,34 @@ test('selecting a piece then an edge lets you edit the edge angle', async ({ pag
 	const before = await angle.inputValue();
 
 	// nudge +1° → the angle value changes (geometry edit re-derived)
+	await page.getByTitle('Rotate +1°').click();
+	await expect.poll(async () => await angle.inputValue()).not.toBe(before);
+});
+
+test('edge pivot toggle lets you rotate around either endpoint', async ({ page }) => {
+	await openStudio(page);
+	await importRectangle(page);
+
+	await page.locator('button[title="Toggle object browser"]').click();
+	await page.getByText('Piece 1', { exact: true }).click();
+	await page.locator('button[title="Toggle object browser"]').click();
+	await page.locator('button.font-bold').filter({ hasText: /^Line/ }).first().click();
+	await expect(page.locator('span', { hasText: /^Properties for Edge/ })).toBeVisible();
+
+	// the Pivot control shows two endpoint buttons; the first (from) is active by default
+	const pivot = page.locator('div.join').filter({ has: page.locator('button.join-item') }).first();
+	const pivotButtons = pivot.locator('button.join-item');
+	await expect(pivotButtons).toHaveCount(2);
+	await expect(pivotButtons.nth(0)).toHaveClass(/btn-active/);
+
+	// switch the pivot to the other endpoint
+	await pivotButtons.nth(1).click();
+	await expect(pivotButtons.nth(1)).toHaveClass(/btn-active/);
+	await expect(pivotButtons.nth(0)).not.toHaveClass(/btn-active/);
+
+	// angle editing still works after switching pivot
+	const angle = page.locator('label', { hasText: 'Angle (°)' }).locator('input');
+	const before = await angle.inputValue();
 	await page.getByTitle('Rotate +1°').click();
 	await expect.poll(async () => await angle.inputValue()).not.toBe(before);
 });

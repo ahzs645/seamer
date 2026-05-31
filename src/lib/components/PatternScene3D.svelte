@@ -2,7 +2,9 @@
   import { onMount, onDestroy } from 'svelte';
   import type { Pattern } from '$lib/types/pattern';
   import { PatternRenderer, type RendererStatus, type SceneMode } from '$lib/scene/scene3d';
+  import type { SimConfig } from '$lib/sim/config';
   import { isDarkTheme, toggleTheme, applyStoredTheme } from '$lib/utils/theme';
+  import { pieceGeometrySignature } from '$lib/utils/patternGeometry';
 
   interface Props {
     currentPattern: Pattern;
@@ -41,12 +43,23 @@
 
   let rebuildTimer: ReturnType<typeof setTimeout> | undefined;
   let lastKey = '';
+  // Per-piece resolved-geometry signature at the last ACTUAL rebuild. Diffing the live pattern against
+  // this tells us which pieces' shapes were edited, so only those re-triangulate from live geometry.
+  let builtSigs = new Map<string, string>();
 
-  function patternKey(p: Pattern): string {
+  function pieceSigs(p: Pattern): Map<string, string> {
+    const m = new Map<string, string>();
+    for (const pc of p.pieces) m.set(pc.id, pieceGeometrySignature(p, pc));
+    return m;
+  }
+
+  /** The rebuild trigger. Includes each piece's RESOLVED geometry signature (not just path/point
+   *  counts) so reshaping a piece in the 2D editor — moving a point, dragging a bézier handle —
+   *  changes the key and forces a 3D rebuild. */
+  function patternKey(p: Pattern, sigs = pieceSigs(p)): string {
     return JSON.stringify({
       body: p.body,
-      pieces: p.pieces.map((pc) => ({ id: pc.id, n: pc.mainPaths.length, a: pc.settings3d.arrangement, f: pc.settings3d.frozen, h: pc.hidden })),
-      pts: p.points.length,
+      pieces: p.pieces.map((pc) => ({ id: pc.id, g: sigs.get(pc.id), a: pc.settings3d.arrangement, f: pc.settings3d.frozen, h: pc.hidden })),
       seams: p.seams.length,
       mats: p.materials.map((m) => ({ id: m.id, c: m.frontTexture?.color, sw: m.stretchWarpValue, wf: m.stretchWeftValue, b: m.bendValue, w: m.weight }))
     });
@@ -61,7 +74,8 @@
     renderer.onModeChange = (m, piece, kind) => { sceneMode = m; selectedPiece = piece; arrangeKind = kind ?? null; };
     renderer.onSelectPiece = (id) => { onpieceselect?.(id); };
     renderer.onDrapeSettled = (savedByPiece) => { ondrapesettled?.(savedByPiece); };
-    lastKey = patternKey(currentPattern);
+    builtSigs = pieceSigs(currentPattern);
+    lastKey = patternKey(currentPattern, builtSigs);
     lightingMode = currentPattern.settings3d.lightingMode || 'flat';
     renderer.setPattern(currentPattern).then(() => {
       poses = renderer?.poseNames() ?? [];
@@ -83,7 +97,14 @@
     clearTimeout(rebuildTimer);
     const snapshot = currentPattern;
     rebuildTimer = setTimeout(() => {
-      renderer?.setPattern(snapshot).then(() => {
+      // Diff the about-to-build pattern against the last ACTUAL build to find which pieces' shapes
+      // were edited (robust across several edits within the debounce window). Those rebuild from live
+      // geometry; the rest keep their cached drape. builtSigs advances only here, when a build runs.
+      const sigs = pieceSigs(snapshot);
+      const changed = new Set<string>();
+      for (const [id, sig] of sigs) if (builtSigs.has(id) && builtSigs.get(id) !== sig) changed.add(id);
+      builtSigs = sigs;
+      renderer?.setPattern(snapshot, changed).then(() => {
         poses = renderer?.poseNames() ?? [];
         renderer?.setHighlightedPiece(selectedPieceId);
         applyLabelDisplay();
@@ -143,6 +164,36 @@
     a.click();
     URL.revokeObjectURL(url);
   }
+  // Save Image: export the current 3D view as a PNG (matches the source's bottom-bar "Save Image").
+  function saveImage() {
+    if (!renderer) return;
+    const a = document.createElement('a');
+    a.href = renderer.captureImage();
+    a.download = `${currentPattern.name.replace(/\s+/g, '_') || 'garment'}.png`;
+    a.click();
+  }
+
+  // Simulation controls: expose the solver parameters (matches the source's "Simulation controls").
+  let showSimPanel = $state(false);
+  let simCfg = $state<SimConfig | null>(null);
+  function toggleSimPanel() {
+    showSimPanel = !showSimPanel;
+    if (showSimPanel && renderer) simCfg = renderer.getSimConfig();
+  }
+  function setSim(patch: Partial<SimConfig>) {
+    if (!renderer || !simCfg) return;
+    simCfg = { ...simCfg, ...patch };
+    void renderer.setSimConfig(patch);
+  }
+  // gravity is stored as a vector; the slider edits its magnitude (m/s²).
+  function setGravity(g: number) { setSim({ gravity: [0, -g, 0] }); }
+
+  // Frozen snapshot: a translucent ghost of the current drape, kept as a visual reference.
+  let hasSnap = $state(false);
+  let snapOpacity = $state(0.35);
+  function freezeSnapshot() { renderer?.freezeSnapshot(snapOpacity); hasSnap = !!renderer?.hasSnapshot(); }
+  function clearSnapshot() { renderer?.clearSnapshot(); hasSnap = false; }
+  function setSnapOpacity(o: number) { snapOpacity = o; renderer?.setSnapshotOpacity(o); }
 
   // 'A' toggles arrange mode (matches the source's keyboard shortcut).
   function handleKey(e: KeyboardEvent) {
@@ -162,6 +213,7 @@
     { label: 'Show avatar', icon: 'person', onClick: toggleAvatar, active: () => showAvatar },
     { label: sceneMode === 'arrange' && arrangeKind === 'arrange' ? 'Exit arrange mode' : 'Arrange (A)', icon: 'scatter_plot', onClick: toggleArrangeMode, active: () => sceneMode === 'arrange' && arrangeKind === 'arrange', shortcut: 'A' },
     { label: sceneMode === 'arrange' && arrangeKind === 'manipulate' ? 'Exit move mode' : 'Move pieces (M)', icon: 'open_with', onClick: toggleManipulateMode, active: () => sceneMode === 'arrange' && arrangeKind === 'manipulate', shortcut: 'M' },
+    { label: 'Simulation controls', icon: 'tune', onClick: toggleSimPanel, active: () => showSimPanel },
     { label: dark ? 'Light mode' : 'Dark mode', icon: dark ? 'light_mode' : 'dark_mode', onClick: toggleDark, active: () => dark, sep: true },
     { label: 'Download as OBJ', icon: 'download', onClick: downloadOBJ }
   ]);
@@ -228,13 +280,61 @@
     </div>
   {/if}
 
-  <!-- Lighting-mode tabs (mirrors the source: Flat / Studio 1 / Studio 2 / Sunset) -->
-  <div class="absolute bottom-2 left-1/2 -translate-x-1/2 z-10">
+  <!-- Simulation controls panel (mirrors the source's "Simulation controls"/Simulator config) -->
+  {#if showSimPanel && simCfg}
+    <div class="absolute top-12 right-2 z-10 w-60 bg-base-200/95 backdrop-blur rounded-lg shadow-lg p-3 text-xs space-y-2 max-h-[70vh] overflow-y-auto">
+      <div class="flex items-center justify-between"><span class="font-bold">Simulation controls</span>
+        <button class="btn btn-ghost btn-xs btn-circle" onclick={() => (showSimPanel = false)} aria-label="Close">✕</button>
+      </div>
+      <label class="flex items-center justify-between gap-2"><span>Self-collision</span>
+        <input type="checkbox" class="toggle toggle-xs" checked={simCfg.handleSelfCollisions} onchange={(e) => setSim({ handleSelfCollisions: e.currentTarget.checked })} /></label>
+      <label class="flex items-center justify-between gap-2"><span>Body collision</span>
+        <input type="checkbox" class="toggle toggle-xs" checked={simCfg.handleExternalCollisions} onchange={(e) => setSim({ handleExternalCollisions: e.currentTarget.checked })} /></label>
+      {#each [
+        { key: 'gravity', label: 'Gravity', min: 0, max: 20, step: 0.1, get: () => -simCfg!.gravity[1], set: setGravity, fmt: (v: number) => v.toFixed(1) },
+        { key: 'globalDamping', label: 'Global damping', min: 0, max: 1, step: 0.01, get: () => simCfg!.globalDamping, set: (v: number) => setSim({ globalDamping: v }), fmt: (v: number) => v.toFixed(2) },
+        { key: 'nearDamping', label: 'Near damping', min: 0, max: 1, step: 0.01, get: () => simCfg!.nearDamping, set: (v: number) => setSim({ nearDamping: v }), fmt: (v: number) => v.toFixed(2) },
+        { key: 'simulationThickness', label: 'Thickness (mm)', min: 0, max: 20, step: 0.5, get: () => simCfg!.simulationThickness * 1000, set: (v: number) => setSim({ simulationThickness: v / 1000, edgeThickness: v / 1000 }), fmt: (v: number) => v.toFixed(1) },
+        { key: 'selfCollisionFriction', label: 'Self friction', min: 0, max: 1, step: 0.05, get: () => simCfg!.selfCollisionFriction, set: (v: number) => setSim({ selfCollisionFriction: v }), fmt: (v: number) => v.toFixed(2) },
+        { key: 'externalCollisionFriction', label: 'Body friction', min: 0, max: 1, step: 0.05, get: () => simCfg!.externalCollisionFriction, set: (v: number) => setSim({ externalCollisionFriction: v }), fmt: (v: number) => v.toFixed(2) },
+        { key: 'seamStrength', label: 'Seam strength', min: 0, max: 2, step: 0.1, get: () => simCfg!.seamStrength, set: (v: number) => setSim({ seamStrength: v }), fmt: (v: number) => v.toFixed(1) },
+        { key: 'seamIterations', label: 'Seam iterations', min: 1, max: 8, step: 1, get: () => simCfg!.seamIterations, set: (v: number) => setSim({ seamIterations: v }), fmt: (v: number) => v.toFixed(0) }
+      ] as ctl (ctl.key)}
+        <label class="flex flex-col gap-0.5">
+          <span class="flex justify-between"><span>{ctl.label}</span><span class="opacity-60">{ctl.fmt(ctl.get())}</span></span>
+          <input type="range" class="range range-xs" min={ctl.min} max={ctl.max} step={ctl.step} value={ctl.get()} oninput={(e) => ctl.set(parseFloat(e.currentTarget.value))} />
+        </label>
+      {/each}
+      <p class="opacity-50 leading-tight pt-1">Changes apply immediately; the drape is preserved.</p>
+      <div class="border-t border-base-300 pt-2 space-y-1">
+        <span class="font-bold">Frozen snapshot</span>
+        {#if hasSnap}
+          <label class="flex flex-col gap-0.5">
+            <span class="flex justify-between"><span>Opacity</span><span class="opacity-60">{snapOpacity.toFixed(2)}</span></span>
+            <input type="range" class="range range-xs" min="0.05" max="1" step="0.05" value={snapOpacity} oninput={(e) => setSnapOpacity(parseFloat(e.currentTarget.value))} />
+          </label>
+          <div class="flex gap-1">
+            <button class="btn btn-xs flex-1" onclick={freezeSnapshot}>Re-freeze</button>
+            <button class="btn btn-xs btn-ghost flex-1" onclick={clearSnapshot}>Remove</button>
+          </div>
+        {:else}
+          <button class="btn btn-xs btn-block" onclick={freezeSnapshot}>Freeze snapshot of drape</button>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  <!-- Lighting-mode tabs + Save Image (mirrors the source's bottom bar) -->
+  <div class="absolute bottom-2 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2">
     <div class="join join-horizontal bg-base-200/85 backdrop-blur rounded-lg shadow">
       {#each lightingTabs as tab}
         <button class="join-item btn btn-xs" class:btn-active={lightingMode === tab.id} onclick={() => setLighting(tab.id)}>{tab.label}</button>
       {/each}
     </div>
+    <button class="btn btn-xs gap-1 bg-base-200/85 backdrop-blur shadow" title="Save a PNG of the 3D view" onclick={saveImage}>
+      <span class="material-symbols-rounded notranslate text-base" aria-hidden="true">photo_camera</span>
+      Save Image
+    </button>
   </div>
 
   <!-- Pose selector -->

@@ -224,6 +224,25 @@ export function pieceInternalPolylines(
   return piece.internalPaths.map((pp) => piecePathPolyline(pp, paths, points, spacingMm)).filter((e) => e.length >= 2);
 }
 
+/**
+ * A compact fingerprint of a piece's RESOLVED 2D geometry: its stitched outline, internal lines, grain
+ * direction, and particle spacing. It changes whenever the piece's shape changes — moving a point,
+ * dragging a bézier handle, retargeting a path — because those all alter the flattened polylines.
+ * The 3D view uses this to (a) trigger a rebuild when a shape is edited and (b) detect WHICH pieces
+ * changed, so only those re-triangulate from live geometry while the rest keep their cached drape.
+ * Rounded to 0.1 mm to absorb float jitter that should not force a rebuild.
+ */
+export function pieceGeometrySignature(pattern: Pattern, piece: Piece): string {
+  const paths = indexPaths(pattern);
+  const points = indexPoints(pattern);
+  const r = (n: number) => Math.round(n * 10) / 10; // 0.1 mm
+  const enc = (poly: Vec2[]) => poly.map((p) => `${r(p.x)},${r(p.y)}`).join(' ');
+  const outline = enc(pieceOutline(pattern, piece, paths, points, 4));
+  const internals = pieceInternalPolylines(pattern, piece, paths, points, 4).map(enc).join('|');
+  const g = piece.grainVector ?? { x: 0, y: 1 };
+  return `${outline}#${internals}#g${r(g.x)},${r(g.y)}#pd${piece.settings3d.particleDistance ?? ''}`;
+}
+
 // ---------------------------------------------------------------------------
 // 2D-plan placement (matches the original app's pattern layout).
 //
