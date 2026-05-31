@@ -117,7 +117,10 @@ export class PatternRenderer {
   private selectedArrange = -1;
 
   onStatus: (status: RendererStatus, message?: string) => void = () => {};
-  onModeChange: (mode: SceneMode, selectedPieceId: string | null) => void = () => {};
+  // `kind` distinguishes the two piece-edit tools while mode === 'arrange': 'arrange' (flat layout)
+  // vs 'manipulate' (drag the draped pieces in place). null in 'view'. Lets the UI sync its toolbar
+  // state even when Move mode is entered by clicking a piece in the 3D view (not via the toolbar).
+  onModeChange: (mode: SceneMode, selectedPieceId: string | null, kind: 'arrange' | 'manipulate' | null) => void = () => {};
   /** Fired when a user-run drape settles (sim stopped): the freshly-settled per-piece savedPositions
    *  (stride-5: x2d,y2d mm, x3d,y3d,z3d m), keyed by base piece id, so the app can persist them. */
   onDrapeSettled: (savedByPiece: Record<string, number[]>) => void = () => {};
@@ -340,17 +343,18 @@ export class PatternRenderer {
       this.setHighlightedPiece(entry.pieceId);
       this.onSelectPiece(entry.pieceId);
 
-      if (!this.simulating) {
-        // DEFAULT (no sim running): clicking a piece enters in-place "Move pieces" mode and selects it,
-        // showing the transform gizmo — i.e. arrange/drag, NOT a simulation. (The grab-to-pull below
-        // only runs while a sim is actually playing.) Matches the source: click a piece → move handles.
+      if (!ev.shiftKey) {
+        // DEFAULT: clicking a piece enters in-place "Move pieces" mode and selects it, showing the
+        // transform gizmo — i.e. arrange/drag, NOT a simulation. Works even while a sim is playing
+        // (enterManipulateMode stops it first), so a click never unexpectedly grabs/pulls the fabric.
+        // Matches the source: click a piece → move handles. (Hold Shift to grab-and-pull instead.)
         this.enterManipulateMode();
         const idx = this.arrangeEntries.findIndex((e) => e.pieceId === entry.pieceId);
         if (idx >= 0) this.selectArrange(idx);
         return;
       }
 
-      // A simulation is playing: click-drag grabs and pulls the live fabric.
+      // Shift+drag: grab and pull the live fabric (soft-body); starts the sim if not already running.
       const pos = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
       let bestL = face.a;
       let bd = Infinity;
@@ -517,13 +521,14 @@ export class PatternRenderer {
       // outward face and the "back side" badge on the reverse. Built unconditionally so toggling
       // label mode is a cheap uniform flip rather than a full cloth rebuild (which would re-drape).
       const { face: faceLabelTex, back: backLabelTex } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
+      const labelFlipFace = piece.pieceId.includes('#M'); // mirror instances have reversed winding
       const labelOpacity = this.showLabels && !hidden && this.labelMode === 'flat' ? 1 : 0;
 
       // Our cloth triangles wind with their geometric front face pointing INWARD, so the outward
       // surface the camera sees is the BackSide. For a separate back texture we therefore render the
       // FACE (front) texture on a BackSide mesh (shows outward) and the back texture on a FrontSide
       // mesh (shows inward). With a single double-sided material this doesn't matter (both sides same).
-      const mat = createGarmentMaterial(pieceMat, flat, { side: separateBack ? THREE.BackSide : THREE.DoubleSide, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity });
+      const mat = createGarmentMaterial(pieceMat, flat, { side: separateBack ? THREE.BackSide : THREE.DoubleSide, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity, labelFlipFace });
       mat.wireframe = this.showTriangles;
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
@@ -534,7 +539,7 @@ export class PatternRenderer {
       // separate back side: a second mesh on the same (deforming) geometry, back faces only
       let backMesh: THREE.Mesh | undefined;
       if (separateBack) {
-        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity });
+        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity, labelFlipFace });
         backMat.wireframe = this.showTriangles;
         backMesh = new THREE.Mesh(geo, backMat);
         backMesh.castShadow = true; backMesh.receiveShadow = true; backMesh.frustumCulled = false;
@@ -973,7 +978,7 @@ export class PatternRenderer {
       const name = this.pattern!.pieces.find((p) => p.id === piece.pieceId)?.name ?? 'Piece';
       const { face, back } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
       const labelOpacity = this.showLabels && this.labelMode === 'flat' ? 1 : 0;
-      const mat = createGarmentMaterial(matById.get(piece.materialId), flat, { labelTexture: face, labelTextureBack: back, labelOpacity });
+      const mat = createGarmentMaterial(matById.get(piece.materialId), flat, { labelTexture: face, labelTextureBack: back, labelOpacity, labelFlipFace: piece.pieceId.includes('#M') });
       mat.wireframe = this.showTriangles;
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
@@ -1012,12 +1017,18 @@ export class PatternRenderer {
       m.emissiveIntensity = 0.4;
       this.transform?.attach(e.group);
       this.highlightId = e.pieceId;
-      this.onModeChange('arrange', e.pieceId);
+      this.emitModeChange(e.pieceId);
       this.onSelectPiece(e.pieceId);
     } else {
       this.transform?.detach();
-      this.onModeChange('arrange', null);
+      this.emitModeChange(null);
     }
+  }
+
+  /** Fire onModeChange with the current mode + edit kind (arrange vs in-place manipulate). */
+  private emitModeChange(selectedPieceId: string | null): void {
+    const kind = this.mode === 'arrange' ? (this.arrangeFromDrape ? 'manipulate' : 'arrange') : null;
+    this.onModeChange(this.mode, selectedPieceId, kind);
   }
 
   /** Gizmo mode while arranging. */
@@ -1055,7 +1066,7 @@ export class PatternRenderer {
     this.clothGroup.visible = true;
     this.mode = 'view';
     this.arrangeFromDrape = false;
-    this.onModeChange('view', null);
+    this.emitModeChange(null);
   }
 
   /** Drape from the current arrangement: seed the sim with the moved pieces and simulate. */

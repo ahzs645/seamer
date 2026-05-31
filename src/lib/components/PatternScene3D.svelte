@@ -58,7 +58,7 @@
     renderer = new PatternRenderer(containerEl);
     webgpu = renderer.webgpuAvailable();
     renderer.onStatus = (s, msg) => { status = s; statusMessage = msg ?? ''; };
-    renderer.onModeChange = (m, piece) => { sceneMode = m; selectedPiece = piece; if (m === 'view') arrangeKind = null; };
+    renderer.onModeChange = (m, piece, kind) => { sceneMode = m; selectedPiece = piece; arrangeKind = kind ?? null; };
     renderer.onSelectPiece = (id) => { onpieceselect?.(id); };
     renderer.onDrapeSettled = (savedByPiece) => { ondrapesettled?.(savedByPiece); };
     lastKey = patternKey(currentPattern);
@@ -103,19 +103,18 @@
     else renderer.simulate();
   }
   function reset() { renderer?.resetSimulation(); }
+  // arrangeKind is kept in sync by renderer.onModeChange, so these just toggle/switch the tool.
   function toggleArrangeMode() {
     if (!renderer) return;
     if (sceneMode === 'arrange' && arrangeKind === 'arrange') { renderer.exitArrangeMode(); return; }
     if (sceneMode === 'arrange') renderer.exitArrangeMode(); // switching from the Move tool
     renderer.enterArrangeMode();
-    arrangeKind = 'arrange';
   }
   function toggleManipulateMode() {
     if (!renderer) return;
     if (sceneMode === 'arrange' && arrangeKind === 'manipulate') { renderer.exitArrangeMode(); return; }
     if (sceneMode === 'arrange') renderer.exitArrangeMode(); // switching from the Arrange tool
     renderer.enterManipulateMode();
-    arrangeKind = 'manipulate';
   }
   function setGizmoMode(m: 'translate' | 'rotate') { gizmoMode = m; renderer?.setArrangeTransformMode(m); }
   function drapeFromArrangement() { renderer?.simulateFromArrangement(); }

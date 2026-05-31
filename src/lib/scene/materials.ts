@@ -14,6 +14,9 @@ export interface GarmentMatOpts {
   labelTextureBack?: THREE.Texture;
   /** badge opacity (0 hides it); toggled live via mat.userData.labelUniforms.uLabelOpacity */
   labelOpacity?: number;
+  /** mirror instances have X-negated geometry (reversed winding), which inverts gl_FrontFacing — set
+   *  true so the "face side" badge still lands on the outward surface. */
+  labelFlipFace?: boolean;
 }
 
 /** True when this material wants its back face rendered with a different texture. */
@@ -81,7 +84,8 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
     const uniforms = {
       uLabelMap: { value: opts.labelTexture },
       uLabelMapBack: { value: opts.labelTextureBack ?? opts.labelTexture },
-      uLabelOpacity: { value: opts.labelOpacity ?? 1 }
+      uLabelOpacity: { value: opts.labelOpacity ?? 1 },
+      uLabelFlip: { value: opts.labelFlipFace ? 1 : 0 }
     };
     mat.userData.labelUniforms = uniforms;
     // Distinguish the label-injected program from a plain garment program with identical parameters,
@@ -91,16 +95,19 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
       shader.uniforms.uLabelMap = uniforms.uLabelMap;
       shader.uniforms.uLabelMapBack = uniforms.uLabelMapBack;
       shader.uniforms.uLabelOpacity = uniforms.uLabelOpacity;
+      shader.uniforms.uLabelFlip = uniforms.uLabelFlip;
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nattribute vec2 uvLabel;\nvarying vec2 vUvLabel;')
         .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvUvLabel = uvLabel;');
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nuniform sampler2D uLabelMap;\nuniform sampler2D uLabelMapBack;\nuniform float uLabelOpacity;\nvarying vec2 vUvLabel;')
+        .replace('#include <common>', '#include <common>\nuniform sampler2D uLabelMap;\nuniform sampler2D uLabelMapBack;\nuniform float uLabelOpacity;\nuniform float uLabelFlip;\nvarying vec2 vUvLabel;')
         .replace('#include <map_fragment>', `#include <map_fragment>
         {
-          // Cloth fronts wind inward, so the outward (fabric face) surface is back-facing: show the
-          // "face side" badge there, and the read-correct "back side" badge on the reverse.
-          vec4 lbl = gl_FrontFacing ? texture2D(uLabelMapBack, vUvLabel) : texture2D(uLabelMap, vUvLabel);
+          // Cloth fronts wind inward, so the outward (fabric face) surface is normally back-facing —
+          // show the "face side" badge there, the read-correct "back side" badge on the reverse.
+          // Mirror instances (X-negated, reversed winding) invert gl_FrontFacing, so uLabelFlip swaps it.
+          bool outward = (uLabelFlip > 0.5) ? gl_FrontFacing : !gl_FrontFacing;
+          vec4 lbl = outward ? texture2D(uLabelMap, vUvLabel) : texture2D(uLabelMapBack, vUvLabel);
           vec3 lblLin = pow(lbl.rgb, vec3(2.2)); // sRGB canvas -> linear, matched to the lit pipeline
           diffuseColor.rgb = mix(diffuseColor.rgb, lblLin, lbl.a * uLabelOpacity);
         }`);
