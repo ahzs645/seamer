@@ -15,6 +15,7 @@
     pieceWorldInternalPolylines,
     pieceTransform,
     pieceInverseTransform,
+    pieceCutCounts,
     piecePathPolyline,
     placedPoints,
     allSeamGeometry,
@@ -615,7 +616,8 @@
 
       if (currentPattern.showPieceNames) {
         const mid = toCanvas(cen);
-        pieceNameChip(c, piece.name, mid.x, mid.y);
+        const cuts = pieceCutCounts(piece);
+        pieceNameChip(c, cuts.total > 1 ? `${piece.name}  ×${cuts.total}` : piece.name, mid.x, mid.y);
       }
     }
 

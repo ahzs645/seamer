@@ -630,6 +630,21 @@
                 onchange={(e) => updatePiece((p) => ({ ...p, mirrorX: e.currentTarget.checked }))} /> Mirror X</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.mirrorY}
                 onchange={(e) => updatePiece((p) => ({ ...p, mirrorY: e.currentTarget.checked }))} /> Mirror Y</label>
+              <hr class="border-base-200" />
+              <span class="text-[11px] font-semibold opacity-70">Cut count</span>
+              <div class="grid grid-cols-2 gap-1">
+                <label class="flex flex-col gap-0.5 text-[11px]">Right pieces
+                  <input type="number" min="0" step="1" class="input input-bordered input-xs" value={piece.rightPieces}
+                    oninput={(e) => updatePiece((p) => ({ ...p, rightPieces: Math.max(0, parseInt(e.currentTarget.value) || 0) }), 'Cut count')} /></label>
+                <label class="flex flex-col gap-0.5 text-[11px]">Left (mirrored)
+                  <input type="number" min="0" step="1" class="input input-bordered input-xs" value={piece.leftPieces}
+                    oninput={(e) => updatePiece((p) => ({ ...p, leftPieces: Math.max(0, parseInt(e.currentTarget.value) || 0) }), 'Cut count')} /></label>
+              </div>
+              <label class="flex items-center justify-between gap-2 text-[11px]">Mirror left along
+                <select class="select select-bordered select-xs w-20" value={piece.mirrorLeftPiecesAxis}
+                  onchange={(e) => updatePiece((p) => ({ ...p, mirrorLeftPiecesAxis: e.currentTarget.value }), 'Mirror axis')}>
+                  <option value="X">X axis</option><option value="Y">Y axis</option></select></label>
+              <p class="text-[11px] opacity-50">Left/right copies appear in the cutting marker. 3D drapes the base piece only.</p>
 
             {:else if s.id === 'scaling'}
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.seamAllowanceInside}

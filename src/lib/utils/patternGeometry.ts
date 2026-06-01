@@ -260,6 +260,17 @@ export function pieceGeometrySignature(pattern: Pattern, piece: Piece): string {
 // origin point so edits to that point keep the placement correct.
 // ---------------------------------------------------------------------------
 
+/**
+ * How many times a piece is cut: `asIs` straight copies plus `mirrored` reflected copies
+ * (left/right pairs). A piece with no counts set is cut once. `total` is always ≥ 1.
+ */
+export function pieceCutCounts(piece: Piece): { asIs: number; mirrored: number; total: number } {
+  const right = piece.rightPieces ?? 0;
+  const left = piece.leftPieces ?? 0;
+  const asIs = right > 0 ? right : left > 0 ? 0 : 1;
+  return { asIs, mirrored: left, total: Math.max(1, asIs + left) };
+}
+
 /** Build the drafting-space → plan-space transform for a piece. */
 export function pieceTransform(
   piece: Piece,

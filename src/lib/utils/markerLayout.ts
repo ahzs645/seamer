@@ -5,7 +5,7 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import {
-  indexPaths, indexPoints, pieceWorldOutline, pieceAllowancePolygon, type Vec2
+  indexPaths, indexPoints, pieceWorldOutline, pieceAllowancePolygon, pieceCutCounts, type Vec2
 } from './patternGeometry';
 
 export interface Placement {
@@ -50,8 +50,14 @@ export function nestPieces(pattern: Pattern, fabricWidthMm = 1400, gapMm = 10): 
     const cut = sa > 0.05 ? pieceAllowancePolygon(pattern, piece, piece.seamAllowanceInside ? -sa : sa, paths, points, 2) : outline;
     const ref = cut.length >= 3 ? cut : outline;
     const bb = polyBounds(ref);
+    const w = bb.maxX - bb.minX, h = bb.maxY - bb.minY;
     const norm = (poly: Vec2[]) => poly.map((p) => ({ x: p.x - bb.minX, y: p.y - bb.minY }));
-    items.push({ pieceId: piece.id, name: piece.name, cut: norm(ref), outline: norm(outline), w: bb.maxX - bb.minX, h: bb.maxY - bb.minY });
+    // mirror a normalised poly within its own bbox, across the configured axis
+    const mirror = (poly: Vec2[]) => poly.map((p) => (piece.mirrorLeftPiecesAxis === 'Y' ? { x: p.x, y: h - p.y } : { x: w - p.x, y: p.y }));
+    const baseCut = norm(ref), baseOut = norm(outline);
+    const { asIs, mirrored } = pieceCutCounts(piece);
+    for (let i = 0; i < asIs; i++) items.push({ pieceId: piece.id, name: piece.name, cut: baseCut, outline: baseOut, w, h });
+    for (let i = 0; i < mirrored; i++) items.push({ pieceId: piece.id, name: `${piece.name} (mirror)`, cut: mirror(baseCut), outline: mirror(baseOut), w, h });
   }
 
   // First-fit decreasing by height (shelf packing).
