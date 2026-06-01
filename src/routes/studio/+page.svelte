@@ -20,7 +20,7 @@
   import GradingOverlay from '$lib/components/GradingOverlay.svelte';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { confirm } from '$lib/stores/confirm';
-  import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printPatternTiled, printMarkerTiled } from '$lib/utils/exporters';
+  import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printPatternTiled, printMarkerTiled, patternToPDF, patternToHPGL } from '$lib/utils/exporters';
   import { nestPieces, markerToSVG, type CutOffType } from '$lib/utils/markerLayout';
   import { dxfToPattern, svgToPattern } from '$lib/utils/patternImport';
   import { cutToPattern } from '$lib/utils/cutImport';
@@ -35,13 +35,18 @@
   import BugReportModal from '$lib/components/BugReportModal.svelte';
   import CuttingRoomModal from '$lib/components/CuttingRoomModal.svelte';
   import VersionsModal from '$lib/components/VersionsModal.svelte';
+  import SettingsModal from '$lib/components/SettingsModal.svelte';
+  import StatusBar from '$lib/components/StatusBar.svelte';
+  import HistoryMenu from '$lib/components/HistoryMenu.svelte';
   import { installCommandApi, type ExecuteHost } from '$lib/commands';
   import { get } from 'svelte/store';
+  import { autoSaveSeconds } from '$lib/stores/pattern';
 
   let showCommandPalette = $state(false);
   let showBugReport = $state(false);
   let showCuttingRoom = $state(false);
   let showVersions = $state(false);
+  let showSettings = $state(false);
 
   let currentPattern = $state<Pattern>(structuredClone(EMPTY_PATTERN));
   let saved = $state(true);
@@ -190,14 +195,19 @@
       }
     })();
 
-    autoSaveTimer = setInterval(async () => {
-      if (!saved) { await saveToDB(currentPattern); saved = true; }
-    }, 5000);
+    const startAutosave = (seconds: number) => {
+      clearInterval(autoSaveTimer);
+      autoSaveTimer = setInterval(async () => {
+        if (!saved) { await saveToDB(currentPattern); saved = true; }
+      }, Math.max(2, seconds) * 1000);
+    };
+    startAutosave(get(autoSaveSeconds));
+    const unsubAutosave = autoSaveSeconds.subscribe((s) => startAutosave(s));
 
     const handler = (e: BeforeUnloadEvent) => { if (!saved) e.preventDefault(); };
     window.addEventListener('beforeunload', handler);
 
-    return () => { clearInterval(autoSaveTimer); window.removeEventListener('beforeunload', handler); disposeCommandApi(); };
+    return () => { clearInterval(autoSaveTimer); unsubAutosave(); window.removeEventListener('beforeunload', handler); disposeCommandApi(); };
   });
 
   function handlePatternUpdate(updated: Pattern, label = 'Edit') {
@@ -257,6 +267,22 @@
     if (!blob) { toastError('Nothing to export'); return; }
     downloadBlob(`${base}.png`, blob);
     toastSuccess('Exported PNG');
+  }
+  async function exportPDF() {
+    const base = patternName.replace(/\s+/g, '_') || 'pattern';
+    const sizeStr = (prompt('PDF page size? A4 / A3 / A2 / A1 / A0 / Letter (tiled at true scale)', 'A4') || 'A4').trim();
+    const page = (['A4','A3','A2','A1','A0','Letter'].find((s) => s.toLowerCase() === sizeStr.toLowerCase()) ?? 'A4') as 'A4';
+    try {
+      downloadBlob(`${base}.pdf`, await patternToPDF(currentPattern, { page, tile: true }));
+      toastSuccess(`Exported PDF (${page}, tiled)`);
+    } catch (e) { toastError('PDF export failed'); }
+  }
+  async function exportHPGL() {
+    const base = patternName.replace(/\s+/g, '_') || 'pattern';
+    try {
+      downloadText(`${base}.hpgl`, await patternToHPGL(currentPattern), 'application/vnd.hp-hpgl');
+      toastSuccess('Exported HPGL');
+    } catch (e) { toastError('HPGL export failed'); }
   }
 
   function doPrint() { printPattern(currentPattern, patternName || 'Pattern'); }
@@ -528,6 +554,8 @@
           <li><button onclick={handleExport}>JSON (.seamer.json)</button></li>
           <li><button onclick={() => exportAs('svg')}>SVG</button></li>
           <li><button onclick={() => exportAs('dxf')}>DXF</button></li>
+          <li><button onclick={exportPDF}>PDF (vector, tiled)</button></li>
+          <li><button onclick={exportHPGL}>HPGL (plotter)</button></li>
           <li><button onclick={exportPNG}>PNG</button></li>
           <li><button onclick={() => exportAs('csv')}>CSV (points)</button></li>
           <li class="menu-title pt-2">Cutting</li>
@@ -546,8 +574,12 @@
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">view_list</span>
       </button>
       <ErrorsPanel {currentPattern} />
+      <HistoryMenu onundo={(n) => { for (let i = 0; i < n; i++) handleUndo(); }} onredo={handleRedo} />
       <button class="btn btn-ghost btn-xs" onclick={() => showVersions = true} title="Version history" aria-label="Version history">
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">history</span>
+      </button>
+      <button class="btn btn-ghost btn-xs" onclick={() => showSettings = true} title="Settings" aria-label="Settings">
+        <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">settings</span>
       </button>
       <button class="btn btn-ghost btn-xs" onclick={() => showCommandPalette = true} title="Command palette (⌘K)" aria-label="Command palette">
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">terminal</span>
@@ -600,6 +632,8 @@
     <StudioToolbar {currentPattern} onchange={handlePatternUpdate} />
   </div>
 
+  <StatusBar {currentPattern} {saved} />
+
   {#if showObjectBrowser}
     <ObjectBrowser {currentPattern} onchange={handlePatternUpdate} bind:open={showObjectBrowser} />
   {/if}
@@ -611,6 +645,7 @@
 {#if showBugReport}<BugReportModal {currentPattern} onclose={() => (showBugReport = false)} />{/if}
 {#if showCuttingRoom}<CuttingRoomModal {currentPattern} onchange={handlePatternUpdate} onclose={() => (showCuttingRoom = false)} />{/if}
 {#if showVersions}<VersionsModal {currentPattern} onrestore={applyImported} onchange={handlePatternUpdate} onclose={() => (showVersions = false)} />{/if}
+{#if showSettings}<SettingsModal onclose={() => (showSettings = false)} />{/if}
 
 <Toaster />
 <ConfirmDialog />

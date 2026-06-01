@@ -3,6 +3,7 @@ import { createEmptyPattern, type Pattern, type ConstrainablePoint } from '$lib/
 import { selectionMove, selectionRotate, selectionScale, selectionMirror } from './selection';
 import { elementBringToFront, elementSendToBack, elementMoveToLayer, elementRename } from './element';
 import { variableReorder, variableSetOptions, layerRename, imageUpdate } from './structural';
+import { pieceAddPath } from './piece';
 import { executeCommand, type ExecuteHost } from './execute';
 
 function pt(id: string, x: number, y: number, fixed = true): ConstrainablePoint {
@@ -121,6 +122,38 @@ describe('structural ops', () => {
     p.images = [{ id: 'img', url: '', x: 0, y: 0, width: 100, height: 50 }];
     const out = imageUpdate(p, 'img', { width: 200, lockAspect: true });
     expect(out.images[0].height).toBe(100); // 200 / (100/50)
+  });
+});
+
+describe('pieceAddPath', () => {
+  function withPieceAndPath(): Pattern {
+    const p = base();
+    p.points = [pt('a', 0, 0), pt('b', 10, 0)];
+    p.paths = [{ id: 'path1', name: 'EdgeAB', pathType: 'line', pathPoints: [{ id: 'a' }, { id: 'b' }], version: 0 }];
+    p.pieces = [{ id: 'pc1', mainPaths: [], internalPaths: [], position: { x: 0, y: 0 }, rotation: 0 } as unknown as Pattern['pieces'][number]];
+    return p;
+  }
+  const uid = (pre: string) => `${pre}_test`;
+  it('attaches an existing path to a piece as a boundary edge', () => {
+    const out = pieceAddPath(withPieceAndPath(), 'pc1', 'path1', 'main', uid);
+    expect(out.pieces[0].mainPaths).toHaveLength(1);
+    expect(out.pieces[0].mainPaths[0]).toMatchObject({ path: 'path1', from: 'a', to: 'b', reversed: false });
+  });
+  it('attaches as an internal path with a fold angle', () => {
+    const out = pieceAddPath(withPieceAndPath(), 'pc1', 'path1', 'internal', uid);
+    expect(out.pieces[0].internalPaths).toHaveLength(1);
+    expect(out.pieces[0].internalPaths[0].foldAngle).toBe(0);
+    expect(out.pieces[0].mainPaths).toHaveLength(0);
+  });
+  it('is a no-op if the path is already attached', () => {
+    const once = pieceAddPath(withPieceAndPath(), 'pc1', 'path1', 'main', uid);
+    const twice = pieceAddPath(once, 'pc1', 'path1', 'main', uid);
+    expect(twice.pieces[0].mainPaths).toHaveLength(1);
+  });
+  it('is a no-op for an unknown piece or path', () => {
+    const p = withPieceAndPath();
+    expect(pieceAddPath(p, 'nope', 'path1', 'main', uid)).toBe(p);
+    expect(pieceAddPath(p, 'pc1', 'nope', 'main', uid)).toBe(p);
   });
 });
 

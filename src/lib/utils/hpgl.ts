@@ -6,6 +6,24 @@ import type { Vec2 } from './patternGeometry';
 
 const UNIT_MM = 0.025; // 1 plotter unit = 0.025 mm
 
+/** Polylines (mm) → HPGL plotter program. Each polyline = pen-up to its start, pen-down through its
+ *  points; closed polylines repeat their first point. Optional pen-per-polyline for layer colours. */
+export function toHPGL(polys: { pts: Vec2[]; closed?: boolean; pen?: number }[]): string {
+  const u = (v: number) => Math.round(v / UNIT_MM); // mm → plotter units
+  const out: string[] = ['IN;', 'SP1;'];
+  let pen = 1;
+  for (const poly of polys) {
+    const pts = poly.pts;
+    if (pts.length < 2) continue;
+    if (poly.pen && poly.pen !== pen) { pen = poly.pen; out.push(`SP${pen};`); }
+    out.push(`PU${u(pts[0].x)},${u(pts[0].y)};`);
+    const seq = poly.closed ? [...pts.slice(1), pts[0]] : pts.slice(1);
+    out.push('PD' + seq.map((p) => `${u(p.x)},${u(p.y)}`).join(',') + ';');
+  }
+  out.push('PU;', 'SP0;', 'IN;');
+  return out.join('\n');
+}
+
 export function parseHPGL(text: string): Vec2[][] {
   const polys: Vec2[][] = [];
   let cur: Vec2[] = [];

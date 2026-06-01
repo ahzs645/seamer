@@ -14,6 +14,7 @@ import {
   variableReorder, variableSetOptions, variableUpdate,
   layerRename, layerSetStyle, imageUpdate, textUpdate, type LayerStyle
 } from './structural';
+import { pieceAddPath } from './piece';
 
 const num = (v: unknown, d = 0): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : d);
@@ -80,6 +81,15 @@ const defs: CommandDef[] = [
     type: 'element.delete', category: 'element', label: 'Delete element',
     summary: 'Delete one resolvable element by id.', inputs: ['id'],
     run: (p, a) => elementDelete(p, str(a.id))
+  },
+
+  // --- piece building --------------------------------------------------------
+  {
+    type: 'piecePath.add', category: 'piecePath', label: 'Add path to piece',
+    summary: 'Add an existing draft path to a piece as a boundary or internal edge.',
+    inputs: ['pieceId', 'pathId', 'kind?'],
+    example: { pieceId: 'Piece_x', pathId: 'Path_y', kind: 'main' },
+    run: (p, a, c) => pieceAddPath(p, str(a.pieceId), str(a.pathId), str(a.kind, 'main') === 'internal' ? 'internal' : 'main', c.uid)
   },
 
   // --- point -----------------------------------------------------------------

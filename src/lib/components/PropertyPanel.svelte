@@ -683,6 +683,9 @@
                 onchange={(e) => updatePiece((p) => ({ ...p, mirrorX: e.currentTarget.checked }))} /> Mirror X</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.mirrorY}
                 onchange={(e) => updatePiece((p) => ({ ...p, mirrorY: e.currentTarget.checked }))} /> Mirror Y</label>
+              <label class="flex items-center gap-2" title="Draft half the piece; the full shape is mirrored across the first edge (cut on fold)">
+                <input type="checkbox" class="checkbox checkbox-xs" checked={piece.firstEdgeSymmetry ?? false}
+                onchange={(e) => updatePiece((p) => ({ ...p, firstEdgeSymmetry: e.currentTarget.checked }), 'First edge symmetry')} /> First edge symmetry</label>
               <hr class="border-base-200" />
               <span class="text-[11px] font-semibold opacity-70">Cut count</span>
               <div class="grid grid-cols-2 gap-1">
@@ -798,6 +801,15 @@
                               <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(pp.seamAllowance).toFixed(2)}
                                 oninput={(e) => updateMainPath(pp.id, { seamAllowance: fromUnit(parseFloat(e.currentTarget.value) || 0) }, 'Edit edge allowance')} /></label>
                           {/if}
+                        </div>
+
+                        <!-- Cover seam allowance at the edge ends -->
+                        <div class="space-y-1 border-t border-base-200 pt-2">
+                          <span class="text-[11px] font-semibold opacity-70">Cover seam allowance</span>
+                          <label class="flex items-center gap-2 text-[11px]" title="Wrap the allowance around the corner at this edge's start point"><input type="checkbox" class="checkbox checkbox-xs" checked={pp.coverSeamAllowanceStart !== false}
+                            onchange={(e) => updateMainPath(pp.id, { coverSeamAllowanceStart: e.currentTarget.checked }, 'Cover allowance at start')} /> at start</label>
+                          <label class="flex items-center gap-2 text-[11px]" title="Wrap the allowance around the corner at this edge's end point"><input type="checkbox" class="checkbox checkbox-xs" checked={pp.coverSeamAllowanceEnd !== false}
+                            onchange={(e) => updateMainPath(pp.id, { coverSeamAllowanceEnd: e.currentTarget.checked }, 'Cover allowance at end')} /> at end</label>
                         </div>
 
                         <!-- Notches -->

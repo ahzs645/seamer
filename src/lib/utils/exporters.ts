@@ -6,10 +6,10 @@ import {
   indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, pieceTransform, pieceShrinkageScale, type Vec2
 } from './patternGeometry';
 
-type Layer = 'pattern' | 'seam-allowance' | 'internal' | 'marker';
-interface Poly { pts: Vec2[]; closed: boolean; layer: Layer }
+export type Layer = 'pattern' | 'seam-allowance' | 'internal' | 'marker';
+export interface Poly { pts: Vec2[]; closed: boolean; layer: Layer }
 
-function collectPolylines(pattern: Pattern): Poly[] {
+export function collectPolylines(pattern: Pattern): Poly[] {
   const paths = indexPaths(pattern);
   const points = indexPoints(pattern);
   const out: Poly[] = [];
@@ -96,6 +96,79 @@ export function patternToDXF(pattern: Pattern): string {
   }
   lines.push('0', 'ENDSEC', '0', 'EOF');
   return lines.join('\n');
+}
+
+// --- Vector PDF (tiled, true-scale) ------------------------------------------
+
+const PDF_LAYER_STYLE: Record<Layer, import('./pdf').PdfStroke> = {
+  'pattern': { color: [0, 0, 0], width: 0.6 },
+  'seam-allowance': { color: [0.53, 0.53, 0.53], width: 0.4, dash: [3, 2] },
+  'internal': { color: [0.27, 0.27, 0.27], width: 0.4, dash: [2, 2] },
+  'marker': { color: [0.75, 0.22, 0.17], width: 0.4 }
+};
+
+function hexToRgb(hex?: string): [number, number, number] {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex ?? '');
+  if (!m) return [0, 0, 0];
+  const n = parseInt(m[1], 16);
+  return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255];
+}
+
+const pdfBlob = (bytes: Uint8Array): Blob => new Blob([bytes.buffer as ArrayBuffer], { type: 'application/pdf' });
+
+/** Pattern → multi-page vector PDF Blob at true mm scale (tiled across the chosen page size). */
+export async function patternToPDF(pattern: Pattern, opts: import('./pdf').PdfLayoutOpts = {}): Promise<Blob> {
+  const { polylinesToPDF } = await import('./pdf');
+  const polys = collectPolylines(pattern).map((p) => ({ pts: p.pts, closed: p.closed, style: PDF_LAYER_STYLE[p.layer] }));
+  const texts = (pattern.texts ?? []).filter((t) => t.value).map((t) => ({
+    x: t.x, y: t.y, sizeMm: t.fontSize ?? 15, text: t.value,
+    color: hexToRgb(t.color), anchor: (t.align === 'left' ? 'start' : t.align === 'right' ? 'end' : 'middle') as 'start' | 'middle' | 'end',
+    rotation: t.rotation ?? 0
+  }));
+  return pdfBlob(polylinesToPDF(polys, texts, { title: pattern.name || 'Pattern', ...opts }));
+}
+
+/** Nested marker layout → multi-page vector PDF Blob (cut polygons dashed, stitch outlines solid). */
+export async function markerToPDF(
+  layout: { placements: { name: string; poly: Vec2[]; outline: Vec2[] }[]; fabricWidthMm: number; usedLengthMm: number },
+  opts: import('./pdf').PdfLayoutOpts = {}
+): Promise<Blob> {
+  const { polylinesToPDF } = await import('./pdf');
+  const polys: import('./pdf').MmPoly[] = [];
+  const texts: import('./pdf').MmText[] = [];
+  // marker space has y down; flip to y-up mm for the PDF (about usedLength)
+  const flip = (p: Vec2): Vec2 => ({ x: p.x, y: layout.usedLengthMm - p.y });
+  for (const pl of layout.placements) {
+    polys.push({ pts: pl.poly.map(flip), closed: true, style: PDF_LAYER_STYLE['seam-allowance'] });
+    polys.push({ pts: pl.outline.map(flip), closed: true, style: PDF_LAYER_STYLE['pattern'] });
+    const cx = pl.poly.reduce((s, p) => s + p.x, 0) / (pl.poly.length || 1);
+    const cy = pl.poly.reduce((s, p) => s + p.y, 0) / (pl.poly.length || 1);
+    texts.push({ ...flip({ x: cx, y: cy }), sizeMm: 8, text: pl.name, anchor: 'middle' });
+  }
+  // fabric edge
+  polys.push({ pts: [{ x: 0, y: 0 }, { x: layout.fabricWidthMm, y: 0 }, { x: layout.fabricWidthMm, y: layout.usedLengthMm }, { x: 0, y: layout.usedLengthMm }], closed: true, style: { color: [0.05, 0.65, 0.91], width: 0.6 } });
+  return pdfBlob(polylinesToPDF(polys, texts, { title: 'Marker', ...opts }));
+}
+
+// --- HPGL (plotter) ----------------------------------------------------------
+const HPGL_PEN: Record<Layer, number> = { 'pattern': 1, 'seam-allowance': 2, 'internal': 3, 'marker': 4 };
+
+/** Pattern → HPGL plotter program (pen 1 stitch line, 2 cut line, 3 internal, 4 markers). */
+export async function patternToHPGL(pattern: Pattern): Promise<string> {
+  const { toHPGL } = await import('./hpgl');
+  return toHPGL(collectPolylines(pattern).map((p) => ({ pts: p.pts, closed: p.closed, pen: HPGL_PEN[p.layer] })));
+}
+
+/** Nested marker → HPGL (cut polygons on pen 2, stitch outlines on pen 1). */
+export async function markerToHPGL(layout: { placements: { poly: Vec2[]; outline: Vec2[] }[]; usedLengthMm: number }): Promise<string> {
+  const { toHPGL } = await import('./hpgl');
+  const flip = (p: Vec2): Vec2 => ({ x: p.x, y: layout.usedLengthMm - p.y });
+  const polys: { pts: Vec2[]; closed: boolean; pen: number }[] = [];
+  for (const pl of layout.placements) {
+    polys.push({ pts: pl.poly.map(flip), closed: true, pen: 2 });
+    polys.push({ pts: pl.outline.map(flip), closed: true, pen: 1 });
+  }
+  return toHPGL(polys);
 }
 
 export function patternToCSV(pattern: Pattern): string {

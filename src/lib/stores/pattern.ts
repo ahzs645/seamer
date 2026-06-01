@@ -23,6 +23,24 @@ export const snapToGrid = writable<boolean>(false);
 
 export const interactionMode = writable<'fast' | 'accurate'>('fast');
 
+/** Live cursor position in drafting millimetres (set by the 2D canvas), for the status bar. Null when
+ *  the pointer is outside the canvas. */
+export const cursorMm = writable<{ x: number; y: number } | null>(null);
+
+/** Autosave cadence in seconds (user-configurable in Settings; persisted to localStorage). */
+function persisted<T>(key: string, initial: T) {
+  let start = initial;
+  if (typeof localStorage !== 'undefined') {
+    const raw = localStorage.getItem(key);
+    if (raw != null) try { start = JSON.parse(raw) as T; } catch { /* ignore */ }
+  }
+  const store = writable<T>(start);
+  if (typeof localStorage !== 'undefined') store.subscribe((v) => { try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* ignore */ } });
+  return store;
+}
+export const autoSaveSeconds = persisted<number>('seamer.autosaveSeconds', 5);
+export const show3dStats = persisted<boolean>('seamer.show3dStats', false);
+
 // --- Labeled undo/redo history ------------------------------------------------
 // Faithful in spirit to the original application's named editor.execute() commands: each
 // history entry carries a human label so the toolbar can show "Undo Add seam" / "Redo Move

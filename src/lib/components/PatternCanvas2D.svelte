@@ -6,7 +6,7 @@
   import DrawingTools from '$lib/components/DrawingTools.svelte';
   import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
   import { toast } from '$lib/stores/toast';
-  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
+  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, cursorMm } from '$lib/stores/pattern';
   import {
     indexPoints,
     indexPaths,
@@ -31,6 +31,7 @@
   import { deletePiece as deletePieceCascade } from '$lib/utils/patternMutations';
   import * as ops from '$lib/utils/pathPointOps';
   import { breakoutPiece, type BreakoutMode } from '$lib/utils/breakout';
+  import { pieceAddPath } from '$lib/commands/piece';
 
   interface Props {
     currentPattern: Pattern;
@@ -784,13 +785,17 @@
       for (const pp of piece.mainPaths) usedPaths.add(pp.path);
       for (const pp of piece.internalPaths) usedPaths.add(pp.path);
     }
-    for (const path of currentPattern.paths) {
-      if (usedPaths.has(path.id) || !layerVisible(path.layerId)) continue;
-      const isSelected = $selectedPathIds.has(path.id);
-      c.strokeStyle = isSelected ? '#f97316' : '#cbd5e1';
-      c.lineWidth = isSelected ? 2.5 : 1;
-      tracePoly(c, pathPolyline(path, points, 4), false);
-      c.stroke();
+    // Construction geometry = paths not used by any piece. Hidden when showConstruction is off.
+    const showConstruction = currentPattern.showConstruction !== false;
+    if (showConstruction) {
+      for (const path of currentPattern.paths) {
+        if (usedPaths.has(path.id) || !layerVisible(path.layerId)) continue;
+        const isSelected = $selectedPathIds.has(path.id);
+        c.strokeStyle = isSelected ? '#f97316' : '#cbd5e1';
+        c.lineWidth = isSelected ? 2.5 : 1;
+        tracePoly(c, pathPolyline(path, points, 4), false);
+        c.stroke();
+      }
     }
 
     if (baseScale() > 0.12) {
@@ -798,6 +803,8 @@
       const showLabels = baseScale() > 0.18;
       for (const pp of placedPoints(currentPattern, points)) {
         if (!layerVisible(points.get(pp.pointId)?.layerId)) continue;
+        if (!showConstruction && pp.pieceId === '') continue; // hide construction points
+
         const pt = pp.world;
         const cp = toCanvas(pt);
         const isHovered = hoveredPointId === pp.pointId;
@@ -1235,6 +1242,7 @@
           .filter((l) => l.id !== (piece.layerId ?? 'default'))
           .map((l, i): MenuItem => ({ label: `Move to: ${l.name}`, icon: 'layers', sep: i === 0, onClick: () => moveToLayer(piece, l.id) })),
         { label: piece.hidden ? 'Show piece' : 'Hide piece', icon: piece.hidden ? 'visibility' : 'visibility_off', sep: true, onClick: () => togglePieceHidden(piece) },
+        ...looseAttachItems(piece),
         ...([
           ['Breakout: all', 'all'],
           ['Breakout: seams', 'seams'],
@@ -1258,6 +1266,24 @@
 
   // ---- tool actions (new point / pen / create piece / seam / text) ----------
   const uid = (prefix: string) => `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 9)}`;
+
+  /** Context-menu items to attach existing (unattached) draft paths to a piece as boundary/internal
+   *  edges — the "addBoundaryPath / addInternalPath" capability. Capped to keep the menu usable. */
+  function looseAttachItems(piece: Piece): MenuItem[] {
+    const attached = new Set(currentPattern.pieces.flatMap((p) => [...p.mainPaths, ...p.internalPaths].map((pp) => pp.path)));
+    const loose = currentPattern.paths.filter((pa) => !attached.has(pa.id) && pa.pathPoints.length >= 2).slice(0, 6);
+    if (loose.length === 0) return [];
+    const attach = (pathId: string, kind: 'main' | 'internal') => {
+      onchange(pieceAddPath($state.snapshot(currentPattern) as Pattern, piece.id, pathId, kind, uid));
+      toast(kind === 'internal' ? 'Added internal path' : 'Added boundary edge', 'success');
+    };
+    const items: MenuItem[] = [];
+    loose.forEach((pa, i) => {
+      items.push({ label: `Add edge: ${pa.name || pa.id}`, icon: 'add_link', sep: i === 0, onClick: () => attach(pa.id, 'main') });
+      items.push({ label: `Add internal: ${pa.name || pa.id}`, icon: 'timeline', onClick: () => attach(pa.id, 'internal') });
+    });
+    return items;
+  }
   function nextPointName(p: Pattern): string {
     const prefix = p.pointPrefix || 'A';
     let n = p.points.length;
@@ -1662,6 +1688,7 @@
   function handleMouseMove(e: MouseEvent) {
     const pos = getPos(e);
     cursorPos = pos;
+    cursorMm.set(toPattern(pos.x, pos.y)); // live drafting-mm readout for the status bar
     if (isPanning) {
       panOffset.set({ x: currentPanX + (pos.x - dragStartX), y: currentPanY + (pos.y - dragStartY) });
       dragStartX = pos.x; dragStartY = pos.y;
@@ -1758,7 +1785,7 @@
   onmousedown={handleMouseDown}
   onmousemove={handleMouseMove}
   onmouseup={handleMouseUp}
-  onmouseleave={handleMouseUp}
+  onmouseleave={() => { cursorMm.set(null); handleMouseUp(); }}
   onwheel={handleWheel}
   oncontextmenu={handleContextMenu}
   style="cursor: {$selectedTool === 'pan' ? 'grab' : 'crosshair'}; touch-action: none;"
@@ -1781,6 +1808,12 @@
     title="Toggle the avatar body silhouette"
     onclick={() => { showBody = !showBody; render(); }}
   >Body</button>
+  <button
+    class="btn btn-xs"
+    class:btn-active={currentPattern.showConstruction !== false}
+    title="Toggle construction geometry — helper points/paths not used by any piece"
+    onclick={() => onchange({ ...$state.snapshot(currentPattern) as Pattern, showConstruction: currentPattern.showConstruction === false, hasChanged: true })}
+  >Construction</button>
   <button class="btn btn-xs btn-ghost" title="Fit pieces to view" onclick={() => { fitView(); render(); }}>Fit</button>
   <button class="btn btn-xs" class:btn-active={!!bgImage || !!hpglPolys || showBgControls} title="Trace over a reference image or HPGL file" onclick={() => (showBgControls = !showBgControls)}>Trace</button>
 </div>

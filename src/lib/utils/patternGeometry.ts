@@ -177,6 +177,52 @@ export function piecePathPolyline(
  * Build a single closed boundary polyline for a piece by stitching its mainPath edges on shared
  * endpoints. Robust to arbitrary edge order/orientation.
  */
+/** Reflect a point across the infinite line through a and b. */
+function reflectAcrossLine(p: Vec2, a: Vec2, b: Vec2): Vec2 {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-9) return { x: 2 * a.x - p.x, y: 2 * a.y - p.y };
+  const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+  const fx = a.x + t * dx, fy = a.y + t * dy; // foot of perpendicular
+  return { x: 2 * fx - p.x, y: 2 * fy - p.y };
+}
+
+/**
+ * Turn a half-piece boundary loop into the full symmetric outline by mirroring across the fold line
+ * (a→b). Interior points lying on the fold are dropped; the remaining free boundary is reflected and
+ * appended so the result is a closed loop covering both halves. Used for first-edge symmetry.
+ */
+export function mirrorHalfOutline(loop: Vec2[], a: Vec2, b: Vec2): Vec2[] {
+  if (loop.length < 2) return loop;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy || 1;
+  const onFoldInterior = (p: Vec2): boolean => {
+    const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+    const fx = a.x + t * dx, fy = a.y + t * dy;
+    const perp = Math.hypot(p.x - fx, p.y - fy);
+    return perp < 0.5 && t > 0.02 && t < 0.98; // on the fold, strictly between the endpoints
+  };
+  const free = loop.filter((p) => !onFoldInterior(p));
+  const reflected = free.map((p) => reflectAcrossLine(p, a, b)).reverse();
+  const full = [...free, ...reflected];
+  // drop consecutive (near-)duplicate vertices created at the two fold endpoints
+  const out: Vec2[] = [];
+  for (const p of full) {
+    const last = out[out.length - 1];
+    if (!last || Math.hypot(last.x - p.x, last.y - p.y) > 1e-4) out.push(p);
+  }
+  return out;
+}
+
+/** The fold-line endpoints (drafting space) for a piece's first main edge, or null. */
+function firstEdgeEndpoints(piece: Piece, points: Map<string, ConstrainablePoint>): { a: Vec2; b: Vec2 } | null {
+  const fold = piece.mainPaths[0];
+  if (!fold) return null;
+  const a = points.get(fold.from), b = points.get(fold.to);
+  if (!a || !b) return null;
+  return { a: { x: a.x, y: a.y }, b: { x: b.x, y: b.y } };
+}
+
 export function pieceOutline(
   pattern: Pattern,
   piece: Piece,
@@ -209,6 +255,10 @@ export function pieceOutline(
     used[found] = true;
     const e = flip ? edges[found].slice().reverse() : edges[found];
     for (let k = 1; k < e.length; k++) loop.push(e[k]);
+  }
+  if (piece.firstEdgeSymmetry) {
+    const fe = firstEdgeEndpoints(piece, points);
+    if (fe) return mirrorHalfOutline(loop, fe.a, fe.b);
   }
   return loop;
 }
@@ -800,17 +850,24 @@ export function pieceAllowancePolygon(
   }
   const tf = pieceTransform(piece, points, shrink);
   const joins: { p: Vec2; join: CornerJoin }[] = [];
+  // "uncovered" endpoints (cover flag false) cut the allowance corner back square — collected first
+  // so they win over any styling join at the same point.
+  const cuts: { p: Vec2; join: CornerJoin }[] = [];
+  const squareCut: CornerJoin = { type: 'byLength', length: baseMag };
   for (const pp of piece.mainPaths) {
+    const fp = points.get(pp.from), tp = points.get(pp.to);
+    if (pp.coverSeamAllowanceStart === false && fp) cuts.push({ p: tf({ x: fp.x, y: fp.y }), join: squareCut });
+    if (pp.coverSeamAllowanceEnd === false && tp) cuts.push({ p: tf({ x: tp.x, y: tp.y }), join: squareCut });
     const type = (pp.seamCornerJoinType ?? 'intersection') as CornerJoin['type'];
     const active = type === 'intersection' ? (pp.seamCornerMaxLength ?? 0) > 0 : true;
     if (!active) continue;
     const join: CornerJoin = { type, radius: pp.cornerRadius ?? 0, maxLength: pp.seamCornerMaxLength ?? 0, length: pp.seamCornerLength ?? 0 };
-    const fp = points.get(pp.from), tp = points.get(pp.to);
     if (fp) joins.push({ p: tf({ x: fp.x, y: fp.y }), join });
     if (tp) joins.push({ p: tf({ x: tp.x, y: tp.y }), join });
   }
-  if (!joins.length) return allow;
+  if (!joins.length && !cuts.length) return allow;
   const joinFor = (c: Vec2): CornerJoin | null => {
+    for (const j of cuts) if (Math.hypot(j.p.x - c.x, j.p.y - c.y) < 1.5) return j.join;
     for (const j of joins) if (Math.hypot(j.p.x - c.x, j.p.y - c.y) < 1.5) return j.join;
     return null;
   };

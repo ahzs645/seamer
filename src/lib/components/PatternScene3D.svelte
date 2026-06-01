@@ -5,6 +5,21 @@
   import type { SimConfig } from '$lib/sim/config';
   import { isDarkTheme, toggleTheme, applyStoredTheme } from '$lib/utils/theme';
   import { pieceGeometrySignature } from '$lib/utils/patternGeometry';
+  import { show3dStats } from '$lib/stores/pattern';
+
+  // lightweight FPS meter for the optional stats overlay (Settings → 3D stats)
+  let fps = $state(0);
+  onMount(() => {
+    let raf = 0, frames = 0, last = performance.now();
+    const tick = () => {
+      frames++;
+      const now = performance.now();
+      if (now - last >= 500) { fps = Math.round((frames * 1000) / (now - last)); frames = 0; last = now; }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  });
 
   interface Props {
     currentPattern: Pattern;
@@ -230,6 +245,9 @@
 
 <div class="w-full h-full relative">
   <div bind:this={containerEl} class="w-full h-full"></div>
+  {#if $show3dStats}
+    <div class="absolute bottom-2 right-2 z-20 font-mono text-[11px] bg-black/60 text-green-300 rounded px-2 py-1 pointer-events-none">{fps} fps</div>
+  {/if}
 
   {#if !webgpu}
     <div class="absolute top-2 left-1/2 -translate-x-1/2 z-10 bg-warning text-warning-content text-xs rounded px-3 py-1 shadow">

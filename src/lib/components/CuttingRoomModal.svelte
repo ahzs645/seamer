@@ -7,8 +7,7 @@
   import {
     nestPieces, nestPiecesTrueShape, markerToSVG, type MarkerLayout, type CutOffType
   } from '$lib/utils/markerLayout';
-  import { printMarkerTiled } from '$lib/utils/exporters';
-  import { downloadText } from '$lib/utils/exporters';
+  import { printMarkerTiled, downloadText, downloadBlob, markerToPDF, markerToHPGL } from '$lib/utils/exporters';
   import { toastSuccess, toastError } from '$lib/stores/toast';
 
   let { currentPattern, onchange, onclose }:
@@ -94,6 +93,22 @@
     if (!layout) return;
     printMarkerTiled(layout, { title: (currentPattern.name || 'Pattern') + ' — marker' });
   }
+  async function exportPDF() {
+    if (!layout) return;
+    const base = (currentPattern.name || 'pattern').replace(/\s+/g, '_');
+    try {
+      downloadBlob(`${base}_marker.pdf`, await markerToPDF(layout, { page: 'A0', tile: true, title: `${currentPattern.name} marker` }));
+      toastSuccess('Marker PDF exported (A0, tiled)');
+    } catch { toastError('PDF export failed'); }
+  }
+  async function exportHPGL() {
+    if (!layout) return;
+    const base = (currentPattern.name || 'pattern').replace(/\s+/g, '_');
+    try {
+      downloadText(`${base}_marker.hpgl`, await markerToHPGL(layout), 'application/vnd.hp-hpgl');
+      toastSuccess('Marker HPGL exported');
+    } catch { toastError('HPGL export failed'); }
+  }
 
   // initial nest on open
   $effect(() => { if (!layout) nest(); });
@@ -159,7 +174,9 @@
             <button class="btn btn-ghost btn-xs flex-1" onclick={resetCut}>Reset</button>
           </div>
           <div class="flex gap-1">
-            <button class="btn btn-ghost btn-xs flex-1" onclick={exportSVG}>Export SVG</button>
+            <button class="btn btn-ghost btn-xs flex-1" onclick={exportSVG}>SVG</button>
+            <button class="btn btn-ghost btn-xs flex-1" onclick={exportPDF}>PDF</button>
+            <button class="btn btn-ghost btn-xs flex-1" onclick={exportHPGL}>HPGL</button>
             <button class="btn btn-ghost btn-xs flex-1" onclick={print}>Print…</button>
           </div>
         {/if}

@@ -134,6 +134,12 @@ export interface PiecePath {
   cornerRadius?: number; // mm — used when join type is 'radius'
   seamCornerMaxLength?: number; // mm — cap for the 'intersection' miter
   seamCornerLength?: number; // mm — fixed corner length for 'byLength'
+  // Whether the seam allowance wraps/covers the corner at the edge's start/end point. Default true
+  // (covered = the allowance extends to meet the neighbour). When false, the allowance is cut back
+  // flush at that endpoint (a clean square end). Faithful to the source's per-edge "Cover seam
+  // allowance at start/end" toggles.
+  coverSeamAllowanceStart?: boolean;
+  coverSeamAllowanceEnd?: boolean;
 }
 
 export interface PieceArrangement {
@@ -191,6 +197,10 @@ export interface Piece {
   seamAllowanceInside: boolean;
   seamAllowance?: number; // mm — per-piece override of pattern.seamAllowance (undefined => pattern default)
   useMaterialScaling?: boolean; // when true, scale this piece by its material's shrinkage % (cut compensation)
+  // When true the mainPaths describe HALF the piece, drafted on one side of the first main edge;
+  // the full outline is produced by mirroring across that first edge (a "cut on fold" / first-edge
+  // symmetry, faithful to the source's firstEdgeSymmetry flag). Default false.
+  firstEdgeSymmetry?: boolean;
   mainPaths: PiecePath[]; // ordered boundary loop
   internalPaths: PiecePath[]; // darts / internal seams / fold lines
   markers?: PieceMarker[]; // drill holes / punch markers (piece-local mm)
@@ -417,6 +427,9 @@ export interface Pattern {
   snapToGrid: boolean;
   snapToGuides: boolean;
   showPieceNames: boolean;
+  // Show construction geometry (points/paths not used by any piece). When false the 2D canvas hides
+  // helper/reference geometry to declutter the view. Faithful to the source's showConstruction flag.
+  showConstruction?: boolean;
   viewMode: '2d' | '3d' | 'both';
   interactionMode: 'fast' | 'accurate' | string;
   settings3d: PatternSettings3D;
@@ -512,6 +525,7 @@ export function createEmptyPattern(): Pattern {
     snapToGrid: false,
     snapToGuides: false,
     showPieceNames: true,
+    showConstruction: true,
     viewMode: 'both',
     interactionMode: 'fast',
     settings3d: defaultPatternSettings3D(),
