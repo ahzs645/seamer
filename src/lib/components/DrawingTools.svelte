@@ -29,6 +29,7 @@
     ] },
     { id: 'point', label: 'New point', hotkey: 'N', icon: 'radio_button_checked' },
     { id: 'piece', label: 'Create pattern piece', hotkey: 'T', icon: 'extension', gap: true },
+    { id: 'internal', label: 'Add internal path (dart / fold) to the selected piece', hotkey: 'D', icon: 'conversion_path' },
     { group: 'Seam tools', svg: SEAM_MULTI, gap: true, sub: [
       { id: 'seam-single', label: 'Create single seam', hotkey: 'S', svg: SEAM_SINGLE },
       { id: 'seam-multi', label: 'Create multi seam', hotkey: 'Shift+S', svg: SEAM_MULTI }

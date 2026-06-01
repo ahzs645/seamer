@@ -125,6 +125,8 @@ export interface PiecePath {
   reversed: boolean;
   isMirrorLine?: boolean;
   notches: Notch[];
+  // internal paths only: dart/fold dihedral angle in degrees (0 = flat seam line, no fold)
+  foldAngle?: number;
   // seam-allowance corner finishing (all optional; undefined => 'intersection' with no cap):
   seamCornerJoinType?: SeamCornerJoinType;
   cornerRadius?: number; // mm — used when join type is 'radius'
@@ -177,6 +179,7 @@ export interface Piece {
   mirrorX: boolean;
   mirrorY: boolean;
   seamAllowanceInside: boolean;
+  seamAllowance?: number; // mm — per-piece override of pattern.seamAllowance (undefined => pattern default)
   mainPaths: PiecePath[]; // ordered boundary loop
   internalPaths: PiecePath[]; // darts / internal seams / fold lines
   settings3d: PieceSettings3D;

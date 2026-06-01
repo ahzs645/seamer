@@ -21,6 +21,7 @@
     polygonCentroid,
     pointInPolygon,
     offsetPolygon,
+    pieceAllowancePolygon,
     type Vec2,
     type PlacedPoint
   } from '$lib/utils/patternGeometry';
@@ -546,10 +547,11 @@
         c.setLineDash([]);
       }
 
-      // seam allowance — a dashed offset of the boundary (outward, or inward if the piece is set so)
-      const sa = currentPattern.seamAllowance ?? 0;
+      // seam allowance — a dashed offset of the boundary (outward, or inward if the piece is set so),
+      // honouring a per-piece override and per-edge corner joins (radius/byLength/intersection cap).
+      const sa = piece.seamAllowance ?? currentPattern.seamAllowance ?? 0;
       if (sa > 0.05 && outline.length >= 3) {
-        const allow = offsetPolygon(outline, piece.seamAllowanceInside ? -sa : sa);
+        const allow = pieceAllowancePolygon(currentPattern, piece, piece.seamAllowanceInside ? -sa : sa, paths, points);
         c.save();
         c.strokeStyle = isSelected ? 'rgba(29,78,216,0.5)' : 'rgba(30,41,59,0.4)';
         c.lineWidth = 1;
@@ -905,6 +907,66 @@
     toast(toCurve ? 'Converted to curve' : 'Converted to line', 'success');
   }
 
+  /** Reverse a path's direction (and swap each bézier handle's in/out tangents). */
+  function reversePath(pathId: string) {
+    const p = $state.snapshot(currentPattern) as Pattern;
+    const paths = p.paths.map((pa) =>
+      pa.id === pathId
+        ? { ...pa, pathPoints: pa.pathPoints.slice().reverse().map((pp) => (pp.handle ? { ...pp, handle: { ...pp.handle, v1: pp.handle.v2, v2: pp.handle.v1 } } : pp)) }
+        : pa
+    );
+    onchange({ ...p, paths, hasChanged: true });
+    toast('Reversed path', 'success');
+  }
+
+  /** Move a path to another layer. */
+  function movePathToLayer(pathId: string, layerId: string) {
+    const p = $state.snapshot(currentPattern) as Pattern;
+    onchange({ ...p, paths: p.paths.map((pa) => (pa.id === pathId ? { ...pa, layerId } : pa)), hasChanged: true });
+    toast('Moved to layer', 'success');
+  }
+
+  /** Mirror the selected points across their centroid (horizontal or vertical axis). */
+  function flipSelectedPoints(axis: 'h' | 'v') {
+    const ids = $selectedPointIds; if (ids.size === 0) return;
+    const sel = currentPattern.points.filter((p) => ids.has(p.id));
+    const cx = sel.reduce((s, p) => s + p.x, 0) / sel.length, cy = sel.reduce((s, p) => s + p.y, 0) / sel.length;
+    const points = currentPattern.points.map((p) =>
+      ids.has(p.id) ? { ...p, x: axis === 'h' ? 2 * cx - p.x : p.x, y: axis === 'v' ? 2 * cy - p.y : p.y } : p
+    );
+    onchange({ ...currentPattern, points, hasChanged: true });
+    toast(`Flipped ${sel.length} point${sel.length === 1 ? '' : 's'}`, 'success');
+  }
+
+  /** Split a piece edge at the clicked location: insert a midpoint and replace the edge with two. */
+  function splitEdge(owner: { piece: Piece; pp: import('$lib/types/pattern').PiecePath }, world: Vec2) {
+    const paths = indexPaths(currentPattern); const points = indexPoints(currentPattern);
+    const poly = piecePathPolyline(owner.pp, paths, points, 2);
+    if (poly.length < 2) { toast('Cannot split this edge', 'error'); return; }
+    // nearest point on the edge polyline to the click
+    let best = poly[0]; let bestD = Infinity;
+    for (let i = 1; i < poly.length; i++) {
+      const a = poly[i - 1], b = poly[i];
+      const dx = b.x - a.x, dy = b.y - a.y; const l2 = dx * dx + dy * dy || 1;
+      let t = ((world.x - a.x) * dx + (world.y - a.y) * dy) / l2; t = Math.max(0, Math.min(1, t));
+      const px = a.x + t * dx, py = a.y + t * dy; const d = Math.hypot(world.x - px, world.y - py);
+      if (d < bestD) { bestD = d; best = { x: px, y: py }; }
+    }
+    let p = $state.snapshot(currentPattern) as Pattern;
+    const r = withNewPoint(p, best); p = r.p; const mid = r.id;
+    const path1 = lineThrough([owner.pp.from, mid]); const path2 = lineThrough([mid, owner.pp.to]);
+    p = { ...p, paths: [...p.paths, path1, path2] };
+    const pp1 = { ...owner.pp, id: uid('PiecePath'), path: path1.id, from: owner.pp.from, to: mid, notches: [] };
+    const pp2 = { ...owner.pp, id: uid('PiecePath'), path: path2.id, from: mid, to: owner.pp.to, notches: [] };
+    const isMain = owner.piece.mainPaths.some((x) => x.id === owner.pp.id);
+    const repl = (list: import('$lib/types/pattern').PiecePath[]) => list.flatMap((x) => (x.id === owner.pp.id ? [pp1, pp2] : [x]));
+    const pieces = p.pieces.map((pc) => (pc.id === owner.piece.id
+      ? { ...pc, mainPaths: isMain ? repl(pc.mainPaths) : pc.mainPaths, internalPaths: isMain ? pc.internalPaths : repl(pc.internalPaths) }
+      : pc));
+    onchange({ ...p, pieces, hasChanged: true });
+    toast('Split edge', 'success');
+  }
+
   /** Rotate the selected construction points around their centre (degrees). */
   function rotateSelectedPoints(deg: number) {
     const ids = $selectedPointIds; if (ids.size === 0) return;
@@ -978,6 +1040,8 @@
       if (n > 1) {
         items.push({ label: `Rotate ${n} points…`, icon: 'rotate_right', onClick: () => { const d = prompt('Degrees to rotate selected points:', '90'); if (d) rotateSelectedPoints(parseFloat(d) || 0); } });
         items.push({ label: `Scale ${n} points…`, icon: 'open_in_full', onClick: () => { const s = prompt('Scale selected points by percent:', '100'); if (s) scaleSelectedPoints(parseFloat(s) || 100); } });
+        items.push({ label: 'Flip horizontal', icon: 'flip', onClick: () => flipSelectedPoints('h') });
+        items.push({ label: 'Flip vertical', icon: 'flip', onClick: () => flipSelectedPoints('v') });
       }
       items.push({ label: `Delete point${n > 1 ? 's' : ''}`, icon: 'delete', danger: true, sep: items.length > 0, onClick: () => {
         const ids = $selectedPointIds;
@@ -1003,8 +1067,11 @@
           isCurve
             ? { label: 'Convert to line', icon: 'show_chart', onClick: () => convertPath(path.id, false) }
             : { label: 'Convert to curve', icon: 'gesture', onClick: () => convertPath(path.id, true) },
-          { label: 'Add notch here', icon: 'content_cut', sep: true, onClick: () => addNotch(owner.pp.id, edgeParamAt(owner.pp, world)) },
+          { label: 'Reverse path', icon: 'swap_horiz', onClick: () => reversePath(path.id) },
+          { label: 'Split edge here', icon: 'content_cut', onClick: () => splitEdge(owner, world) },
+          { label: 'Add notch here', icon: 'straighten', sep: true, onClick: () => addNotch(owner.pp.id, edgeParamAt(owner.pp, world)) },
           ...(hasNotches ? [{ label: 'Clear notches', icon: 'backspace', onClick: () => clearNotches(owner.pp.id) } as MenuItem] : []),
+          ...currentPattern.layers.filter((l) => l.id !== path.layerId).map((l) => ({ label: `Move to layer: ${l.name}`, icon: 'layers', sep: l === currentPattern.layers.find((x) => x.id !== path.layerId), onClick: () => movePathToLayer(path.id, l.id) } as MenuItem)),
           { label: 'Remove edge from piece', icon: 'delete', danger: true, sep: true, onClick: () => { mutatePieces((ps) => ps.map((p) => p.id === owner.piece.id ? { ...p, mainPaths: p.mainPaths.filter((x) => x.id !== owner.pp.id) } : p)); toast('Removed edge'); } }
         ] };
         return;
@@ -1157,7 +1224,7 @@
     if (!pid) { const r = withNewPoint(p, world); p = r.p; pid = r.id; }
     const draft = [...penDraft, pid];
     penDraft = draft;
-    if ($selectedTool === 'pen') {
+    if ($selectedTool === 'pen' || $selectedTool === 'internal') {
       // maintain one working line path through the placed points
       if (!draftPathId) { const path = lineThrough(draft); draftPathId = path.id; p = { ...p, paths: [...p.paths, path] }; }
       else p = { ...p, paths: p.paths.map((pa) => (pa.id === draftPathId ? { ...pa, pathPoints: draft.map((id) => ({ id })) } : pa)) };
@@ -1168,6 +1235,20 @@
 
   function finishDraft() {
     const tool = $selectedTool;
+    if (tool === 'internal') {
+      // Attach the drafted polyline to the selected piece as an internal path (dart / fold line).
+      if (penDraft.length < 2) { cancelDraft(); return; }
+      const pieceId = [...$selectedPieceIds][0];
+      const piece = pieceId ? currentPattern.pieces.find((p) => p.id === pieceId) : null;
+      if (!piece || !draftPathId) { toast('Select a piece first, then draw the internal path', 'error'); cancelDraft(); return; }
+      const from = penDraft[0], to = penDraft[penDraft.length - 1];
+      const ip: import('$lib/types/pattern').PiecePath = { id: uid('PiecePath'), name: 'Internal', path: draftPathId, from, to, reversed: false, notches: [], foldAngle: 0 };
+      const pieces = currentPattern.pieces.map((p) => (p.id === piece.id ? { ...p, internalPaths: [...p.internalPaths, ip] } : p));
+      onchange({ ...$state.snapshot(currentPattern) as Pattern, pieces, hasChanged: true });
+      toast('Added internal path', 'success');
+      penDraft = []; draftPathId = null; render();
+      return;
+    }
     if (tool === 'piece' && penDraft.length >= 3) {
       let p: Pattern = $state.snapshot(currentPattern) as Pattern;
       const loop = penDraft;
@@ -1201,7 +1282,7 @@
 
   function cancelDraft() { penDraft = []; draftPathId = null; render(); }
 
-  const DRAWING_TOOLS = new Set(['pen', 'piece', 'point', 'text', 'seam', 'seam-single', 'seam-multi', 'circle', 'arc', 'arc-center', 'arc-3pt']);
+  const DRAWING_TOOLS = new Set(['pen', 'piece', 'internal', 'point', 'text', 'seam', 'seam-single', 'seam-multi', 'circle', 'arc', 'arc-center', 'arc-3pt']);
   function isDrawingTool(t: string) { return DRAWING_TOOLS.has(t); }
 
   /** Reset any in-progress operation and return to the select tool (Esc / V / Cancel button). */
@@ -1218,6 +1299,7 @@
       case 'point': return 'Click to add a point';
       case 'pen': return penDraft.length ? 'Click to add points · Enter to finish · Esc to cancel' : 'Click to start a path';
       case 'piece': return penDraft.length ? 'Click points to outline the piece · click the first point to close' : 'Click points to outline a new piece';
+      case 'internal': return $selectedPieceIds.size !== 1 ? 'Select one piece first, then draw a dart / fold line' : penDraft.length ? 'Click to add points · Enter to attach to the piece · Esc to cancel' : 'Click to start an internal path in the selected piece';
       case 'seam': case 'seam-single': return seamFirstEdge ? 'Click the matching edge to sew it' : 'Click an edge to start a seam';
       case 'seam-multi': return seamMultiEdges.length ? `Click more edges to join (${seamMultiEdges.length}) · Enter to finish` : 'Click the first edge of the seam';
       case 'circle': return arcClicks.length ? 'Click to set the radius' : 'Click to set the centre of the circle';
@@ -1326,10 +1408,10 @@
     if (tool === 'pan' || e.button === 1 || e.metaKey || e.ctrlKey || e.altKey) { isPanning = true; return; }
     if (tool === 'measure') { measureFrom = hitTestPoint(pos.x, pos.y); return; }
     if (tool === 'point') { const r = withNewPoint($state.snapshot(currentPattern) as Pattern, toPattern(pos.x, pos.y)); onchange({ ...r.p, hasChanged: true }); return; }
-    if (tool === 'pen' || tool === 'piece') {
+    if (tool === 'pen' || tool === 'piece' || tool === 'internal') {
       penOrPieceClick(pos);
-      // arm drag-for-curve on the just-placed pen point
-      if (tool === 'pen') { penDragging = true; penDragPointId = penDraft[penDraft.length - 1] ?? null; dragStartX = pos.x; dragStartY = pos.y; }
+      // arm drag-for-curve on the just-placed point (pen + internal draw lines/curves)
+      if (tool === 'pen' || tool === 'internal') { penDragging = true; penDragPointId = penDraft[penDraft.length - 1] ?? null; dragStartX = pos.x; dragStartY = pos.y; }
       return;
     }
     if (tool === 'text') { insertTextAt(pos); return; }

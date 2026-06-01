@@ -145,7 +145,13 @@
     selectedPathIds.set(new Set([pp.path]));
   }
   function removeMainPath(pp: PiecePath) {
-    updatePiece((p) => ({ ...p, mainPaths: p.mainPaths.filter((x) => x.id !== pp.id) }));
+    updatePiece((p) => ({ ...p, mainPaths: p.mainPaths.filter((x) => x.id !== pp.id) }), 'Remove edge');
+  }
+  function removeInternalPath(pp: PiecePath) {
+    updatePiece((p) => ({ ...p, internalPaths: p.internalPaths.filter((x) => x.id !== pp.id) }), 'Remove internal path');
+  }
+  function updateInternalPath(ppId: string, partial: Partial<PiecePath>, label = 'Edit internal path') {
+    updatePiece((p) => ({ ...p, internalPaths: p.internalPaths.map((x) => (x.id === ppId ? { ...x, ...partial } : x)) }), label);
   }
   // Mark a boundary edge as the piece's mirror/fold line: the cloth is reflected across it for a
   // symmetric whole (drafted as a half). One mirror line per piece, so enabling clears the others.
@@ -592,8 +598,16 @@
 
             {:else if s.id === 'scaling'}
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.seamAllowanceInside}
-                onchange={(e) => updatePiece((p) => ({ ...p, seamAllowanceInside: e.currentTarget.checked }))} /> Seam allowance inside</label>
-              <p class="opacity-70">Pattern seam allowance: {(currentPattern.seamAllowance / 25.4).toFixed(2)} in</p>
+                onchange={(e) => updatePiece((p) => ({ ...p, seamAllowanceInside: e.currentTarget.checked }), 'Seam allowance inside')} /> Seam allowance inside</label>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.seamAllowance !== undefined}
+                onchange={(e) => updatePiece((p) => { if (e.currentTarget.checked) return { ...p, seamAllowance: currentPattern.seamAllowance }; const { seamAllowance, ...rest } = p; return rest as Piece; }, 'Override seam allowance')} /> Override seam allowance</label>
+              {#if piece.seamAllowance !== undefined}
+                <label class="flex items-center justify-between gap-2">Allowance ({unitLabel})
+                  <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(piece.seamAllowance).toFixed(2)}
+                    oninput={(e) => updatePiece((p) => ({ ...p, seamAllowance: fromUnit(parseFloat(e.currentTarget.value) || 0) }), 'Edit seam allowance')} /></label>
+              {:else}
+                <p class="opacity-70">Pattern default: {toUnit(currentPattern.seamAllowance).toFixed(2)} {unitLabel}</p>
+              {/if}
 
             {:else if s.id === 'orientation'}
               <label class="flex flex-col gap-0.5">Rotation (°)
@@ -625,9 +639,17 @@
                             title="Seam corner join &amp; notches" aria-label="Edit corner join and notches"
                             onclick={() => (cornerEditId = cornerEditId === pp.id ? null : pp.id)}>tune</button>
                         {/if}
-                        <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove" onclick={() => removeMainPath(pp)}>delete</button>
+                        <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove" onclick={() => (s.id === 'seam' ? removeMainPath(pp) : removeInternalPath(pp))}>delete</button>
                       </div>
                     </div>
+
+                    {#if s.id === 'internal'}
+                      <div class="border-t border-base-200 px-2 py-1.5 bg-base-100">
+                        <label class="flex items-center justify-between gap-2 text-[11px]">Fold angle (°) — dart/pleat dihedral
+                          <input type="number" step="1" class="input input-bordered input-xs w-20" value={pp.foldAngle ?? 0}
+                            oninput={(e) => updateInternalPath(pp.id, { foldAngle: parseFloat(e.currentTarget.value) || 0 })} /></label>
+                      </div>
+                    {/if}
 
                     {#if s.id === 'seam' && cornerEditId === pp.id}
                       {@const joinType = pp.seamCornerJoinType ?? 'intersection'}

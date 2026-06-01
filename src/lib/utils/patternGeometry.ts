@@ -558,6 +558,137 @@ export function offsetPolygon(poly: Vec2[], dist: number, miterLimit = 4): Vec2[
   return out;
 }
 
+// --- Seam-allowance corner joins -------------------------------------------------------------
+// The seam-allowance cut line is the boundary outline offset by the allowance. Where two edges
+// meet, the corner can be finished three ways (faithful to the original ro.js seam-corner editor):
+//   intersection — extend both offset edges to their miter point (optionally capped to maxLength)
+//   radius       — round the corner with a fillet arc of the given radius
+//   byLength     — chamfer the corner square at a fixed distance from the corner
+export interface CornerJoin {
+  type: 'intersection' | 'radius' | 'byLength';
+  radius?: number; // mm (radius)
+  maxLength?: number; // mm cap from the true corner (intersection); 0 = uncapped
+  length?: number; // mm chamfer back-off (byLength)
+}
+
+function unit(from: Vec2, to: Vec2): Vec2 {
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const l = Math.hypot(dx, dy) || 1;
+  return { x: dx / l, y: dy / l };
+}
+
+/**
+ * Rewrite the corners of an offset allowance polygon `allow` (one vertex per `outline` vertex) per a
+ * lookup that maps each true (un-offset) corner to its join spec. `baseDist` is the allowance width,
+ * used to cap intersection miters. Vertices with no join (or a degenerate one) pass through unchanged.
+ */
+export function applyCornerJoins(
+  allow: Vec2[],
+  outline: Vec2[],
+  joinFor: (corner: Vec2) => CornerJoin | null,
+  baseDist: number
+): Vec2[] {
+  const n = allow.length;
+  if (n < 3 || outline.length !== n) return allow;
+  const out: Vec2[] = [];
+  for (let i = 0; i < n; i++) {
+    const cur = allow[i];
+    const prev = allow[(i - 1 + n) % n];
+    const next = allow[(i + 1) % n];
+    const join = joinFor(outline[i]);
+    if (!join) { out.push(cur); continue; }
+
+    // directions from the corner along each adjacent offset edge (away from the corner)
+    const u1 = unit(cur, prev);
+    const u2 = unit(cur, next);
+    const lenPrev = Math.hypot(prev.x - cur.x, prev.y - cur.y);
+    const lenNext = Math.hypot(next.x - cur.x, next.y - cur.y);
+    const cosA = Math.max(-1, Math.min(1, u1.x * u2.x + u1.y * u2.y));
+    const half = Math.acos(cosA) / 2; // half the interior angle at the corner
+
+    if (join.type === 'radius' && (join.radius ?? 0) > 0.01 && half > 0.01 && half < Math.PI / 2 - 0.01) {
+      const r = join.radius as number;
+      let t = r / Math.tan(half); // tangent length from the corner along each edge
+      t = Math.min(t, lenPrev * 0.98, lenNext * 0.98);
+      if (t <= 0.01) { out.push(cur); continue; }
+      const p1 = { x: cur.x + u1.x * t, y: cur.y + u1.y * t };
+      const p2 = { x: cur.x + u2.x * t, y: cur.y + u2.y * t };
+      const b = unit({ x: 0, y: 0 }, { x: u1.x + u2.x, y: u1.y + u2.y });
+      const rEff = t * Math.tan(half); // actual radius after clamping t
+      const center = { x: cur.x + b.x * (rEff / Math.sin(half)), y: cur.y + b.y * (rEff / Math.sin(half)) };
+      let a1 = Math.atan2(p1.y - center.y, p1.x - center.x);
+      let a2 = Math.atan2(p2.y - center.y, p2.x - center.x);
+      // sweep the short way
+      let d = a2 - a1;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      while (d < -Math.PI) d += 2 * Math.PI;
+      const steps = Math.max(2, Math.ceil(Math.abs(d) / 0.4));
+      for (let s = 0; s <= steps; s++) {
+        const a = a1 + (d * s) / steps;
+        out.push({ x: center.x + Math.cos(a) * rEff, y: center.y + Math.sin(a) * rEff });
+      }
+      continue;
+    }
+
+    if (join.type === 'byLength' && (join.length ?? 0) > 0.01) {
+      const L = Math.min(join.length as number, lenPrev * 0.98, lenNext * 0.98);
+      if (L <= 0.01) { out.push(cur); continue; }
+      out.push({ x: cur.x + u1.x * L, y: cur.y + u1.y * L });
+      out.push({ x: cur.x + u2.x * L, y: cur.y + u2.y * L });
+      continue;
+    }
+
+    if (join.type === 'intersection' && (join.maxLength ?? 0) > 0.01) {
+      // clamp the miter spike: distance from the true corner to the offset vertex
+      const corner = outline[i];
+      const vx = cur.x - corner.x, vy = cur.y - corner.y;
+      const d = Math.hypot(vx, vy);
+      const cap = baseDist + (join.maxLength as number);
+      if (d > cap && d > 0.01) {
+        out.push({ x: corner.x + (vx / d) * cap, y: corner.y + (vy / d) * cap });
+        continue;
+      }
+    }
+    out.push(cur);
+  }
+  return out;
+}
+
+/**
+ * The seam-allowance cut-line polygon for a piece, placed on the plan, with per-edge corner joins
+ * applied. `signedDist` is the allowance width (negative => inside the seam line). Shared by the 2D
+ * canvas and the exporters so both render identical corners.
+ */
+export function pieceAllowancePolygon(
+  pattern: Pattern,
+  piece: Piece,
+  signedDist: number,
+  paths = indexPaths(pattern),
+  points = indexPoints(pattern),
+  spacingMm = 4
+): Vec2[] {
+  const outline = pieceWorldOutline(pattern, piece, paths, points, spacingMm);
+  if (outline.length < 3 || Math.abs(signedDist) < 0.05) return outline.length >= 3 ? offsetPolygon(outline, signedDist) : [];
+  const allow = offsetPolygon(outline, signedDist);
+  const tf = pieceTransform(piece, points);
+  const joins: { p: Vec2; join: CornerJoin }[] = [];
+  for (const pp of piece.mainPaths) {
+    const type = (pp.seamCornerJoinType ?? 'intersection') as CornerJoin['type'];
+    const active = type === 'intersection' ? (pp.seamCornerMaxLength ?? 0) > 0 : true;
+    if (!active) continue;
+    const join: CornerJoin = { type, radius: pp.cornerRadius ?? 0, maxLength: pp.seamCornerMaxLength ?? 0, length: pp.seamCornerLength ?? 0 };
+    const fp = points.get(pp.from), tp = points.get(pp.to);
+    if (fp) joins.push({ p: tf({ x: fp.x, y: fp.y }), join });
+    if (tp) joins.push({ p: tf({ x: tp.x, y: tp.y }), join });
+  }
+  if (!joins.length) return allow;
+  const joinFor = (c: Vec2): CornerJoin | null => {
+    for (const j of joins) if (Math.hypot(j.p.x - c.x, j.p.y - c.y) < 1.5) return j.join;
+    return null;
+  };
+  return applyCornerJoins(allow, outline, joinFor, Math.abs(signedDist));
+}
+
 export function pointInPolygon(p: Vec2, poly: Vec2[]): boolean {
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {

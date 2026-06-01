@@ -3,7 +3,7 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import {
-  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, offsetPolygon, type Vec2
+  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, type Vec2
 } from './patternGeometry';
 
 type Layer = 'pattern' | 'seam-allowance' | 'internal';
@@ -12,15 +12,16 @@ interface Poly { pts: Vec2[]; closed: boolean; layer: Layer }
 function collectPolylines(pattern: Pattern): Poly[] {
   const paths = indexPaths(pattern);
   const points = indexPoints(pattern);
-  const sa = pattern.seamAllowance ?? 0;
   const out: Poly[] = [];
   for (const piece of pattern.pieces) {
     const outline = pieceWorldOutline(pattern, piece, paths, points, 2);
     if (outline.length >= 2) {
       out.push({ pts: outline, closed: true, layer: 'pattern' });
-      // seam allowance: the cut line, offset from the stitch outline (outward, or inward if set)
+      // seam allowance: the cut line, offset from the stitch outline (per-piece width + corner joins)
+      const sa = piece.seamAllowance ?? pattern.seamAllowance ?? 0;
       if (sa > 0.05 && outline.length >= 3) {
-        out.push({ pts: offsetPolygon(outline, piece.seamAllowanceInside ? -sa : sa), closed: true, layer: 'seam-allowance' });
+        const allow = pieceAllowancePolygon(pattern, piece, piece.seamAllowanceInside ? -sa : sa, paths, points, 2);
+        if (allow.length >= 3) out.push({ pts: allow, closed: true, layer: 'seam-allowance' });
       }
     }
     for (const ip of pieceWorldInternalPolylines(pattern, piece, paths, points, 2)) {
