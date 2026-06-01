@@ -127,6 +127,8 @@ export interface PiecePath {
   notches: Notch[];
   // internal paths only: dart/fold dihedral angle in degrees (0 = flat seam line, no fold)
   foldAngle?: number;
+  // per-edge seam-allowance width override in mm (undefined => use the piece/pattern allowance)
+  seamAllowance?: number;
   // seam-allowance corner finishing (all optional; undefined => 'intersection' with no cap):
   seamCornerJoinType?: SeamCornerJoinType;
   cornerRadius?: number; // mm — used when join type is 'radius'

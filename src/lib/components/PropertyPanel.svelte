@@ -715,6 +715,17 @@
                           {/if}
                         </div>
 
+                        <!-- Per-edge seam allowance override -->
+                        <div class="space-y-1 border-t border-base-200 pt-2">
+                          <label class="flex items-center gap-2 text-[11px]"><input type="checkbox" class="checkbox checkbox-xs" checked={pp.seamAllowance !== undefined}
+                            onchange={(e) => updateMainPath(pp.id, e.currentTarget.checked ? { seamAllowance: piece.seamAllowance ?? currentPattern.seamAllowance } : { seamAllowance: undefined }, 'Override edge allowance')} /> Override seam allowance on this edge</label>
+                          {#if pp.seamAllowance !== undefined}
+                            <label class="flex items-center justify-between gap-2 text-[11px]">Edge allowance ({unitLabel})
+                              <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(pp.seamAllowance).toFixed(2)}
+                                oninput={(e) => updateMainPath(pp.id, { seamAllowance: fromUnit(parseFloat(e.currentTarget.value) || 0) }, 'Edit edge allowance')} /></label>
+                          {/if}
+                        </div>
+
                         <!-- Notches -->
                         <div class="space-y-1 border-t border-base-200 pt-2">
                           <div class="flex items-center justify-between">

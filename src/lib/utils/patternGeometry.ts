@@ -655,8 +655,94 @@ export function applyCornerJoins(
 }
 
 /**
+ * Stitch a piece's boundary like pieceOutline, but also return, per outline segment i (from vertex i
+ * to vertex i+1), the id of the mainPath that produced it — so per-edge widths can be applied.
+ */
+export function pieceOutlineTagged(
+  pattern: Pattern,
+  piece: Piece,
+  paths = indexPaths(pattern),
+  points = indexPoints(pattern),
+  spacingMm = 4
+): { pts: Vec2[]; edgeOf: string[] } {
+  const edges = piece.mainPaths
+    .map((pp) => ({ id: pp.id, poly: piecePathPolyline(pp, paths, points, spacingMm) }))
+    .filter((e) => e.poly.length >= 2);
+  if (edges.length === 0) return { pts: [], edgeOf: [] };
+  const used = new Array(edges.length).fill(false);
+  const tol = 1.0;
+  const loop: Vec2[] = [...edges[0].poly];
+  const edgeOf: string[] = [];
+  for (let k = 1; k < edges[0].poly.length; k++) edgeOf.push(edges[0].id);
+  used[0] = true;
+  let guard = edges.length * 2;
+  while (guard-- > 0) {
+    const tail = loop[loop.length - 1];
+    let found = -1, flip = false, bestGap = tol;
+    for (let i = 0; i < edges.length; i++) {
+      if (used[i]) continue;
+      const e = edges[i].poly;
+      const dStart = dist(tail, e[0]);
+      const dEnd = dist(tail, e[e.length - 1]);
+      if (dStart <= bestGap) { bestGap = dStart; found = i; flip = false; }
+      if (dEnd <= bestGap) { bestGap = dEnd; found = i; flip = true; }
+    }
+    if (found === -1) break;
+    used[found] = true;
+    const e = flip ? edges[found].poly.slice().reverse() : edges[found].poly;
+    for (let k = 1; k < e.length; k++) { loop.push(e[k]); edgeOf.push(edges[found].id); }
+  }
+  edgeOf.push(edgeOf[edgeOf.length - 1] ?? edges[0].id); // closing segment
+  return { pts: loop, edgeOf };
+}
+
+function intersectLines(p0: Vec2, d0: Vec2, p1: Vec2, d1: Vec2): Vec2 | null {
+  const den = d0.x * d1.y - d0.y * d1.x;
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((p1.x - p0.x) * d1.y - (p1.y - p0.y) * d1.x) / den;
+  return { x: p0.x + d0.x * t, y: p0.y + d0.y * t };
+}
+
+/**
+ * Offset a closed polygon with a per-edge distance `distOf(edgeIndex)` (edge i = vertex i→i+1).
+ * Each output vertex is the intersection of the two adjacent offset lines (miter), clamped so a
+ * sharp corner can't spike past `miterLimit × width`. Generalises offsetPolygon to variable widths.
+ */
+export function offsetPolygonVariable(poly: Vec2[], distOf: (edgeIndex: number) => number, miterLimit = 4): Vec2[] {
+  const n = poly.length;
+  if (n < 3) return poly.map((p) => ({ ...p }));
+  let area = 0;
+  for (let i = 0; i < n; i++) { const a = poly[i], b = poly[(i + 1) % n]; area += a.x * b.y - b.x * a.y; }
+  const ccw = area > 0;
+  const unit = (x: number, y: number): Vec2 => { const l = Math.hypot(x, y) || 1; return { x: x / l, y: y / l }; };
+  const nrm = (e: Vec2): Vec2 => (ccw ? { x: e.y, y: -e.x } : { x: -e.y, y: e.x });
+  const lines: { p: Vec2; d: Vec2; nm: Vec2 }[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n];
+    const e = unit(b.x - a.x, b.y - a.y);
+    const nm = nrm(e);
+    const di = distOf(i);
+    lines.push({ p: { x: a.x + nm.x * di, y: a.y + nm.y * di }, d: e, nm });
+  }
+  const out: Vec2[] = [];
+  for (let i = 0; i < n; i++) {
+    const L0 = lines[(i - 1 + n) % n], L1 = lines[i];
+    const x = intersectLines(L0.p, L0.d, L1.p, L1.d);
+    if (!x) { out.push({ x: poly[i].x + L1.nm.x * distOf(i), y: poly[i].y + L1.nm.y * distOf(i) }); continue; }
+    const d = Math.hypot(x.x - poly[i].x, x.y - poly[i].y);
+    const cap = Math.max(Math.abs(distOf((i - 1 + n) % n)), Math.abs(distOf(i))) * miterLimit;
+    if (cap > 0 && d > cap) {
+      const vx = x.x - poly[i].x, vy = x.y - poly[i].y;
+      out.push({ x: poly[i].x + (vx / d) * cap, y: poly[i].y + (vy / d) * cap });
+    } else out.push(x);
+  }
+  return out;
+}
+
+/**
  * The seam-allowance cut-line polygon for a piece, placed on the plan, with per-edge corner joins
- * applied. `signedDist` is the allowance width (negative => inside the seam line). Shared by the 2D
+ * applied. `signedDist` is the allowance width (negative => inside the seam line). When any boundary
+ * edge carries a per-edge seamAllowance override, a variable-width offset is used. Shared by the 2D
  * canvas and the exporters so both render identical corners.
  */
 export function pieceAllowancePolygon(
@@ -667,9 +753,25 @@ export function pieceAllowancePolygon(
   points = indexPoints(pattern),
   spacingMm = 4
 ): Vec2[] {
-  const outline = pieceWorldOutline(pattern, piece, paths, points, spacingMm);
-  if (outline.length < 3 || Math.abs(signedDist) < 0.05) return outline.length >= 3 ? offsetPolygon(outline, signedDist) : [];
-  const allow = offsetPolygon(outline, signedDist);
+  if (Math.abs(signedDist) < 0.05) return [];
+  const inside = signedDist < 0 ? -1 : 1;
+  const baseMag = Math.abs(signedDist);
+  const hasPerEdge = piece.mainPaths.some((pp) => pp.seamAllowance !== undefined && pp.seamAllowance !== baseMag);
+
+  let outline: Vec2[];
+  let allow: Vec2[];
+  if (hasPerEdge) {
+    const tagged = pieceOutlineTagged(pattern, piece, paths, points, spacingMm);
+    if (tagged.pts.length < 3) return [];
+    const tf = pieceTransform(piece, points);
+    outline = tagged.pts.map(tf);
+    const widthById = new Map(piece.mainPaths.map((pp) => [pp.id, inside * (pp.seamAllowance ?? baseMag)]));
+    allow = offsetPolygonVariable(outline, (i) => widthById.get(tagged.edgeOf[i]) ?? inside * baseMag);
+  } else {
+    outline = pieceWorldOutline(pattern, piece, paths, points, spacingMm);
+    if (outline.length < 3) return [];
+    allow = offsetPolygon(outline, signedDist);
+  }
   const tf = pieceTransform(piece, points);
   const joins: { p: Vec2; join: CornerJoin }[] = [];
   for (const pp of piece.mainPaths) {
