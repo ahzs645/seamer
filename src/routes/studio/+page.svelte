@@ -23,6 +23,8 @@
   import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printPatternTiled, printMarkerTiled } from '$lib/utils/exporters';
   import { nestPieces, markerToSVG } from '$lib/utils/markerLayout';
   import { dxfToPattern, svgToPattern } from '$lib/utils/patternImport';
+  import { cutToPattern } from '$lib/utils/cutImport';
+  import { seamlyToPattern } from '$lib/utils/seamlyImport';
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
   import WelcomeModal from '$lib/components/WelcomeModal.svelte';
@@ -250,6 +252,8 @@
   function parseImport(text: string, ext: string | undefined, name: string): Pattern {
     if (ext === 'dxf') return dxfToPattern(text, name);
     if (ext === 'svg') return svgToPattern(text, name);
+    if (ext === 'cut') return cutToPattern(text, name);
+    if (ext === 'val' || ext === 'sm2d' || ext === 'xml') return seamlyToPattern(text, name);
     const raw = JSON.parse(text);
     return isSimpleFormat(raw) ? convertSimplePattern(raw) : (raw as Pattern);
   }
@@ -260,13 +264,13 @@
   }
 
   function handleImport() {
-    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.dxf,.svg';
+    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.dxf,.svg,.cut,.val,.sm2d,.xml';
     input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0]; if (!file) return;
       const ext = file.name.split('.').pop()?.toLowerCase();
       try {
-        applyImported(parseImport(await file.text(), ext, file.name.replace(/\.(dxf|svg|json|seamer\.json)$/i, '')));
-      } catch { toastError('Could not import file'); }
+        applyImported(parseImport(await file.text(), ext, file.name.replace(/\.(dxf|svg|cut|val|sm2d|xml|json|seamer\.json)$/i, '')));
+      } catch (err) { toastError((err as Error)?.message || 'Could not import file'); }
     };
     input.click();
   }
@@ -461,7 +465,7 @@
       <div class="dropdown dropdown-end">
         <div role="button" tabindex="0" class="btn btn-ghost btn-xs">Import</div>
         <ul class="dropdown-content menu bg-base-200 rounded-box z-50 w-52 p-2 shadow text-sm">
-          <li><button onclick={handleImport}>From file… (JSON/DXF/SVG)</button></li>
+          <li><button onclick={handleImport}>From file… (JSON/DXF/SVG/CUT/Seamly)</button></li>
           <li class="menu-title pt-2">Samples</li>
           {#each importSamples as s}
             <li><button onclick={() => importSample(s.file)}>{s.label}</button></li>
