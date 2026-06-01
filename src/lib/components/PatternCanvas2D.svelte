@@ -14,6 +14,7 @@
     pieceWorldOutline,
     pieceWorldInternalPolylines,
     pieceTransform,
+    pieceInverseTransform,
     piecePathPolyline,
     placedPoints,
     allSeamGeometry,
@@ -454,6 +455,24 @@
       c.drawImage(bgImage, cc.x - wPx / 2, cc.y - hPx / 2, wPx, hPx);
       c.restore();
     }
+    // placed image elements (reference photos / logos), behind the pattern geometry
+    for (const im of currentPattern.images) {
+      const img = textureFor(im.url);
+      if (!img) continue;
+      const layer = currentPattern.layers.find((l) => l.id === im.layerId);
+      if (layer && !layer.visible) continue;
+      const wPx = (im.width || 100) * baseScale();
+      const hPx = (im.height || 100) * baseScale();
+      const cc = toCanvas({ x: im.x, y: im.y });
+      c.save();
+      c.globalAlpha = im.opacity ?? 1;
+      c.imageSmoothingEnabled = true;
+      c.translate(cc.x, cc.y);
+      if (im.rotation) c.rotate((im.rotation * Math.PI) / 180);
+      c.drawImage(img, -wPx / 2, -hPx / 2, wPx, hPx);
+      c.restore();
+    }
+
     if (hpglPolys && hpglPolys.length) {
       c.save();
       c.globalAlpha = bgOpacity;
@@ -645,6 +664,46 @@
           } else tick(0); // single
         }
       }
+    }
+
+    // drill holes / punch markers — placed inside each piece (piece-local → plan → canvas)
+    for (const piece of currentPattern.pieces) {
+      if (piece.hidden || !piece.markers?.length) continue;
+      const tf = pieceTransform(piece, points);
+      c.strokeStyle = isDark ? '#cbd5e1' : '#1e293b';
+      c.fillStyle = c.strokeStyle;
+      c.lineWidth = 1.2; c.setLineDash([]);
+      for (const m of piece.markers) {
+        const p = toCanvas(tf({ x: m.x, y: m.y }));
+        if (m.type === 'drill') {
+          c.beginPath(); c.arc(p.x, p.y, 5, 0, Math.PI * 2); c.stroke();
+          c.beginPath(); c.arc(p.x, p.y, 1.2, 0, Math.PI * 2); c.fill();
+        } else { // punch: an X
+          c.beginPath();
+          c.moveTo(p.x - 4, p.y - 4); c.lineTo(p.x + 4, p.y + 4);
+          c.moveTo(p.x - 4, p.y + 4); c.lineTo(p.x + 4, p.y - 4);
+          c.stroke();
+        }
+      }
+    }
+
+    // text annotations (pattern-level), placed in plan space, with formatting
+    for (const t of currentPattern.texts) {
+      if (!t.value) continue;
+      const layer = currentPattern.layers.find((l) => l.id === t.layerId);
+      if (layer && !layer.visible) continue;
+      const o = toCanvas({ x: t.x, y: t.y });
+      const e = toCanvas({ x: t.x + (t.fontSize ?? 15), y: t.y });
+      const fontPx = Math.max(6, Math.hypot(e.x - o.x, e.y - o.y));
+      c.save();
+      c.translate(o.x, o.y);
+      if (t.rotation) c.rotate((t.rotation * Math.PI) / 180);
+      c.fillStyle = t.color ?? (isDark ? '#e2e8f0' : '#1e293b');
+      c.font = `${fontPx}px Inter, system-ui, sans-serif`;
+      c.textAlign = t.align ?? 'center';
+      c.textBaseline = 'middle';
+      c.fillText(t.value, 0, 0);
+      c.restore();
     }
 
     // seams — shown only while a seam tool is active (or pinned via the Seams toggle),
@@ -1021,6 +1080,18 @@
     })));
     toast('Added notch', 'success');
   }
+  /** Add a drill-hole / punch marker inside a piece at the clicked (plan-space) location. */
+  function addMarker(piece: Piece, type: 'drill' | 'punch', worldPlan: Vec2) {
+    const local = pieceInverseTransform(piece, indexPoints(currentPattern))(worldPlan);
+    mutatePieces((ps) => ps.map((p) => (p.id === piece.id
+      ? { ...p, markers: [...(p.markers ?? []), { id: uid('Marker'), type, x: local.x, y: local.y }] }
+      : p)));
+    toast(type === 'drill' ? 'Added drill hole' : 'Added punch marker', 'success');
+  }
+  function clearMarkers(piece: Piece) {
+    mutatePieces((ps) => ps.map((p) => (p.id === piece.id ? { ...p, markers: [] } : p)));
+    toast('Cleared markers');
+  }
   function clearNotches(piecePathId: string) {
     mutatePieces((ps) => ps.map((pc) => ({ ...pc, mainPaths: pc.mainPaths.map((pp) => pp.id === piecePathId ? { ...pp, notches: [] } : pp) })));
     toast('Cleared notches');
@@ -1088,7 +1159,10 @@
       x: e.clientX, y: e.clientY,
       items: [
         { label: 'Duplicate', icon: 'content_copy', onClick: () => duplicatePiece(piece) },
-        { label: 'Mirror along X-axis', icon: 'flip', onClick: () => mirrorPiece(piece, 'X') },
+        { label: 'Add drill hole here', icon: 'radio_button_checked', onClick: () => addMarker(piece, 'drill', toPattern(pos.x, pos.y)) },
+        { label: 'Add punch marker here', icon: 'add', onClick: () => addMarker(piece, 'punch', toPattern(pos.x, pos.y)) },
+        ...((piece.markers?.length ?? 0) > 0 ? [{ label: 'Clear markers', icon: 'backspace', onClick: () => clearMarkers(piece) } as MenuItem] : []),
+        { label: 'Mirror along X-axis', icon: 'flip', sep: true, onClick: () => mirrorPiece(piece, 'X') },
         { label: 'Mirror along Y-axis', icon: 'flip', onClick: () => mirrorPiece(piece, 'Y') },
         { label: 'Bring to front', icon: 'flip_to_front', sep: true, onClick: () => reorderPiece(piece, true) },
         { label: 'Send to back', icon: 'flip_to_back', onClick: () => reorderPiece(piece, false) },
@@ -1282,7 +1356,7 @@
 
   function cancelDraft() { penDraft = []; draftPathId = null; render(); }
 
-  const DRAWING_TOOLS = new Set(['pen', 'piece', 'internal', 'point', 'text', 'seam', 'seam-single', 'seam-multi', 'circle', 'arc', 'arc-center', 'arc-3pt']);
+  const DRAWING_TOOLS = new Set(['pen', 'piece', 'internal', 'point', 'text', 'image', 'seam', 'seam-single', 'seam-multi', 'circle', 'arc', 'arc-center', 'arc-3pt']);
   function isDrawingTool(t: string) { return DRAWING_TOOLS.has(t); }
 
   /** Reset any in-progress operation and return to the select tool (Esc / V / Cancel button). */
@@ -1296,6 +1370,7 @@
   const toolStatus = $derived.by(() => {
     switch ($selectedTool) {
       case 'text': return 'Click to place text';
+      case 'image': return 'Click to place an image, then choose a file';
       case 'point': return 'Click to add a point';
       case 'pen': return penDraft.length ? 'Click to add points · Enter to finish · Esc to cancel' : 'Click to start a path';
       case 'piece': return penDraft.length ? 'Click points to outline the piece · click the first point to close' : 'Click points to outline a new piece';
@@ -1315,8 +1390,33 @@
     const value = prompt('Text:');
     if (!value) return;
     const p = $state.snapshot(currentPattern) as Pattern;
-    const text = { id: uid('Text'), value, x: world.x, y: world.y } as import('$lib/types/pattern').PatternText;
+    const text = { id: uid('Text'), value, x: world.x, y: world.y, fontSize: 15, color: '#1e293b', align: 'center' as const, rotation: 0 } as import('$lib/types/pattern').PatternText;
     onchange({ ...p, texts: [...p.texts, text], hasChanged: true });
+  }
+
+  function insertImageAt(pos: Vec2) {
+    const world = toPattern(pos.x, pos.y);
+    const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/*';
+    input.onchange = () => {
+      const file = input.files?.[0]; if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const url = String(reader.result);
+        const probe = new Image();
+        probe.onload = () => {
+          const widthMm = 150;
+          const heightMm = widthMm * (probe.naturalHeight / probe.naturalWidth || 1);
+          const p = $state.snapshot(currentPattern) as Pattern;
+          const image = { id: uid('Image'), url, x: world.x, y: world.y, width: widthMm, height: heightMm, rotation: 0, opacity: 1 } as import('$lib/types/pattern').PatternImage;
+          onchange({ ...p, images: [...p.images, image], hasChanged: true });
+          toast('Inserted image', 'success');
+          selectedTool.set('select');
+        };
+        probe.src = url;
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
   }
 
   /** Hit-test a piece boundary edge (returns the PiecePath id), for the seam tool. */
@@ -1415,6 +1515,7 @@
       return;
     }
     if (tool === 'text') { insertTextAt(pos); return; }
+    if (tool === 'image') { insertImageAt(pos); return; }
     if (tool === 'seam' || tool === 'seam-single') { seamClick(pos); return; }
     if (tool === 'seam-multi') { seamMultiClick(pos); return; }
     if (tool === 'circle' || tool === 'arc-center' || tool === 'arc-3pt') { arcClick(pos); return; }

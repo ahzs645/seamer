@@ -161,6 +161,14 @@ export interface PieceSettings3D {
   savedPositions: number[];
 }
 
+/** A construction marker placed inside a piece (drill hole / punch), in piece-local drafting mm. */
+export interface PieceMarker {
+  id: string;
+  type: 'drill' | 'punch';
+  x: number;
+  y: number;
+}
+
 export interface Piece {
   id: string;
   name: string;
@@ -182,6 +190,7 @@ export interface Piece {
   seamAllowance?: number; // mm — per-piece override of pattern.seamAllowance (undefined => pattern default)
   mainPaths: PiecePath[]; // ordered boundary loop
   internalPaths: PiecePath[]; // darts / internal seams / fold lines
+  markers?: PieceMarker[]; // drill holes / punch markers (piece-local mm)
   settings3d: PieceSettings3D;
   hidden?: boolean; // object-browser visibility toggle (omitted = visible)
 }
@@ -221,6 +230,7 @@ export interface Material {
   libraryItemId: string | null;
   libraryVersion: number | null;
   libraryUpdatedAt: string | null;
+  currentPreset?: string | null; // name of the applied MaterialPreset (null/undefined => Custom)
 }
 
 export interface SeamRef {
@@ -325,11 +335,27 @@ export interface GradingProfile {
 
 export interface PatternImage {
   id: string;
+  url: string; // data URL or remote
+  x: number; // centre, mm (plan space)
+  y: number;
+  width: number; // mm
+  height: number; // mm
+  rotation?: number; // degrees
+  opacity?: number; // 0..1
+  layerId?: string;
   [k: string]: unknown;
 }
 
 export interface PatternText {
   id: string;
+  value: string;
+  x: number; // mm (plan space)
+  y: number;
+  fontSize?: number; // mm
+  color?: string; // hex
+  align?: 'left' | 'center' | 'right';
+  rotation?: number; // degrees
+  layerId?: string;
   [k: string]: unknown;
 }
 

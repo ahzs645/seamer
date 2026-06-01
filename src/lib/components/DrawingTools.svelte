@@ -34,7 +34,8 @@
       { id: 'seam-single', label: 'Create single seam', hotkey: 'S', svg: SEAM_SINGLE },
       { id: 'seam-multi', label: 'Create multi seam', hotkey: 'Shift+S', svg: SEAM_MULTI }
     ] },
-    { id: 'text', label: 'Insert text', hotkey: 'I', icon: 'text_fields', gap: true }
+    { id: 'text', label: 'Insert text', hotkey: 'I', icon: 'text_fields', gap: true },
+    { id: 'image', label: 'Insert image (reference / logo)', hotkey: 'G', icon: 'image' }
   ];
 
   const groupActive = (e: Entry) => !!e.sub?.some((s) => s.id === $selectedTool);

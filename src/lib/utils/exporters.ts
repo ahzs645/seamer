@@ -3,10 +3,10 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import {
-  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, type Vec2
+  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, pieceTransform, type Vec2
 } from './patternGeometry';
 
-type Layer = 'pattern' | 'seam-allowance' | 'internal';
+type Layer = 'pattern' | 'seam-allowance' | 'internal' | 'marker';
 interface Poly { pts: Vec2[]; closed: boolean; layer: Layer }
 
 function collectPolylines(pattern: Pattern): Poly[] {
@@ -26,6 +26,21 @@ function collectPolylines(pattern: Pattern): Poly[] {
     }
     for (const ip of pieceWorldInternalPolylines(pattern, piece, paths, points, 2)) {
       if (ip.length >= 2) out.push({ pts: ip, closed: false, layer: 'internal' });
+    }
+    // drill holes / punch markers → small circle (drill) or cross (punch)
+    if (piece.markers?.length) {
+      const tf = pieceTransform(piece, points);
+      for (const m of piece.markers) {
+        const w = tf({ x: m.x, y: m.y });
+        if (m.type === 'drill') {
+          const r = 2.5; const circle: Vec2[] = [];
+          for (let i = 0; i <= 16; i++) { const a = (i / 16) * Math.PI * 2; circle.push({ x: w.x + Math.cos(a) * r, y: w.y + Math.sin(a) * r }); }
+          out.push({ pts: circle, closed: true, layer: 'marker' });
+        } else {
+          out.push({ pts: [{ x: w.x - 2, y: w.y - 2 }, { x: w.x + 2, y: w.y + 2 }], closed: false, layer: 'marker' });
+          out.push({ pts: [{ x: w.x - 2, y: w.y + 2 }, { x: w.x + 2, y: w.y - 2 }], closed: false, layer: 'marker' });
+        }
+      }
     }
   }
   return out;
@@ -52,15 +67,23 @@ export function patternToSVG(pattern: Pattern): string {
   const style: Record<Layer, string> = {
     'pattern': 'stroke="#000" stroke-width="0.5"',
     'seam-allowance': 'stroke="#888" stroke-width="0.4" stroke-dasharray="3,2"',
-    'internal': 'stroke="#444" stroke-width="0.35" stroke-dasharray="2,2"'
+    'internal': 'stroke="#444" stroke-width="0.35" stroke-dasharray="2,2"',
+    'marker': 'stroke="#c0392b" stroke-width="0.4"'
   };
   const paths = polys.map((p) => {
     const d = p.pts.map((v, i) => `${i === 0 ? 'M' : 'L'}${X(v.x)},${Y(v.y)}`).join(' ') + (p.closed ? ' Z' : '');
     return `  <path d="${d}" fill="none" ${style[p.layer]}/>`;
   }).join('\n');
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const texts = (pattern.texts ?? []).filter((t) => t.value).map((t) => {
+    const anchor = t.align === 'left' ? 'start' : t.align === 'right' ? 'end' : 'middle';
+    const rot = t.rotation ? ` transform="rotate(${(-t.rotation).toFixed(2)} ${X(t.x)} ${Y(t.y)})"` : '';
+    return `  <text x="${X(t.x)}" y="${Y(t.y)}" font-size="${(t.fontSize ?? 15).toFixed(1)}" fill="${t.color ?? '#000'}" text-anchor="${anchor}" dominant-baseline="middle"${rot}>${esc(t.value)}</text>`;
+  }).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${w.toFixed(1)}mm" height="${h.toFixed(1)}mm" viewBox="0 0 ${w.toFixed(1)} ${h.toFixed(1)}">
 ${paths}
+${texts}
 </svg>`;
 }
 

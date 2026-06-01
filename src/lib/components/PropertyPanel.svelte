@@ -7,6 +7,7 @@
     materialLibrary, libraryStatus, getLibraryItem, saveNewLibraryItem, overwriteLibraryItem,
     instantiateFromLibrary, syncFromLibrary, type LibraryStatus
   } from '$lib/stores/materialLibrary';
+  import { MATERIAL_PRESETS, getPreset } from '$lib/data/materialPresets';
 
   interface Props {
     currentPattern: Pattern;
@@ -265,6 +266,18 @@
   function setFrontTexture(id: string, partial: Partial<NonNullable<Mat['frontTexture']>>) {
     updateMaterial(id, (m) => ({ ...m, frontTexture: { ...(m.frontTexture ?? { url: '', mediaId: null, color: '#bbbbbb', scale: 100, normalUrl: '', normalMediaId: null, normalMapScale: 100, opacityUrl: '', opacityMediaId: null, opacityMapScale: 100 }), ...partial } }));
   }
+  function applyPreset(id: string, name: string) {
+    const preset = getPreset(name);
+    if (!preset) { updateMaterial(id, (m) => ({ ...m, currentPreset: null })); return; }
+    updateMaterial(id, (m) => ({
+      ...m,
+      stretchWarpValue: preset.stretchWarpValue, stretchWeftValue: preset.stretchWeftValue,
+      bendValue: preset.bendValue, thickness: preset.thickness, weight: preset.weight,
+      roughness: preset.roughness, metalness: preset.metalness, specularIntensity: preset.specularIntensity,
+      currentPreset: preset.name
+    }));
+    toastSuccess(`Applied "${preset.name}" preset`);
+  }
   function setStretch(id: string, which: 'warp' | 'weft', value: number) {
     updateMaterial(id, (m) => ({
       ...m,
@@ -393,8 +406,25 @@
     { id: '3d', icon: 'view_in_ar', title: '3D Settings' },
     { id: 'sizes', icon: 'tag', title: 'Sizes & Variables' },
     { id: 'body', icon: 'accessibility', title: 'Body' },
-    { id: 'materials', icon: 'texture', title: 'Materials' }
+    { id: 'materials', icon: 'texture', title: 'Materials' },
+    { id: 'texts', icon: 'text_fields', title: 'Text' },
+    { id: 'images', icon: 'image', title: 'Images' }
   ];
+
+  type Txt = Pattern['texts'][number];
+  function updateText(id: string, partial: Partial<Txt>) {
+    updatePattern({ texts: currentPattern.texts.map((t) => (t.id === id ? { ...t, ...partial } : t)) });
+  }
+  function removeText(id: string) {
+    updatePattern({ texts: currentPattern.texts.filter((t) => t.id !== id) });
+  }
+  type Img = Pattern['images'][number];
+  function updateImage(id: string, partial: Partial<Img>) {
+    updatePattern({ images: currentPattern.images.map((im) => (im.id === id ? { ...im, ...partial } : im)) });
+  }
+  function removeImage(id: string) {
+    updatePattern({ images: currentPattern.images.filter((im) => im.id !== id) });
+  }
 </script>
 
 {#snippet matSlider(label: string, value: number, min: number, max: number, step: number, oninput: (v: number) => void)}
@@ -483,6 +513,11 @@
     <hr class="border-base-200" />
     <div class="space-y-2">
       <span class="font-semibold">Simulation</span>
+      <label class="flex flex-col gap-0.5">Preset
+        <select class="select select-bordered select-xs" value={m.currentPreset ?? ''} onchange={(e) => applyPreset(m.id, e.currentTarget.value)}>
+          <option value="">Custom</option>
+          {#each MATERIAL_PRESETS as pr}<option value={pr.name}>{pr.name}</option>{/each}
+        </select></label>
       <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={linkWarpWeft} onchange={(e) => (linkWarpWeft = e.currentTarget.checked)} /> Link warp and weft</label>
       {@render matSlider('Stretch warp', m.stretchWarpValue, 0, 100, 1, (v) => setStretch(m.id, 'warp', v))}
       {#if !linkWarpWeft}{@render matSlider('Stretch weft', m.stretchWeftValue, 0, 100, 1, (v) => setStretch(m.id, 'weft', v))}{/if}
@@ -796,7 +831,7 @@
       <div class="w-full bg-base-200 block mt-[-1px]" class:bg-base-300={patternOpen === s.id}>
         <button type="button" class="w-full flex items-center p-2 px-3 text-sm" aria-expanded={patternOpen === s.id} onclick={() => togglePattern(s.id)}>
           <span class="material-symbols-rounded mr-2">{s.icon}</span>
-          <span class="text-md font-bold">{s.title}{s.id === 'materials' ? ` (${currentPattern.materials.length})` : ''}</span>
+          <span class="text-md font-bold">{s.title}{s.id === 'materials' ? ` (${currentPattern.materials.length})` : s.id === 'texts' && currentPattern.texts.length ? ` (${currentPattern.texts.length})` : s.id === 'images' && currentPattern.images.length ? ` (${currentPattern.images.length})` : ''}</span>
           <span class="material-symbols-rounded ml-auto">{patternOpen === s.id ? 'keyboard_arrow_down' : 'keyboard_arrow_right'}</span>
         </button>
         {#if patternOpen === s.id}
@@ -849,6 +884,31 @@
                 <select class="select select-bordered select-xs" value={currentPattern.settings3d.lightingMode} onchange={(e) => updateSettings3D({ lightingMode: e.currentTarget.value })}>
                   {#each ['flat', 'hdri', 'studio1', 'studio2', 'sunset'] as m}<option value={m}>{m}</option>{/each}</select></label>
               {@render labelSetting()}
+              <hr class="border-base-200" />
+              <span class="text-xs font-semibold opacity-70">Simulation</span>
+              <label class="flex items-center justify-between gap-2">Gravity
+                <input type="number" step="0.1" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.gravity[1]}
+                  oninput={(e) => updateSettings3D({ gravity: [currentPattern.settings3d.gravity[0], parseFloat(e.currentTarget.value) || 0, currentPattern.settings3d.gravity[2]] })} /></label>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.handleSelfCollisions} onchange={(e) => updateSettings3D({ handleSelfCollisions: e.currentTarget.checked })} /> Self-collisions</label>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.forceLowEndHardware} onchange={(e) => updateSettings3D({ forceLowEndHardware: e.currentTarget.checked })} /> Force low-end hardware</label>
+              <hr class="border-base-200" />
+              <span class="text-xs font-semibold opacity-70">Overlays</span>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.showArrangementPoints} onchange={(e) => updateSettings3D({ showArrangementPoints: e.currentTarget.checked })} /> Arrangement points</label>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.showTriangles} onchange={(e) => updateSettings3D({ showTriangles: e.currentTarget.checked })} /> Mesh triangles</label>
+              <hr class="border-base-200" />
+              <span class="text-xs font-semibold opacity-70">Post-processing</span>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.n8aoEnabled} onchange={(e) => updateSettings3D({ n8aoEnabled: e.currentTarget.checked })} /> Ambient occlusion (N8AO)</label>
+              {#if currentPattern.settings3d.n8aoEnabled}
+                <label class="flex items-center justify-between gap-2 text-[11px]">AO intensity
+                  <input type="number" step="0.5" min="0" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.n8aoIntensity}
+                    oninput={(e) => updateSettings3D({ n8aoIntensity: parseFloat(e.currentTarget.value) || 0 })} /></label>
+              {/if}
+              <label class="flex items-center justify-between gap-2 text-[11px]">Bokeh f-stop
+                <input type="number" step="0.5" min="0" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.bokehFStop}
+                  oninput={(e) => updateSettings3D({ bokehFStop: parseFloat(e.currentTarget.value) || 0 })} /></label>
+              <label class="flex items-center justify-between gap-2 text-[11px]">SMAA scale
+                <input type="number" step="1" min="0" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.smaaScale}
+                  oninput={(e) => updateSettings3D({ smaaScale: parseFloat(e.currentTarget.value) || 0 })} /></label>
 
             {:else if s.id === 'sizes'}
               <!-- Sizes -->
@@ -971,6 +1031,54 @@
                     {/each}
                   </div>
                 {/if}
+              </div>
+
+            {:else if s.id === 'texts'}
+              <div class="flex flex-col gap-2 w-full">
+                {#each currentPattern.texts as t (t.id)}
+                  <div class="rounded-md border border-base-300 p-2 space-y-1">
+                    <div class="flex items-center gap-1">
+                      <input type="text" class="input input-bordered input-xs flex-1" value={t.value} placeholder="Text…"
+                        oninput={(e) => updateText(t.id, { value: e.currentTarget.value })} />
+                      <button class="btn btn-ghost btn-xs p-1 text-error" title="Delete text" aria-label="Delete text" onclick={() => removeText(t.id)}><span class="material-symbols-rounded text-base">delete</span></button>
+                    </div>
+                    <div class="grid grid-cols-3 gap-1">
+                      <label class="flex flex-col gap-0.5 text-[11px]">Size (mm)
+                        <input type="number" min="1" step="1" class="input input-bordered input-xs" value={t.fontSize ?? 15} oninput={(e) => updateText(t.id, { fontSize: parseFloat(e.currentTarget.value) || 15 })} /></label>
+                      <label class="flex flex-col gap-0.5 text-[11px]">Angle (°)
+                        <input type="number" step="1" class="input input-bordered input-xs" value={t.rotation ?? 0} oninput={(e) => updateText(t.id, { rotation: parseFloat(e.currentTarget.value) || 0 })} /></label>
+                      <label class="flex flex-col gap-0.5 text-[11px]">Color
+                        <input type="color" class="w-full h-6 rounded border" value={t.color ?? '#1e293b'} oninput={(e) => updateText(t.id, { color: e.currentTarget.value })} /></label>
+                    </div>
+                    <label class="flex flex-col gap-0.5 text-[11px]">Align
+                      <select class="select select-bordered select-xs" value={t.align ?? 'center'} onchange={(e) => updateText(t.id, { align: e.currentTarget.value as 'left' | 'center' | 'right' })}>
+                        <option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
+                  </div>
+                {:else}<p class="opacity-60">No text yet. Use the Text tool (I) to place text on the canvas.</p>{/each}
+              </div>
+
+            {:else if s.id === 'images'}
+              <div class="flex flex-col gap-2 w-full">
+                {#each currentPattern.images as im (im.id)}
+                  <div class="rounded-md border border-base-300 p-2 space-y-1">
+                    <div class="flex items-center gap-2">
+                      <div class="w-10 h-10 rounded border border-base-300 shrink-0 bg-base-200" style={`background-image:url('${im.url}');background-size:cover;background-position:center`}></div>
+                      <div class="grid grid-cols-2 gap-1 flex-1">
+                        <label class="flex flex-col gap-0.5 text-[11px]">Width (mm)
+                          <input type="number" min="1" step="1" class="input input-bordered input-xs" value={(im.width ?? 100).toFixed(0)} oninput={(e) => updateImage(im.id, { width: parseFloat(e.currentTarget.value) || 100 })} /></label>
+                        <label class="flex flex-col gap-0.5 text-[11px]">Height (mm)
+                          <input type="number" min="1" step="1" class="input input-bordered input-xs" value={(im.height ?? 100).toFixed(0)} oninput={(e) => updateImage(im.id, { height: parseFloat(e.currentTarget.value) || 100 })} /></label>
+                      </div>
+                      <button class="btn btn-ghost btn-xs p-1 text-error" title="Delete image" aria-label="Delete image" onclick={() => removeImage(im.id)}><span class="material-symbols-rounded text-base">delete</span></button>
+                    </div>
+                    <div class="grid grid-cols-2 gap-1">
+                      <label class="flex flex-col gap-0.5 text-[11px]">Angle (°)
+                        <input type="number" step="1" class="input input-bordered input-xs" value={im.rotation ?? 0} oninput={(e) => updateImage(im.id, { rotation: parseFloat(e.currentTarget.value) || 0 })} /></label>
+                      <label class="flex flex-col gap-0.5 text-[11px]">Opacity
+                        <input type="range" min="0" max="1" step="0.05" class="range range-xs" value={im.opacity ?? 1} oninput={(e) => updateImage(im.id, { opacity: parseFloat(e.currentTarget.value) })} /></label>
+                    </div>
+                  </div>
+                {:else}<p class="opacity-60">No images. Use the Image tool (G) to place a reference image or logo.</p>{/each}
               </div>
             {/if}
           </div>

@@ -50,6 +50,12 @@
   function removeSeam(id: string) {
     onchange({ ...currentPattern, seams: currentPattern.seams.filter((s) => s.id !== id), hasChanged: true });
   }
+
+  // Reverse a seam: swap which side is "from" and which is "to" (mirrors the original seam.reverse).
+  function reverseSeam(id: string) {
+    const seams = currentPattern.seams.map((s) => (s.id === id ? { ...s, fromPaths: s.toPaths, toPaths: s.fromPaths } : s));
+    onchange({ ...currentPattern, seams, hasChanged: true });
+  }
 </script>
 
 <div class="text-xs">
@@ -61,6 +67,9 @@
         <span class="flex-1 truncate text-[11px]" title={seamLabel(currentPattern, seam, owners)}>
           {seamLabel(currentPattern, seam, owners)}
         </span>
+        <button class="btn btn-xs btn-ghost px-0.5" title="Reverse seam direction" aria-label="Reverse seam" onclick={() => reverseSeam(seam.id)}>
+          <span class="material-symbols-rounded text-sm align-middle">swap_horiz</span>
+        </button>
         <button class="btn btn-xs btn-ghost px-0.5 text-error" onclick={() => removeSeam(seam.id)}>&times;</button>
       </div>
     {/each}
