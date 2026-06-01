@@ -46,6 +46,33 @@ function bumpVersion(path: ConstrainablePath): ConstrainablePath {
 	return { ...path, version: (path.version ?? 1) + 1 };
 }
 
+/**
+ * Apply a Bézier point's mirror constraints when one of its two tangent handles is moved to `newV`
+ * (anchor-relative). Ports the original's handle mirror settings (`sameLength` / `sameAngle`):
+ * - both: the opposite handle becomes the exact negation (full point-symmetric handle).
+ * - sameAngle only: the opposite handle keeps its own length but points the opposite direction.
+ * - sameLength only: the opposite handle keeps its direction but matches the new length.
+ * - neither: the opposite handle is left untouched.
+ * Returns a NEW handle (preserving lengthFormula/angleFormula and the flags).
+ */
+export function applyHandleConstraint(h: BezierHandle, which: 'v1' | 'v2', newV: { x: number; y: number }): BezierHandle {
+	const otherKey = which === 'v1' ? 'v2' : 'v1';
+	const other = otherKey === 'v1' ? h.v1 : h.v2;
+	const nl = Math.hypot(newV.x, newV.y);
+	let mirrored = { x: other.x, y: other.y };
+	if (h.sameAngle && h.sameLength) {
+		mirrored = { x: -newV.x, y: -newV.y };
+	} else if (h.sameAngle) {
+		const ol = Math.hypot(other.x, other.y);
+		if (nl > 1e-9) mirrored = { x: (-newV.x / nl) * ol, y: (-newV.y / nl) * ol };
+	} else if (h.sameLength) {
+		const ol = Math.hypot(other.x, other.y);
+		if (ol > 1e-9) mirrored = { x: (other.x / ol) * nl, y: (other.y / ol) * nl };
+	}
+	const set = { x: newV.x, y: newV.y };
+	return { ...h, v1: which === 'v1' ? set : mirrored, v2: which === 'v2' ? set : mirrored };
+}
+
 // ---- predicates (context-menu visibility) ----------------------------------
 
 /** Point is a sliding point on a curve path → can be promoted to a curve anchor. */

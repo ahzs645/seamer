@@ -49,6 +49,8 @@
   let dragPointId: string | null = $state(null);
   let dragInvert: ((w: Vec2) => Vec2) | null = null;
   let dragStartWorld: Vec2 | null = null;
+  // interactive bezier-handle drag (on the selected edge's anchor points)
+  let dragHandle: { pathId: string; pointId: string; which: 'v1' | 'v2'; invert: (w: Vec2) => Vec2; anchor: Vec2 } | null = null;
   let dragStartX = 0;
   let dragStartY = 0;
   let currentZoom = $state(1);
@@ -427,6 +429,43 @@
 
   function hitTestPoint(cx: number, cy: number, threshold = HOVER_THRESHOLD): string | null {
     return hitTestPlaced(cx, cy, threshold)?.pointId ?? null;
+  }
+
+  /**
+   * Hit-test the salmon bezier-handle endpoints shown on the single selected edge (drawSelectedEdge).
+   * Returns the handle to drag (with the owning piece's world→draft invert + the anchor's draft pos),
+   * or null. Tested in canvas pixels since the handles are drawn at a fixed pixel radius.
+   */
+  function hitTestHandle(cx: number, cy: number, px = 9): { pathId: string; pointId: string; which: 'v1' | 'v2'; invert: (w: Vec2) => Vec2; anchor: Vec2 } | null {
+    if ($selectedPathIds.size !== 1) return null;
+    const pathId = [...$selectedPathIds][0];
+    const points = indexPoints(currentPattern);
+    let owner: { piece: Piece; pp: import('$lib/types/pattern').PiecePath } | null = null;
+    for (const piece of currentPattern.pieces) {
+      if (piece.hidden) continue;
+      if ($selectedPieceIds.size > 0 && !$selectedPieceIds.has(piece.id)) continue;
+      const pp = [...piece.mainPaths, ...piece.internalPaths].find((x) => x.path === pathId);
+      if (pp) { owner = { piece, pp }; break; }
+    }
+    if (!owner) return null;
+    const path = currentPattern.paths.find((p) => p.id === pathId);
+    if (!path) return null;
+    const tf = pieceTransform(owner.piece, points, pieceShrinkageScale(currentPattern, owner.piece));
+    const inv = pieceInverseTransform(owner.piece, points);
+    let best: { pathId: string; pointId: string; which: 'v1' | 'v2'; invert: (w: Vec2) => Vec2; anchor: Vec2 } | null = null;
+    let bestD = px;
+    for (const ap of path.pathPoints) {
+      const anchor = points.get(ap.id);
+      if (!anchor || !ap.handle) continue;
+      for (const which of ['v1', 'v2'] as const) {
+        const v = ap.handle[which];
+        if (!v || (v.x === 0 && v.y === 0)) continue;
+        const hw = toCanvas(tf({ x: anchor.x + v.x, y: anchor.y + v.y }));
+        const d = Math.hypot(cx - hw.x, cy - hw.y);
+        if (d < bestD) { bestD = d; best = { pathId, pointId: ap.id, which, invert: inv, anchor: { x: anchor.x, y: anchor.y } }; }
+      }
+    }
+    return best;
   }
 
   function tracePoly(c: CanvasRenderingContext2D, poly: Vec2[], close: boolean) {
@@ -1557,6 +1596,10 @@
     if (tool === 'circle' || tool === 'arc-center' || tool === 'arc-3pt') { arcClick(pos); return; }
     if (tool === 'arc') return;
 
+    // bezier-handle drag takes priority over anchor selection (handles sit on top of anchors)
+    const hHit = hitTestHandle(pos.x, pos.y);
+    if (hHit) { dragHandle = hHit; isDragging = true; return; }
+
     const hit = hitTestPlaced(pos.x, pos.y);
     if (hit) {
       const cur = new Set($selectedPointIds);
@@ -1641,6 +1684,18 @@
       }
       return;
     }
+    if (dragHandle) {
+      // drag a bezier tangent handle: map cursor → draft space, set the new anchor-relative vector,
+      // and mirror the opposite handle per the point's sameLength/sameAngle constraints.
+      const draft = (dragHandle.invert ?? ((w: Vec2) => w))(toPattern(pos.x, pos.y));
+      const newV = { x: draft.x - dragHandle.anchor.x, y: draft.y - dragHandle.anchor.y };
+      const paths = currentPattern.paths.map((pa) => pa.id !== dragHandle!.pathId ? pa : {
+        ...pa,
+        pathPoints: pa.pathPoints.map((pp) => (pp.id === dragHandle!.pointId && pp.handle ? { ...pp, handle: ops.applyHandleConstraint(pp.handle, dragHandle!.which, newV) } : pp))
+      });
+      onchange({ ...currentPattern, paths, hasChanged: true });
+      return;
+    }
     if (isDragging && dragPointId) {
       // map the cursor (world) back into the dragged point's drafting space
       const world = toPattern(pos.x, pos.y);
@@ -1678,6 +1733,7 @@
     }
     isDragging = false;
     dragPointId = null;
+    dragHandle = null;
     dragInvert = null;
     dragStartWorld = null;
     dragDraftStart = null;

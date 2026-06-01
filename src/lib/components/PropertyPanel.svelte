@@ -69,6 +69,22 @@
     onchange({ ...currentPattern, points, hasChanged: true });
   }
 
+  // ---- Curve-handle mirror constraints (per selected edge) — ports the original handle.update -----
+  // The bezier handles on the selected edge's points; their sameLength/sameAngle govern how dragging
+  // one handle mirrors the other (enforced live in PatternCanvas2D via applyHandleConstraint).
+  const edgeHandlePoints = $derived(editingEdge ? editingEdge.path.pathPoints.filter((pp) => pp.handle) : []);
+  const allSameLength = $derived(edgeHandlePoints.length > 0 && edgeHandlePoints.every((pp) => pp.handle?.sameLength));
+  const allSameAngle = $derived(edgeHandlePoints.length > 0 && edgeHandlePoints.every((pp) => pp.handle?.sameAngle));
+  function setEdgeHandleMirror(patch: { sameLength?: boolean; sameAngle?: boolean }) {
+    if (!editingEdge) return;
+    const id = editingEdge.path.id;
+    const paths = currentPattern.paths.map((pa) => pa.id !== id ? pa : {
+      ...pa,
+      pathPoints: pa.pathPoints.map((pp) => (pp.handle ? { ...pp, handle: { ...pp.handle, ...patch } } : pp))
+    });
+    onchange({ ...currentPattern, paths, hasChanged: true });
+  }
+
   // which accordion section is open (Seam boundary open by default, like the source)
   let openSection = $state<string>('seam');
   function toggle(id: string) { openSection = openSection === id ? '' : id; }
@@ -368,6 +384,33 @@
     ...currentPattern.variables.filter((v) => v.id !== formulaVarId).map((v) => ({ name: v.name, value: v.value ?? 0 })),
     ...Object.entries(currentPattern.body.fields).map(([name, value]) => ({ name, value }))
   ]);
+  // Categorised geometric-reference tokens for the formula picker (point coords/angles, path
+  // lengths/angles, curve handles, body measurements) — resolved by the solver against geometry.
+  const formulaCategories = $derived.by(() => {
+    const p = currentPattern;
+    const pointName = new Map(p.points.map((pt) => [pt.id, pt.name || pt.id]));
+    const cats: { name: string; items: { label: string; token: string; title?: string }[] }[] = [];
+    cats.push({ name: 'Custom variables', items: p.variables.filter((v) => v.id !== formulaVarId && /^[A-Za-z_$][\w$]*$/.test(v.name)).map((v) => ({ label: v.name, token: v.name, title: `${v.name} = ${v.value ?? 0}` })) });
+    const body = Object.keys(p.body.fields);
+    if (body.length) cats.push({ name: 'Body', items: body.map((f) => ({ label: f, token: `body.${f}`, title: 'measurement' })) });
+    cats.push({ name: 'Path lengths', items: p.paths.map((pa) => ({ label: `${pa.name || pa.id}.length`, token: `${pa.id}.length` })) });
+    cats.push({ name: 'Path angles', items: p.paths.map((pa) => ({ label: `${pa.name || pa.id}.angle`, token: `${pa.id}.angle` })) });
+    cats.push({ name: 'Point coordinates', items: p.points.flatMap((pt) => [
+      { label: `${pt.name || pt.id}.x`, token: `${pt.id}.x` },
+      { label: `${pt.name || pt.id}.y`, token: `${pt.id}.y` }
+    ]) });
+    const ptAngles: { label: string; token: string }[] = [];
+    const handles: { label: string; token: string }[] = [];
+    for (const pa of p.paths) for (const pp of pa.pathPoints) {
+      const nm = pointName.get(pp.id) ?? pp.id;
+      ptAngles.push({ label: `${pa.name || pa.id}·${nm}.angle`, token: `${pa.id}.${pp.id}.angle` });
+      if (pp.handle) for (const [suf, lbl] of [['handle.length', 'h.len'], ['handle.angle', 'h.ang'], ['handle.length2', 'h.len2'], ['handle.angle2', 'h.ang2']] as const)
+        handles.push({ label: `${nm}.${lbl}`, token: `${pa.id}.${pp.id}.${suf}` });
+    }
+    cats.push({ name: 'Point angles', items: ptAngles });
+    if (handles.length) cats.push({ name: 'Curve handles', items: handles });
+    return cats.filter((c) => c.items.length);
+  });
   const selectedVariable = $derived(currentPattern.variables.find((v) => v.id === selectedVariableId) ?? null);
   const VAR_TYPE_ICON: Record<string, string> = { number: 'tag', boolean: 'check', enum: 'list', string: 'text_fields', length: 'straighten', angle: 'rotate_right' };
 
@@ -605,6 +648,15 @@
           <p class="text-[11px] opacity-50">Adds a referenced edge whose points stay reflected across the axis (a parametric symmetry constraint).</p>
         {/if}
       </div>
+
+      {#if edgeHandlePoints.length > 0}
+        <div class="border-t border-base-200 pt-2 space-y-1">
+          <span class="text-xs font-semibold flex items-center gap-1"><span class="material-symbols-rounded text-sm">gesture</span>Curve handles</span>
+          <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={allSameAngle} onchange={(e) => setEdgeHandleMirror({ sameAngle: e.currentTarget.checked })} /> Same angle (handles stay collinear)</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={allSameLength} onchange={(e) => setEdgeHandleMirror({ sameLength: e.currentTarget.checked })} /> Same length (handles stay equal)</label>
+          <p class="text-[11px] opacity-50">Drag the salmon handle dots in the 2D view; the opposite handle follows these mirror rules.</p>
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -1126,6 +1178,7 @@
   <FormulaDialog
     formula={fv?.valueFormula?.formula ?? String(fv?.value ?? '')}
     variables={formulaScope}
+    categories={formulaCategories}
     onsave={(f, val) => { if (formulaVarId) updateVariable(formulaVarId, { valueFormula: { ...(fv?.valueFormula ?? { formula: '', unit: 'none' }), formula: f }, value: val ?? fv?.value ?? 0 }); formulaVarId = null; }}
     oncancel={() => (formulaVarId = null)}
   />
