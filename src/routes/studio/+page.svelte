@@ -31,6 +31,17 @@
   import { redraft, hasConstraints, makeParametric, solvePoints, resolveVariables, captureAlterationDelta } from '$lib/solver/solve';
   import AlterationsPanel from '$lib/components/AlterationsPanel.svelte';
   import type { AlterationTrack, BezierHandle } from '$lib/types/pattern';
+  import CommandPalette from '$lib/components/CommandPalette.svelte';
+  import BugReportModal from '$lib/components/BugReportModal.svelte';
+  import CuttingRoomModal from '$lib/components/CuttingRoomModal.svelte';
+  import VersionsModal from '$lib/components/VersionsModal.svelte';
+  import { installCommandApi, type ExecuteHost } from '$lib/commands';
+  import { get } from 'svelte/store';
+
+  let showCommandPalette = $state(false);
+  let showBugReport = $state(false);
+  let showCuttingRoom = $state(false);
+  let showVersions = $state(false);
 
   let currentPattern = $state<Pattern>(structuredClone(EMPTY_PATTERN));
   let saved = $state(true);
@@ -148,7 +159,21 @@
 
   let autoSaveTimer: ReturnType<typeof setInterval>;
 
+  // Command-bus host: the unified command layer commits through the same undo-aware update path the
+  // UI uses (handlePatternUpdate), reads the live selection, and is exposed to scripts/agents via
+  // window.seamscape. No login/network — every command runs in-page.
+  const commandHost: ExecuteHost = {
+    getPattern: () => $state.snapshot(currentPattern) as Pattern,
+    getSelection: () => ({
+      pointIds: [...get(selectedPointIds)],
+      pathIds: [...get(selectedPathIds)],
+      pieceIds: [...get(selectedPieceIds)]
+    }),
+    apply: (next, label) => handlePatternUpdate(next, label)
+  };
+
   onMount(() => {
+    const disposeCommandApi = installCommandApi(commandHost);
     (async () => {
       const id = $page.url.searchParams.get('id');
       if (id) {
@@ -172,7 +197,7 @@
     const handler = (e: BeforeUnloadEvent) => { if (!saved) e.preventDefault(); };
     window.addEventListener('beforeunload', handler);
 
-    return () => { clearInterval(autoSaveTimer); window.removeEventListener('beforeunload', handler); };
+    return () => { clearInterval(autoSaveTimer); window.removeEventListener('beforeunload', handler); disposeCommandApi(); };
   });
 
   function handlePatternUpdate(updated: Pattern, label = 'Edit') {
@@ -364,7 +389,23 @@
     if ((e.metaKey || e.ctrlKey) && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelectedPiece(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); handleCopy(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); handlePaste(); }
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); showCommandPalette = !showCommandPalette; }
     if (e.key === '?' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); showShortcuts = !showShortcuts; }
+    // Selection batch transforms (no modifier): arrows nudge, [ ] rotate, < > scale, M mirror.
+    {
+      const hasSel = $selectedPointIds.size || $selectedPathIds.size || $selectedPieceIds.size;
+      if (hasSel && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const step = e.shiftKey ? 10 : 1;
+        const move = (dx: number, dy: number) => { e.preventDefault(); commandHost && (window.seamscape?.execute('selection.move', { dx, dy })); };
+        if (e.key === 'ArrowLeft') move(-step, 0);
+        else if (e.key === 'ArrowRight') move(step, 0);
+        else if (e.key === 'ArrowUp') move(0, -step);
+        else if (e.key === 'ArrowDown') move(0, step);
+        else if (e.key === '[') { e.preventDefault(); window.seamscape?.execute('selection.rotate', { degrees: -15 }); }
+        else if (e.key === ']') { e.preventDefault(); window.seamscape?.execute('selection.rotate', { degrees: 15 }); }
+        else if (e.key === 'm' || e.key === 'M') { e.preventDefault(); window.seamscape?.execute('selection.mirror', { axis: e.shiftKey ? 'y' : 'x' }); }
+      }
+    }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       let p = $pattern;
       let changed = false;
@@ -490,6 +531,7 @@
           <li><button onclick={exportPNG}>PNG</button></li>
           <li><button onclick={() => exportAs('csv')}>CSV (points)</button></li>
           <li class="menu-title pt-2">Cutting</li>
+          <li><button onclick={() => (showCuttingRoom = true)}>Cutting room…</button></li>
           <li><button onclick={exportMarker}>Marker / nest (SVG)</button></li>
           <li><button onclick={doPrintMarker}>Print marker (tiled)…</button></li>
           <li><button onclick={doPrintTiled}>Print pattern (tiled)…</button></li>
@@ -504,6 +546,15 @@
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">view_list</span>
       </button>
       <ErrorsPanel {currentPattern} />
+      <button class="btn btn-ghost btn-xs" onclick={() => showVersions = true} title="Version history" aria-label="Version history">
+        <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">history</span>
+      </button>
+      <button class="btn btn-ghost btn-xs" onclick={() => showCommandPalette = true} title="Command palette (⌘K)" aria-label="Command palette">
+        <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">terminal</span>
+      </button>
+      <button class="btn btn-ghost btn-xs" onclick={() => showBugReport = true} title="Send feedback" aria-label="Send feedback">
+        <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">feedback</span>
+      </button>
       <button class="btn btn-ghost btn-xs" onclick={() => showShortcuts = true} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">keyboard</span>
       </button>
@@ -556,6 +607,10 @@
 
 <KeyboardShortcuts bind:open={showShortcuts} />
 <WelcomeModal onshowshortcuts={() => (showShortcuts = true)} />
+{#if showCommandPalette}<CommandPalette host={commandHost} onclose={() => (showCommandPalette = false)} />{/if}
+{#if showBugReport}<BugReportModal {currentPattern} onclose={() => (showBugReport = false)} />{/if}
+{#if showCuttingRoom}<CuttingRoomModal {currentPattern} onchange={handlePatternUpdate} onclose={() => (showCuttingRoom = false)} />{/if}
+{#if showVersions}<VersionsModal {currentPattern} onrestore={applyImported} onchange={handlePatternUpdate} onclose={() => (showVersions = false)} />{/if}
 
 <Toaster />
 <ConfirmDialog />

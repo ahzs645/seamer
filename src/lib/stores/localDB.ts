@@ -4,7 +4,8 @@ import type { Pattern } from '$lib/types/pattern';
 const DB_NAME = 'seamer-patterns';
 const STORE_NAME = 'patterns';
 const HISTORY_STORE = 'history';
-const DB_VERSION = 2;
+const VERSIONS_STORE = 'versions';
+const DB_VERSION = 3;
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -17,6 +18,10 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(HISTORY_STORE)) {
         db.createObjectStore(HISTORY_STORE, { keyPath: 'patternId' });
+      }
+      if (!db.objectStoreNames.contains(VERSIONS_STORE)) {
+        const vs = db.createObjectStore(VERSIONS_STORE, { keyPath: 'id' });
+        vs.createIndex('patternId', 'patternId', { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -99,6 +104,55 @@ export async function deletePattern(id: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     tx.objectStore(STORE_NAME).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// --- Local version history (named snapshots) ---------------------------------
+// Lets users keep named versions of a pattern entirely on-device — no login, no cloud. Each record
+// stores a full pattern snapshot under a generated id, indexed by the source pattern id.
+
+export interface VersionRecord {
+  id: string;
+  patternId: string;
+  versionNumber: number;
+  name: string;
+  savedAt: string;
+  snapshot: Pattern;
+}
+
+export async function saveVersion(patternId: string, name: string, snapshot: Pattern, versionNumber: number): Promise<VersionRecord> {
+  const db = await openDB();
+  const rec: VersionRecord = {
+    id: `ver_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
+    patternId, name, versionNumber,
+    savedAt: new Date().toISOString(),
+    snapshot: JSON.parse(JSON.stringify(snapshot))
+  };
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(VERSIONS_STORE, 'readwrite');
+    tx.objectStore(VERSIONS_STORE).put(rec);
+    tx.oncomplete = () => resolve(rec);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function listVersions(patternId: string): Promise<VersionRecord[]> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const idx = db.transaction(VERSIONS_STORE, 'readonly').objectStore(VERSIONS_STORE).index('patternId');
+    const req = idx.getAll(patternId);
+    req.onsuccess = () => resolve((req.result || []).sort((a: VersionRecord, b: VersionRecord) => b.savedAt.localeCompare(a.savedAt)));
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteVersion(id: string): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(VERSIONS_STORE, 'readwrite');
+    tx.objectStore(VERSIONS_STORE).delete(id);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

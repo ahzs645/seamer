@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Pattern, Layer } from '$lib/types/pattern';
+  import { layerRename, layerSetStyle, type LayerStyle } from '$lib/commands/structural';
 
   interface Props {
     currentPattern: Pattern;
@@ -8,6 +9,25 @@
 
   let { currentPattern, onchange }: Props = $props();
   let newLayerName = $state('');
+  let editingId = $state<string | null>(null);
+  let editName = $state('');
+  let styleId = $state<string | null>(null);
+
+  function startRename(layer: Layer) { editingId = layer.id; editName = layer.name; }
+  function commitRename() {
+    if (editingId && editName.trim()) onchange(layerRename(currentPattern, editingId, editName.trim()));
+    editingId = null;
+  }
+  function styleOf(layer: Layer): LayerStyle {
+    return (layer.style && typeof layer.style === 'object' ? layer.style : {}) as LayerStyle;
+  }
+  function setStyle(layerId: string, patch: Partial<LayerStyle>) {
+    const layer = currentPattern.layers.find((l) => l.id === layerId);
+    if (!layer) return;
+    const next = { ...styleOf(layer), ...patch };
+    onchange(layerSetStyle(currentPattern, layerId, next));
+  }
+  function clearStyle(layerId: string) { onchange(layerSetStyle(currentPattern, layerId, null)); }
 
   function toggleVisibility(layerId: string) {
     const layers = currentPattern.layers.map(l =>
@@ -85,7 +105,21 @@
         >
           {layer.visible ? '👁' : '🚫'}
         </button>
-        <span class="flex-1 truncate">{layer.name}</span>
+        {#if editingId === layer.id}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="input input-bordered input-xs flex-1 h-5"
+            bind:value={editName}
+            autofocus
+            onclick={(e) => e.stopPropagation()}
+            onkeydown={(e) => { if (e.key === 'Enter') commitRename(); else if (e.key === 'Escape') editingId = null; }}
+            onblur={commitRename}
+          />
+        {:else}
+          <span class="flex-1 truncate" ondblclick={(e) => { e.stopPropagation(); startRename(layer); }} role="textbox" tabindex="-1">{layer.name}</span>
+        {/if}
+        <button class="btn btn-xs btn-ghost px-1" title="Rename" onclick={(e: MouseEvent) => { e.stopPropagation(); startRename(layer); }} aria-label="Rename layer">✎</button>
+        <button class="btn btn-xs btn-ghost px-1" class:text-primary={styleId === layer.id} title="Layer style" onclick={(e: MouseEvent) => { e.stopPropagation(); styleId = styleId === layer.id ? null : layer.id; }} aria-label="Layer style">🎨</button>
         <button
           class="btn btn-xs btn-ghost px-1"
           class:text-error={layer.locked}
@@ -93,10 +127,34 @@
         >
           {layer.locked ? '🔒' : '🔓'}
         </button>
-        {#if currentPattern.layers.length > 1}
+        {#if currentPattern.layers.length > 1 && layer.id !== 'default'}
           <button class="btn btn-xs btn-ghost px-1 text-error" onclick={(e: MouseEvent) => { e.stopPropagation(); deleteLayer(layer.id); }}>✕</button>
         {/if}
       </div>
+      {#if styleId === layer.id}
+        {@const st = styleOf(layer)}
+        <div class="ml-6 mb-1 p-2 rounded bg-base-200 space-y-1">
+          <div class="flex items-center gap-2">
+            <span class="w-16">Color</span>
+            <input type="color" class="h-5 w-8 p-0 border-0 bg-transparent" value={st.color ?? '#000000'} onchange={(e) => setStyle(layer.id, { color: (e.currentTarget as HTMLInputElement).value })} />
+            <button class="btn btn-ghost btn-xs ml-auto" onclick={() => clearStyle(layer.id)}>Clear</button>
+          </div>
+          <label class="flex items-center gap-2">
+            <span class="w-16">Width</span>
+            <input type="range" min="0.5" max="4" step="0.5" class="range range-xs flex-1" value={st.lineWidth ?? 1} onchange={(e) => setStyle(layer.id, { lineWidth: +(e.currentTarget as HTMLInputElement).value })} />
+            <span class="w-6 text-right">{st.lineWidth ?? 1}</span>
+          </label>
+          <label class="flex items-center gap-2">
+            <span class="w-16">Opacity</span>
+            <input type="range" min="0.1" max="1" step="0.1" class="range range-xs flex-1" value={st.opacity ?? 1} onchange={(e) => setStyle(layer.id, { opacity: +(e.currentTarget as HTMLInputElement).value })} />
+            <span class="w-6 text-right">{st.opacity ?? 1}</span>
+          </label>
+          <label class="flex items-center gap-2">
+            <input type="checkbox" class="checkbox checkbox-xs" checked={st.dashed ?? false} onchange={(e) => setStyle(layer.id, { dashed: (e.currentTarget as HTMLInputElement).checked })} />
+            <span>Dashed</span>
+          </label>
+        </div>
+      {/if}
     {/each}
   </div>
 

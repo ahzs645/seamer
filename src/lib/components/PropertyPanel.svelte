@@ -8,6 +8,7 @@
     instantiateFromLibrary, syncFromLibrary, type LibraryStatus
   } from '$lib/stores/materialLibrary';
   import { MATERIAL_PRESETS, getPreset } from '$lib/data/materialPresets';
+  import { variableReorder, variableSetOptions, imageUpdate } from '$lib/commands/structural';
 
   interface Props {
     currentPattern: Pattern;
@@ -1024,9 +1025,10 @@
               <h6 class="border-b-2 border-base-200 font-semibold pb-1 mt-3">Variables</h6>
               <div class="border border-base-200 rounded-md bg-base-100 max-h-40 overflow-y-auto">
                 <ul>
-                  {#each currentPattern.variables as v}
+                  {#each currentPattern.variables as v, i (v.id)}
                     <li class="w-full flex items-center" class:bg-base-300={selectedVariableId === v.id}>
-                      <span class="material-symbols-rounded px-1 opacity-40 cursor-grab text-base">drag_handle</span>
+                      <button class="material-symbols-rounded px-1 opacity-50 hover:opacity-100 text-base disabled:opacity-20" disabled={i === 0} title="Move up" aria-label="Move variable up" onclick={() => onchange(variableReorder(currentPattern, v.id, i - 1), 'Reorder variable')}>keyboard_arrow_up</button>
+                      <button class="material-symbols-rounded px-1 opacity-50 hover:opacity-100 text-base disabled:opacity-20" disabled={i === currentPattern.variables.length - 1} title="Move down" aria-label="Move variable down" onclick={() => onchange(variableReorder(currentPattern, v.id, i + 1), 'Reorder variable')}>keyboard_arrow_down</button>
                       <button class="flex items-center gap-1 p-1 w-full text-left" onclick={() => (selectedVariableId = v.id)}>
                         <span class="material-symbols-rounded text-base">{VAR_TYPE_ICON[v.type] ?? 'tag'}</span>
                         <span class="truncate">{v.name || 'unnamed'}</span>
@@ -1055,6 +1057,21 @@
                   <label class="flex flex-col gap-0.5">Type
                     <select class="select select-bordered select-sm" value={v.type} onchange={(e) => updateVariable(v.id, { type: e.currentTarget.value })}>
                       <option value="number">Number</option><option value="boolean">Boolean</option><option value="enum">Enum</option><option value="string">String</option></select></label>
+                  {#if v.type === 'enum'}
+                    {@const opts = (v.options ?? []).map((o) => String(o))}
+                    <div class="flex flex-col gap-0.5">
+                      <span>Options</span>
+                      {#each opts as opt, oi}
+                        <span class="flex items-center gap-1">
+                          <input class="input input-bordered input-sm flex-1" value={opt}
+                            oninput={(e) => { const next = [...opts]; next[oi] = e.currentTarget.value; onchange(variableSetOptions(currentPattern, v.id, next), 'Edit variable options'); }} />
+                          <button class="btn btn-ghost btn-sm btn-square text-error" title="Remove option" aria-label="Remove option"
+                            onclick={() => onchange(variableSetOptions(currentPattern, v.id, opts.filter((_, k) => k !== oi)), 'Remove variable option')}>✕</button>
+                        </span>
+                      {/each}
+                      <button class="btn btn-ghost btn-sm self-start" onclick={() => onchange(variableSetOptions(currentPattern, v.id, [...opts, `Option ${opts.length + 1}`]), 'Add variable option')}>+ Add option</button>
+                    </div>
+                  {/if}
                   <label class="flex flex-col gap-0.5">Value
                     <span class="flex items-center gap-2">
                       <input type="number" class="input input-bordered input-sm flex-1" value={v.value ?? 0} oninput={(e) => updateVariable(v.id, { value: parseFloat(e.currentTarget.value) || 0, valueFormula: { ...v.valueFormula, formula: e.currentTarget.value } })} />
@@ -1135,9 +1152,14 @@
                       <label class="flex flex-col gap-0.5 text-[11px]">Color
                         <input type="color" class="w-full h-6 rounded border" value={t.color ?? '#1e293b'} oninput={(e) => updateText(t.id, { color: e.currentTarget.value })} /></label>
                     </div>
-                    <label class="flex flex-col gap-0.5 text-[11px]">Align
-                      <select class="select select-bordered select-xs" value={t.align ?? 'center'} onchange={(e) => updateText(t.id, { align: e.currentTarget.value as 'left' | 'center' | 'right' })}>
-                        <option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
+                    <div class="grid grid-cols-2 gap-1">
+                      <label class="flex flex-col gap-0.5 text-[11px]">Align
+                        <select class="select select-bordered select-xs" value={t.align ?? 'center'} onchange={(e) => updateText(t.id, { align: e.currentTarget.value as 'left' | 'center' | 'right' })}>
+                          <option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
+                      <label class="flex flex-col gap-0.5 text-[11px]">Layer
+                        <select class="select select-bordered select-xs" value={t.layerId ?? 'default'} onchange={(e) => updateText(t.id, { layerId: e.currentTarget.value })}>
+                          {#each currentPattern.layers as l (l.id)}<option value={l.id}>{l.name}</option>{/each}</select></label>
+                    </div>
                   </div>
                 {:else}<p class="opacity-60">No text yet. Use the Text tool (I) to place text on the canvas.</p>{/each}
               </div>
@@ -1150,9 +1172,9 @@
                       <div class="w-10 h-10 rounded border border-base-300 shrink-0 bg-base-200" style={`background-image:url('${im.url}');background-size:cover;background-position:center`}></div>
                       <div class="grid grid-cols-2 gap-1 flex-1">
                         <label class="flex flex-col gap-0.5 text-[11px]">Width (mm)
-                          <input type="number" min="1" step="1" class="input input-bordered input-xs" value={(im.width ?? 100).toFixed(0)} oninput={(e) => updateImage(im.id, { width: parseFloat(e.currentTarget.value) || 100 })} /></label>
+                          <input type="number" min="1" step="1" class="input input-bordered input-xs" value={(im.width ?? 100).toFixed(0)} oninput={(e) => onchange(imageUpdate(currentPattern, im.id, { width: parseFloat(e.currentTarget.value) || 100 }), 'Resize image')} /></label>
                         <label class="flex flex-col gap-0.5 text-[11px]">Height (mm)
-                          <input type="number" min="1" step="1" class="input input-bordered input-xs" value={(im.height ?? 100).toFixed(0)} oninput={(e) => updateImage(im.id, { height: parseFloat(e.currentTarget.value) || 100 })} /></label>
+                          <input type="number" min="1" step="1" class="input input-bordered input-xs" value={(im.height ?? 100).toFixed(0)} oninput={(e) => onchange(imageUpdate(currentPattern, im.id, { height: parseFloat(e.currentTarget.value) || 100 }), 'Resize image')} /></label>
                       </div>
                       <button class="btn btn-ghost btn-xs p-1 text-error" title="Delete image" aria-label="Delete image" onclick={() => removeImage(im.id)}><span class="material-symbols-rounded text-base">delete</span></button>
                     </div>
@@ -1161,6 +1183,13 @@
                         <input type="number" step="1" class="input input-bordered input-xs" value={im.rotation ?? 0} oninput={(e) => updateImage(im.id, { rotation: parseFloat(e.currentTarget.value) || 0 })} /></label>
                       <label class="flex flex-col gap-0.5 text-[11px]">Opacity
                         <input type="range" min="0" max="1" step="0.05" class="range range-xs" value={im.opacity ?? 1} oninput={(e) => updateImage(im.id, { opacity: parseFloat(e.currentTarget.value) })} /></label>
+                    </div>
+                    <div class="grid grid-cols-2 gap-1 items-center">
+                      <label class="flex items-center gap-1 text-[11px]"><input type="checkbox" class="checkbox checkbox-xs" checked={(im.lockAspect as boolean) ?? false} onchange={(e) => updateImage(im.id, { lockAspect: e.currentTarget.checked } as Partial<Img>)} /> Lock aspect</label>
+                      <label class="flex items-center gap-1 text-[11px]"><input type="checkbox" class="checkbox checkbox-xs" checked={(im.locked as boolean) ?? false} onchange={(e) => updateImage(im.id, { locked: e.currentTarget.checked } as Partial<Img>)} /> Lock (no drag)</label>
+                      <label class="flex flex-col gap-0.5 text-[11px] col-span-2">Layer
+                        <select class="select select-bordered select-xs" value={im.layerId ?? 'default'} onchange={(e) => updateImage(im.id, { layerId: e.currentTarget.value })}>
+                          {#each currentPattern.layers as l (l.id)}<option value={l.id}>{l.name}</option>{/each}</select></label>
                     </div>
                   </div>
                 {:else}<p class="opacity-60">No images. Use the Image tool (G) to place a reference image or logo.</p>{/each}
