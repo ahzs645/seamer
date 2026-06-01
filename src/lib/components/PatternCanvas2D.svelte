@@ -14,6 +14,7 @@
     pieceWorldOutline,
     pieceWorldInternalPolylines,
     pieceTransform,
+    pieceShrinkageScale,
     pieceInverseTransform,
     pieceCutCounts,
     piecePathPolyline,
@@ -28,6 +29,8 @@
     type PlacedPoint
   } from '$lib/utils/patternGeometry';
   import { deletePiece as deletePieceCascade } from '$lib/utils/patternMutations';
+  import * as ops from '$lib/utils/pathPointOps';
+  import { breakoutPiece, type BreakoutMode } from '$lib/utils/breakout';
 
   interface Props {
     currentPattern: Pattern;
@@ -244,7 +247,7 @@
       if (pp) { owner = { piece, pp }; break; }
     }
     if (!owner) return;
-    const tf = pieceTransform(owner.piece, points);
+    const tf = pieceTransform(owner.piece, points, pieceShrinkageScale(currentPattern, owner.piece));
     const poly = piecePathPolyline(owner.pp, paths, points, 4).map(tf);
     if (poly.length < 2) return;
 
@@ -523,7 +526,7 @@
       const outline = pieceWorldOutline(currentPattern, piece, paths, points, 4);
       if (outline.length < 2) continue;
 
-      const tf = pieceTransform(piece, points);
+      const tf = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
 
       if (isSelected) {
         // selected piece -> clean editable line-art (no fabric fill): each boundary edge
@@ -624,7 +627,7 @@
     // notches — short perpendicular ticks at their position along each main edge
     for (const piece of currentPattern.pieces) {
       if (piece.hidden) continue;
-      const tf = pieceTransform(piece, points);
+      const tf = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
       for (const pp of piece.mainPaths) {
         if (!pp.notches?.length) continue;
         const poly = piecePathPolyline(pp, paths, points, 4).map(tf);
@@ -671,7 +674,7 @@
     // drill holes / punch markers — placed inside each piece (piece-local → plan → canvas)
     for (const piece of currentPattern.pieces) {
       if (piece.hidden || !piece.markers?.length) continue;
-      const tf = pieceTransform(piece, points);
+      const tf = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
       c.strokeStyle = isDark ? '#cbd5e1' : '#1e293b';
       c.fillStyle = c.strokeStyle;
       c.lineWidth = 1.2; c.setLineDash([]);
@@ -851,7 +854,7 @@
     for (const id of [...(seamFirstEdge ? [seamFirstEdge] : []), ...seamMultiEdges]) {
       const owners = pieceOwnerOf(id);
       if (!owners) continue;
-      const tf = pieceTransform(owners.piece, points);
+      const tf = pieceTransform(owners.piece, points, pieceShrinkageScale(currentPattern, owners.piece));
       const poly = piecePathPolyline(owners.pp, paths, points, 4).map(tf);
       c.strokeStyle = PATH_MAGENTA; c.lineWidth = 3; c.setLineDash([]);
       tracePoly(c, poly, false); c.stroke();
@@ -1115,6 +1118,27 @@
         items.push({ label: `Scale ${n} points…`, icon: 'open_in_full', onClick: () => { const s = prompt('Scale selected points by percent:', '100'); if (s) scaleSelectedPoints(parseFloat(s) || 100); } });
         items.push({ label: 'Flip horizontal', icon: 'flip', onClick: () => flipSelectedPoints('h') });
         items.push({ label: 'Flip vertical', icon: 'flip', onClick: () => flipSelectedPoints('v') });
+      } else {
+        // single point → topology edits (port of the original right-click point ops)
+        const pid = ptHit.pointId;
+        const p = currentPattern;
+        const apply = (res: Pattern | null, msg: string) => { if (res) { onchange(res); toast(msg, 'success'); } else { toast('Operation not available here', 'error'); } };
+        if (ops.canConvertToCurvePoint(p, pid)) items.push({ label: 'Convert to curve point', icon: 'gesture', onClick: () => apply(ops.convertToCurvePoint(p, pid), 'Converted to curve point') });
+        if (ops.canConvertToSlidingPoint(p, pid)) items.push({ label: 'Convert to sliding point', icon: 'drag_pan', onClick: () => apply(ops.convertToSlidingPoint(p, pid), 'Converted to sliding point') });
+        if (ops.canSplitCurve(p, pid)) items.push({ label: 'Split into two curves', icon: 'call_split', onClick: () => apply(ops.splitCurveAtPoint(p, pid), 'Split curve') });
+        if (ops.canSplitLine(p, pid)) items.push({ label: 'Split into two lines', icon: 'call_split', onClick: () => apply(ops.splitLineAtPoint(p, pid), 'Split line') });
+        if (ops.canMergeCurves(p, pid)) items.push({ label: 'Merge into one curve', icon: 'arrow_and_edge', onClick: () => apply(ops.mergeCurvesAtPoint(p, pid), 'Merged curves') });
+        if (ops.canMergeLines(p, pid)) items.push({ label: 'Merge into one line', icon: 'arrow_and_edge', onClick: () => apply(ops.mergeLinesAtPoint(p, pid), 'Merged lines') });
+        if (ops.isSlidingPointAnywhere(p, pid)) {
+          const hosts = ops.slidingHostPaths(p, pid);
+          if (hosts.length > 1) hosts.forEach((h, i) => items.push({ label: `Release from ${h.name || `Path ${i + 1}`}`, icon: 'toggle_off', onClick: () => apply(ops.releaseSlidingPoint(p, pid, h.id), 'Released sliding point') }));
+          else items.push({ label: 'Release point from path', icon: 'toggle_off', onClick: () => apply(ops.releaseSlidingPoint(p, pid), 'Released sliding point') });
+        }
+        if (ops.canDisconnectPaths(p, pid)) {
+          const hosts = ops.disconnectHostPaths(p, pid);
+          if (hosts.length > 2) hosts.slice(1).forEach((h, i) => items.push({ label: `Disconnect ${h.name || `Path ${i + 2}`}`, icon: 'call_split', onClick: () => apply(ops.disconnectPaths(p, pid, h.id), 'Disconnected path') }));
+          else items.push({ label: 'Disconnect path', icon: 'call_split', onClick: () => apply(ops.disconnectPaths(p, pid), 'Disconnected path') });
+        }
       }
       items.push({ label: `Delete point${n > 1 ? 's' : ''}`, icon: 'delete', danger: true, sep: items.length > 0, onClick: () => {
         const ids = $selectedPointIds;
@@ -1172,6 +1196,16 @@
           .filter((l) => l.id !== (piece.layerId ?? 'default'))
           .map((l, i): MenuItem => ({ label: `Move to: ${l.name}`, icon: 'layers', sep: i === 0, onClick: () => moveToLayer(piece, l.id) })),
         { label: piece.hidden ? 'Show piece' : 'Hide piece', icon: piece.hidden ? 'visibility' : 'visibility_off', sep: true, onClick: () => togglePieceHidden(piece) },
+        ...([
+          ['Breakout: all', 'all'],
+          ['Breakout: seams', 'seams'],
+          ['Breakout: cut', 'cut'],
+          ['Breakout: internal lines', 'internal'],
+          ['Breakout: seams + internal', 'seamsInternal']
+        ] as [string, BreakoutMode][]).map(([label, m], i): MenuItem => ({
+          label, icon: 'copy_all', sep: i === 0,
+          onClick: () => { const res = breakoutPiece(currentPattern, piece.id, m); if (res) { onchange(res); toast('Broke out piece geometry', 'success'); } else { toast('Nothing to break out', 'error'); } }
+        })),
         { label: 'Delete', icon: 'delete', danger: true, sep: true, onClick: () => deletePiece(piece) }
       ]
     };
@@ -1430,7 +1464,7 @@
     let best: string | null = null, bestD = tol;
     for (const piece of currentPattern.pieces) {
       if (piece.hidden || !layerVisible(piece.layerId) || layerLocked(piece.layerId)) continue;
-      const tf = pieceTransform(piece, points);
+      const tf = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
       for (const pp of piece.mainPaths) {
         const poly = piecePathPolyline(pp, paths, points, 4).map(tf);
         for (let i = 1; i < poly.length; i++) {

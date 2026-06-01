@@ -3,7 +3,8 @@ import type { Pattern } from '$lib/types/pattern';
 
 const DB_NAME = 'seamer-patterns';
 const STORE_NAME = 'patterns';
-const DB_VERSION = 1;
+const HISTORY_STORE = 'history';
+const DB_VERSION = 2;
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -14,9 +15,51 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains(HISTORY_STORE)) {
+        db.createObjectStore(HISTORY_STORE, { keyPath: 'patternId' });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+  });
+}
+
+/** A persisted undo/redo history record for one pattern (whole-pattern snapshots + labels). */
+export interface HistoryRecord {
+  patternId: string;
+  undo: { pattern: Pattern; label: string }[];
+  redo: { pattern: Pattern; label: string }[];
+  savedAt: string;
+}
+
+export async function saveHistory(rec: Omit<HistoryRecord, 'savedAt'>): Promise<void> {
+  const db = await openDB();
+  // JSON round-trip strips Svelte $state proxies that IndexedDB's structured clone rejects.
+  const plain = JSON.parse(JSON.stringify({ ...rec, savedAt: new Date().toISOString() }));
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(HISTORY_STORE, 'readwrite');
+    tx.objectStore(HISTORY_STORE).put(plain);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function loadHistory(patternId: string): Promise<HistoryRecord | null> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(HISTORY_STORE, 'readonly').objectStore(HISTORY_STORE).get(patternId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteHistory(patternId: string): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(HISTORY_STORE, 'readwrite');
+    tx.objectStore(HISTORY_STORE).delete(patternId);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
   });
 }
 

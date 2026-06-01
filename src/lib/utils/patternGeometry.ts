@@ -272,9 +272,23 @@ export function pieceCutCounts(piece: Piece): { asIs: number; mirrored: number; 
 }
 
 /** Build the drafting-space → plan-space transform for a piece. */
+/**
+ * Per-piece shrinkage scale factors (about the piece origin, in the local frame). Returns {1,1}
+ * unless the piece opts in via `useMaterialScaling` AND its assigned material declares a non-zero
+ * shrinkage %. A material that shrinks h% is compensated by cutting (1 + h/100)× larger.
+ */
+export function pieceShrinkageScale(pattern: Pattern, piece: Piece): { x: number; y: number } {
+  if (!piece.useMaterialScaling) return { x: 1, y: 1 };
+  const mat = pattern.materials.find((m) => m.id === piece.materialId);
+  if (!mat) return { x: 1, y: 1 };
+  const f = (pct?: number) => (Number.isFinite(pct) && pct ? Math.max(0.0001, 1 + (pct as number) / 100) : 1);
+  return { x: f(mat.shrinkageHorizontalPercentage), y: f(mat.shrinkageVerticalPercentage) };
+}
+
 export function pieceTransform(
   piece: Piece,
-  points: Map<string, ConstrainablePoint>
+  points: Map<string, ConstrainablePoint>,
+  scale: { x: number; y: number } = { x: 1, y: 1 }
 ): Transform {
   const op = points.get(piece.originPoint);
   const ox = op ? op.x : 0;
@@ -287,8 +301,8 @@ export function pieceTransform(
   const px = piece.position?.x ?? 0;
   const py = piece.position?.y ?? 0;
   return (p: Vec2): Vec2 => {
-    const lx = (p.x - ox) * mx;
-    const ly = (p.y - oy) * my;
+    const lx = (p.x - ox) * mx * scale.x;
+    const ly = (p.y - oy) * my * scale.y;
     return { x: px + lx * cos - ly * sin, y: py + lx * sin + ly * cos };
   };
 }
@@ -305,7 +319,7 @@ export function pieceWorldOutline(
   points = indexPoints(pattern),
   spacingMm = 4
 ): Vec2[] {
-  return applyTransform(pieceOutline(pattern, piece, paths, points, spacingMm), pieceTransform(piece, points));
+  return applyTransform(pieceOutline(pattern, piece, paths, points, spacingMm), pieceTransform(piece, points, pieceShrinkageScale(pattern, piece)));
 }
 
 /** Internal piece paths (darts, fold lines) placed on the plan. */
@@ -316,7 +330,7 @@ export function pieceWorldInternalPolylines(
   points = indexPoints(pattern),
   spacingMm = 4
 ): Vec2[][] {
-  const t = pieceTransform(piece, points);
+  const t = pieceTransform(piece, points, pieceShrinkageScale(pattern, piece));
   return pieceInternalPolylines(pattern, piece, paths, points, spacingMm).map((poly) => applyTransform(poly, t));
 }
 
@@ -769,12 +783,13 @@ export function pieceAllowancePolygon(
   const baseMag = Math.abs(signedDist);
   const hasPerEdge = piece.mainPaths.some((pp) => pp.seamAllowance !== undefined && pp.seamAllowance !== baseMag);
 
+  const shrink = pieceShrinkageScale(pattern, piece);
   let outline: Vec2[];
   let allow: Vec2[];
   if (hasPerEdge) {
     const tagged = pieceOutlineTagged(pattern, piece, paths, points, spacingMm);
     if (tagged.pts.length < 3) return [];
-    const tf = pieceTransform(piece, points);
+    const tf = pieceTransform(piece, points, shrink);
     outline = tagged.pts.map(tf);
     const widthById = new Map(piece.mainPaths.map((pp) => [pp.id, inside * (pp.seamAllowance ?? baseMag)]));
     allow = offsetPolygonVariable(outline, (i) => widthById.get(tagged.edgeOf[i]) ?? inside * baseMag);
@@ -783,7 +798,7 @@ export function pieceAllowancePolygon(
     if (outline.length < 3) return [];
     allow = offsetPolygon(outline, signedDist);
   }
-  const tf = pieceTransform(piece, points);
+  const tf = pieceTransform(piece, points, shrink);
   const joins: { p: Vec2; join: CornerJoin }[] = [];
   for (const pp of piece.mainPaths) {
     const type = (pp.seamCornerJoinType ?? 'intersection') as CornerJoin['type'];

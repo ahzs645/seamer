@@ -658,6 +658,12 @@
               {:else}
                 <p class="opacity-70">Pattern default: {toUnit(currentPattern.seamAllowance).toFixed(2)} {unitLabel}</p>
               {/if}
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.useMaterialScaling ?? false}
+                onchange={(e) => updatePiece((p) => ({ ...p, useMaterialScaling: e.currentTarget.checked }), 'Use material shrinkage')} /> Use material shrinkage</label>
+              {#if piece.useMaterialScaling}
+                {@const mat = currentPattern.materials.find((m) => m.id === piece.materialId)}
+                <p class="opacity-70">Shrinkage: {(mat?.shrinkageHorizontalPercentage ?? 0)}% horizontal, {(mat?.shrinkageVerticalPercentage ?? 0)}% vertical</p>
+              {/if}
 
             {:else if s.id === 'orientation'}
               <label class="flex flex-col gap-0.5">Rotation (°)

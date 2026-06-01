@@ -34,6 +34,8 @@
       bendValue: 0,
       thickness: 0.5,
       weight: 150,
+      shrinkageHorizontalPercentage: 0,
+      shrinkageVerticalPercentage: 0,
       roughness: 0.8,
       metalness: 0.1,
       specularIntensity: 0.25,
@@ -94,6 +96,15 @@
             <label class="col-span-2">Weight (g/m²)
               <input type="number" class="input input-bordered input-xs w-full" value={mat.weight}
                 oninput={(e) => patch(mat.id, (m) => ({ ...m, weight: +e.currentTarget.value }))} /></label>
+          </div>
+          <div class="font-semibold mt-1 opacity-70">Material shrinkage</div>
+          <div class="grid grid-cols-2 gap-1">
+            <label>Horizontal (%)
+              <input type="number" step="0.1" class="input input-bordered input-xs w-full" value={mat.shrinkageHorizontalPercentage ?? 0}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, shrinkageHorizontalPercentage: +e.currentTarget.value }))} /></label>
+            <label>Vertical (%)
+              <input type="number" step="0.1" class="input input-bordered input-xs w-full" value={mat.shrinkageVerticalPercentage ?? 0}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, shrinkageVerticalPercentage: +e.currentTarget.value }))} /></label>
           </div>
           <button class="btn btn-xs btn-ghost w-full" onclick={() => (editingId = null)}>Done</button>
         </div>

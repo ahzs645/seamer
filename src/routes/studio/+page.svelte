@@ -10,7 +10,7 @@
   import MaterialPanel from '$lib/components/MaterialPanel.svelte';
   import SeamPanel from '$lib/components/SeamPanel.svelte';
   import ObjectBrowser from '$lib/components/ObjectBrowser.svelte';
-  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel } from '$lib/stores/pattern';
+  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel, restoreHistory } from '$lib/stores/pattern';
   import { loadPattern, savePattern as saveToDB } from '$lib/stores/localDB';
   import { EMPTY_PATTERN, type Pattern, type Piece, type ConstrainablePoint } from '$lib/types/pattern';
   import { isSimpleFormat, convertSimplePattern } from '$lib/utils/importSimplePattern';
@@ -153,7 +153,12 @@
       const id = $page.url.searchParams.get('id');
       if (id) {
         const loaded = await loadPattern(id);
-        if (loaded) { currentPattern = loaded; patternName = loaded.name; pushUndo(structuredClone(loaded), 'Open pattern'); }
+        if (loaded) {
+          currentPattern = loaded; patternName = loaded.name;
+          // restore this pattern's persisted undo/redo so Ctrl+Z survives reload; seed a baseline only if none.
+          const restored = await restoreHistory(id);
+          if (!restored) pushUndo(structuredClone(loaded), 'Open pattern');
+        }
         pattern.set(currentPattern);
       } else {
         await loadTemplate('simple-pants'); // auto-load a garment to drape

@@ -1,6 +1,7 @@
 import { writable, derived } from 'svelte/store';
 import type { Pattern } from '$lib/types/pattern';
 import { EMPTY_PATTERN } from '$lib/types/pattern';
+import { saveHistory, loadHistory, deleteHistory } from '$lib/stores/localDB';
 
 export const pattern = writable<Pattern>(structuredClone(EMPTY_PATTERN));
 
@@ -49,6 +50,57 @@ function refresh() {
   undoLabel.set(undoStack.length ? undoStack[undoStack.length - 1].label : null);
   redoLabel.set(redoStack.length ? redoStack[redoStack.length - 1].label : null);
   historyLabels.set(undoStack.map((e) => e.label));
+  schedulePersist();
+}
+
+// --- IndexedDB-backed persistence (survives reload) ---------------------------
+// The original studio persists its undo history per-pattern (chunk CY_eMlbS.js: a "history"
+// object store with per-entry + meta records). We keep the rebuild's two-stack snapshot model
+// but mirror it to IndexedDB under the active pattern id, debounced, capped to bound size.
+const PERSIST_LIMIT = 30; // most-recent entries persisted per stack (in-memory keeps HISTORY_LIMIT)
+let historyPatternId: string | null = null;
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let restoring = false;
+
+function schedulePersist() {
+  if (restoring || !historyPatternId || typeof indexedDB === 'undefined') return;
+  if (persistTimer) clearTimeout(persistTimer);
+  const id = historyPatternId;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    saveHistory({
+      patternId: id,
+      undo: undoStack.slice(-PERSIST_LIMIT),
+      redo: redoStack.slice(-PERSIST_LIMIT)
+    }).catch((e) => console.warn('Failed to persist history', e));
+  }, 800);
+}
+
+/** Bind the history to a pattern id and restore its persisted undo/redo (no-op if none). Returns
+ *  true when prior history was restored. Call when a pattern is opened. */
+export async function restoreHistory(patternId: string): Promise<boolean> {
+  historyPatternId = patternId;
+  if (typeof indexedDB === 'undefined') return false;
+  try {
+    const rec = await loadHistory(patternId);
+    if (rec && (rec.undo?.length || rec.redo?.length)) {
+      restoring = true;
+      undoStack = rec.undo ?? [];
+      redoStack = rec.redo ?? [];
+      restoring = false;
+      refresh();
+      return true;
+    }
+  } catch (e) {
+    console.warn('Failed to restore history', e);
+  }
+  return false;
+}
+
+/** Forget a pattern's persisted history (e.g. when the pattern is deleted). */
+export async function clearPersistedHistory(patternId: string): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  try { await deleteHistory(patternId); } catch (e) { console.warn('Failed to clear history store', e); }
 }
 
 /**

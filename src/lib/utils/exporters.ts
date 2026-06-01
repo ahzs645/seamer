@@ -3,7 +3,7 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import {
-  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, pieceTransform, type Vec2
+  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, pieceTransform, pieceShrinkageScale, type Vec2
 } from './patternGeometry';
 
 type Layer = 'pattern' | 'seam-allowance' | 'internal' | 'marker';
@@ -29,7 +29,7 @@ function collectPolylines(pattern: Pattern): Poly[] {
     }
     // drill holes / punch markers → small circle (drill) or cross (punch)
     if (piece.markers?.length) {
-      const tf = pieceTransform(piece, points);
+      const tf = pieceTransform(piece, points, pieceShrinkageScale(pattern, piece));
       for (const m of piece.markers) {
         const w = tf({ x: m.x, y: m.y });
         if (m.type === 'drill') {

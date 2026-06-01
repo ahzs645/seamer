@@ -190,6 +190,7 @@ export interface Piece {
   mirrorY: boolean;
   seamAllowanceInside: boolean;
   seamAllowance?: number; // mm — per-piece override of pattern.seamAllowance (undefined => pattern default)
+  useMaterialScaling?: boolean; // when true, scale this piece by its material's shrinkage % (cut compensation)
   mainPaths: PiecePath[]; // ordered boundary loop
   internalPaths: PiecePath[]; // darts / internal seams / fold lines
   markers?: PieceMarker[]; // drill holes / punch markers (piece-local mm)
@@ -222,6 +223,11 @@ export interface Material {
   bendValue: number;
   thickness: number; // mm
   weight: number; // g/m²
+  // shrinkage compensation: fabric shrinks by this % after washing/pressing, so pieces cut from
+  // it are scaled UP by this amount (about the piece origin) when the piece opts in via
+  // `useMaterialScaling`. Horizontal = weft/width, vertical = warp/length. Undefined => 0%.
+  shrinkageHorizontalPercentage?: number;
+  shrinkageVerticalPercentage?: number;
   // PBR params:
   roughness: number;
   metalness: number;
