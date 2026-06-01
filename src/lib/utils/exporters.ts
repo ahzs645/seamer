@@ -158,6 +158,88 @@ export function patternToPNG(pattern: Pattern, maxPx = 2000, marginPx = 40): Pro
   return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
 }
 
+// --- Tiled multi-page print (true scale, assembly tiling) ------------------------------------
+export interface TileOpts {
+  pageWmm?: number; // 210 = A4 portrait, 216 = Letter
+  pageHmm?: number; // 297 = A4, 279 = Letter
+  marginMm?: number;
+  overlapMm?: number; // shared band between adjacent tiles for gluing
+  title?: string;
+}
+interface TileItem { pts: Vec2[]; closed: boolean; dashed: boolean }
+
+/** Build a printable multi-page HTML where the content is tiled at 1:1 scale across pages. */
+function tiledPagesHTML(items: TileItem[], b: { minX: number; minY: number; maxX: number; maxY: number }, yUp: boolean, opts: TileOpts): string {
+  const pageW = opts.pageWmm ?? 210, pageH = opts.pageHmm ?? 297;
+  const margin = opts.marginMm ?? 8, overlap = opts.overlapMm ?? 6;
+  const pw = pageW - margin * 2, ph = pageH - margin * 2;
+  const strideX = Math.max(10, pw - overlap), strideY = Math.max(10, ph - overlap);
+  const contentW = Math.max(1, b.maxX - b.minX), contentH = Math.max(1, b.maxY - b.minY);
+  const cols = Math.max(1, Math.ceil(contentW / strideX));
+  const rows = Math.max(1, Math.ceil(contentH / strideY));
+
+  const pages: string[] = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const xStart = b.minX + c * strideX;
+      const yTop = yUp ? b.maxY - r * strideY : b.minY + r * strideY;
+      const px = (x: number) => margin + (x - xStart);
+      const py = (y: number) => margin + (yUp ? yTop - y : y - yTop);
+      const paths = items.map((it) => {
+        const d = it.pts.map((v, i) => `${i === 0 ? 'M' : 'L'}${px(v.x).toFixed(2)},${py(v.y).toFixed(2)}`).join(' ') + (it.closed ? ' Z' : '');
+        const dash = it.dashed ? ' stroke-dasharray="3,2"' : '';
+        return `<path d="${d}" fill="none" stroke="#000" stroke-width="0.4"${dash}/>`;
+      }).join('');
+      // printable border, corner ticks, overlap seam guides, page label
+      const more = (c < cols - 1) || (r < rows - 1) || c > 0 || r > 0;
+      const seamGuides =
+        (c < cols - 1 ? `<line x1="${(margin + pw).toFixed(1)}" y1="${margin}" x2="${(margin + pw).toFixed(1)}" y2="${(margin + ph).toFixed(1)}" stroke="#0ea5e9" stroke-width="0.3" stroke-dasharray="2,2"/>` : '') +
+        (r < rows - 1 ? `<line x1="${margin}" y1="${(margin + ph).toFixed(1)}" x2="${(margin + pw).toFixed(1)}" y2="${(margin + ph).toFixed(1)}" stroke="#0ea5e9" stroke-width="0.3" stroke-dasharray="2,2"/>` : '');
+      const tick = (x: number, y: number) => `<path d="M${x - 3},${y} L${x + 3},${y} M${x},${y - 3} L${x},${y + 3}" stroke="#000" stroke-width="0.3"/>`;
+      const ticks = tick(margin, margin) + tick(margin + pw, margin) + tick(margin, margin + ph) + tick(margin + pw, margin + ph);
+      const label = `<text x="${(margin + 2).toFixed(1)}" y="${(margin + 5).toFixed(1)}" font-size="4" fill="#94a3b8">R${r + 1}·C${c + 1} of ${rows}×${cols}${more ? '' : ''}</text>`;
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${pageW}mm" height="${pageH}mm" viewBox="0 0 ${pageW} ${pageH}">` +
+        `<rect x="${margin}" y="${margin}" width="${pw}" height="${ph}" fill="none" stroke="#cbd5e1" stroke-width="0.2"/>` +
+        `<clipPath id="clip"><rect x="${margin}" y="${margin}" width="${pw}" height="${ph}"/></clipPath>` +
+        `<g clip-path="url(#clip)">${paths}</g>${seamGuides}${ticks}${label}</svg>`;
+      pages.push(`<div class="page">${svg}</div>`);
+    }
+  }
+  return `<!doctype html><html><head><title>${opts.title ?? 'Tiled pattern'}</title>` +
+    `<style>@page{size:${pageW}mm ${pageH}mm;margin:0}body{margin:0}` +
+    `.page{width:${pageW}mm;height:${pageH}mm;page-break-after:always;overflow:hidden}` +
+    `.page:last-child{page-break-after:auto}svg{display:block}</style></head><body>` +
+    pages.join('') +
+    `<script>window.onload=function(){window.focus();window.print();}<\/script></body></html>`;
+}
+
+function openPrintDoc(html: string) {
+  const w = window.open('', '_blank', 'width=900,height=700');
+  if (!w) return;
+  w.document.write(html);
+  w.document.close();
+}
+
+/** Tiled multi-page print of the flat pattern at true (1:1) scale. */
+export function printPatternTiled(pattern: Pattern, opts: TileOpts = {}) {
+  const polys = collectPolylines(pattern);
+  if (!polys.length) return;
+  const b = bounds(polys);
+  const items: TileItem[] = polys.map((p) => ({ pts: p.pts, closed: p.closed, dashed: p.layer !== 'pattern' }));
+  openPrintDoc(tiledPagesHTML(items, b, true, { ...opts, title: opts.title ?? 'Pattern (tiled)' }));
+}
+
+/** Tiled multi-page print of a nested cutting marker at true scale. */
+export function printMarkerTiled(layout: { placements: { poly: Vec2[]; outline: Vec2[] }[]; fabricWidthMm: number; usedLengthMm: number }, opts: TileOpts = {}) {
+  const items: TileItem[] = [];
+  for (const pl of layout.placements) {
+    items.push({ pts: pl.poly, closed: true, dashed: true });
+    items.push({ pts: pl.outline, closed: true, dashed: false });
+  }
+  const b = { minX: 0, minY: 0, maxX: layout.fabricWidthMm, maxY: layout.usedLengthMm };
+  openPrintDoc(tiledPagesHTML(items, b, false, { ...opts, title: opts.title ?? 'Marker (tiled)' }));
+}
+
 /** Open the pattern's SVG in a new window and invoke the browser's print dialog. */
 export function printPattern(pattern: Pattern, title = 'Pattern') {
   const svg = patternToSVG(pattern);

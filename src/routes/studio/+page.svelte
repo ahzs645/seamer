@@ -20,7 +20,8 @@
   import GradingOverlay from '$lib/components/GradingOverlay.svelte';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { confirm } from '$lib/stores/confirm';
-  import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern } from '$lib/utils/exporters';
+  import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printPatternTiled, printMarkerTiled } from '$lib/utils/exporters';
+  import { nestPieces, markerToSVG } from '$lib/utils/markerLayout';
   import { dxfToPattern, svgToPattern } from '$lib/utils/patternImport';
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
@@ -227,6 +228,23 @@
   }
 
   function doPrint() { printPattern(currentPattern, patternName || 'Pattern'); }
+  function doPrintTiled() { printPatternTiled(currentPattern, { title: patternName || 'Pattern' }); }
+  function exportMarker() {
+    const base = patternName.replace(/\s+/g, '_') || 'pattern';
+    const widthStr = prompt('Fabric width (mm)?', '1400');
+    if (widthStr === null) return;
+    const layout = nestPieces(currentPattern, parseFloat(widthStr) || 1400);
+    if (!layout.placements.length) { toastError('No pieces to nest'); return; }
+    downloadText(`${base}_marker.svg`, markerToSVG(layout), 'image/svg+xml');
+    toastSuccess(`Marker: ${layout.placements.length} pieces · ${Math.round(layout.usedLengthMm)}mm long`);
+  }
+  function doPrintMarker() {
+    const widthStr = prompt('Fabric width (mm)?', '1400');
+    if (widthStr === null) return;
+    const layout = nestPieces(currentPattern, parseFloat(widthStr) || 1400);
+    if (!layout.placements.length) { toastError('No pieces to nest'); return; }
+    printMarkerTiled(layout, { title: (patternName || 'Pattern') + ' — marker' });
+  }
 
   /** Parse imported text by extension into a Pattern (shared by the file picker + sample loader). */
   function parseImport(text: string, ext: string | undefined, name: string): Pattern {
@@ -458,7 +476,11 @@
           <li><button onclick={() => exportAs('dxf')}>DXF</button></li>
           <li><button onclick={exportPNG}>PNG</button></li>
           <li><button onclick={() => exportAs('csv')}>CSV (points)</button></li>
-          <li><button onclick={doPrint}>Print…</button></li>
+          <li class="menu-title pt-2">Cutting</li>
+          <li><button onclick={exportMarker}>Marker / nest (SVG)</button></li>
+          <li><button onclick={doPrintMarker}>Print marker (tiled)…</button></li>
+          <li><button onclick={doPrintTiled}>Print pattern (tiled)…</button></li>
+          <li><button onclick={doPrint}>Print (single page)…</button></li>
         </ul>
       </div>
       <button class="btn btn-ghost btn-xs" onclick={handleNew}>New</button>
