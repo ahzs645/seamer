@@ -21,7 +21,7 @@
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { confirm } from '$lib/stores/confirm';
   import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printPatternTiled, printMarkerTiled } from '$lib/utils/exporters';
-  import { nestPieces, markerToSVG } from '$lib/utils/markerLayout';
+  import { nestPieces, markerToSVG, type CutOffType } from '$lib/utils/markerLayout';
   import { dxfToPattern, svgToPattern } from '$lib/utils/patternImport';
   import { cutToPattern } from '$lib/utils/cutImport';
   import { seamlyToPattern } from '$lib/utils/seamlyImport';
@@ -242,7 +242,11 @@
     if (widthStr === null) return;
     const layout = nestPieces(currentPattern, parseFloat(widthStr) || 1400);
     if (!layout.placements.length) { toastError('No pieces to nest'); return; }
-    downloadText(`${base}_marker.svg`, markerToSVG(layout), 'image/svg+xml');
+    const coStr = (prompt('Cut-off boundary? none / box / convex / concave', 'none') || 'none').trim().toLowerCase();
+    const cutOff: CutOffType = coStr.startsWith('box') ? 'boundingBox'
+      : coStr.startsWith('convex') ? 'convexHull'
+      : coStr.startsWith('concave') ? 'concaveHull' : 'none';
+    downloadText(`${base}_marker.svg`, markerToSVG(layout, cutOff), 'image/svg+xml');
     toastSuccess(`Marker: ${layout.placements.length} pieces · ${Math.round(layout.usedLengthMm)}mm long`);
   }
   function doPrintMarker() {

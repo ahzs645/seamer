@@ -7,8 +7,11 @@ const SAFE = /^[\w\s+\-*/().,%]*$/;
 export function evalExpr(expr: string, scope: Record<string, number>): number | null {
   // The source wraps variable/path refs in braces — `{var_id}+4`, `{Path_id.length}`. They carry no
   // arithmetic meaning, so drop them before evaluating (otherwise the SAFE check rejects the formula).
-  const src = (expr ?? '').replace(/[{}]/g, '').trim();
+  let src = (expr ?? '').replace(/[{}]/g, '').trim();
   if (!src) return null;
+  // `body.<field>` measurement tokens: the field is also bound by its bare name in scope, but the
+  // dotted form isn't a valid JS identifier, so substitute its value inline. No-op when absent.
+  if (src.includes('body.')) src = src.replace(/\bbody\.([A-Za-z_$][\w$]*)\b/g, (m, field) => (field in scope ? String(scope[field]) : m));
   if (!SAFE.test(src)) return null;
   // only valid JS identifiers can be bound as function args
   const names = Object.keys(scope).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n));

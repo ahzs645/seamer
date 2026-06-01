@@ -923,6 +923,7 @@
                   oninput={(e) => updateSettings3D({ gravity: [currentPattern.settings3d.gravity[0], parseFloat(e.currentTarget.value) || 0, currentPattern.settings3d.gravity[2]] })} /></label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.handleSelfCollisions} onchange={(e) => updateSettings3D({ handleSelfCollisions: e.currentTarget.checked })} /> Self-collisions</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.forceLowEndHardware} onchange={(e) => updateSettings3D({ forceLowEndHardware: e.currentTarget.checked })} /> Force low-end hardware</label>
+              <label class="flex items-center gap-2" title="Experimental: also drape an X-mirrored copy of each left/right-paired piece"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.drapeMirroredPieces ?? false} onchange={(e) => updateSettings3D({ drapeMirroredPieces: e.currentTarget.checked })} /> Drape mirrored pieces (experimental)</label>
               <hr class="border-base-200" />
               <span class="text-xs font-semibold opacity-70">Overlays</span>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.showArrangementPoints} onchange={(e) => updateSettings3D({ showArrangementPoints: e.currentTarget.checked })} /> Arrangement points</label>

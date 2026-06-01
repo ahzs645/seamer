@@ -154,6 +154,18 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
   // mirror instances are needed. (Seam `mirrored` refs to reflected edges are matched to the base
   // edge below; the saved/arranged drape keeps the panels joined.)
   const instances: Instance[] = arranged.map((ap, pi) => ({ ap, mirror: false, pieceIndex: pi }));
+  // Experimental (opt-in via settings3d.drapeMirroredPieces): also drape an X-mirrored instance of
+  // each piece cut as a left/right pair (leftPieces > 0). Its seam edges register under `#M` keys
+  // (see below), so seam refs with `mirrored:true` sew to it. Additive — when the flag is off this
+  // loop emits nothing and the drape is identical to one-instance-per-piece.
+  if (pattern.settings3d.drapeMirroredPieces) {
+    const mirrors: Instance[] = [];
+    for (let pi = 0; pi < arranged.length; pi++) {
+      const owner = pattern.pieces.find((p) => p.id === arranged[pi].cloth.pieceId);
+      if (owner && (owner.leftPieces ?? 0) > 0) mirrors.push({ ap: arranged[pi], mirror: true, pieceIndex: pi });
+    }
+    instances.push(...mirrors);
+  }
 
   let total = 0;
   for (const inst of instances) total += inst.ap.cloth.mesh.points.length;
@@ -277,8 +289,11 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
       bendTargetAngle.push(0); // no internal fold lines in these pieces -> distance-mode bending
     }
 
+    // Base instance registers edgeKey as-is; the mirror instance registers `${edgeKey}#M`, which is
+    // exactly what chain() looks up for a seam ref with `mirrored:true`. Same base pieceId, distinct
+    // key suffix → the mirror's edges never overwrite the base instance's registration.
     for (const [edgeKey, locals] of ap.cloth.edgeParticles) {
-      edgeParticlesGlobal.set(key(ap.cloth.pieceId, edgeKey), locals.map((li) => offset + li));
+      edgeParticlesGlobal.set(key(ap.cloth.pieceId, inst.mirror ? `${edgeKey}#M` : edgeKey), locals.map((li) => offset + li));
     }
     instBoundaryGlobals.push((ap.boundaryLocal ?? []).map((li) => offset + li));
 

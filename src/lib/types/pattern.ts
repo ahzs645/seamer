@@ -292,6 +292,13 @@ export interface PatternSettings3D {
   forceLowEndHardware: boolean;
   handleSelfCollisions: boolean;
   debugFocusPoint: boolean;
+  /**
+   * Experimental: also drape a mirrored 3D instance of each piece cut as a left/right pair
+   * (`leftPieces > 0`). Off by default — when off the 3D drape is unchanged (one instance per piece).
+   * Mirror instances register their seam edges under `#M` keys, so seam refs with `mirrored: true`
+   * connect to them. Unverified against the live GPU sim; enable per pattern to try it.
+   */
+  drapeMirroredPieces?: boolean;
 }
 
 /** A graded size: a proportional scale (about each piece origin) + a swatch colour. */

@@ -7,6 +7,7 @@ import type { Pattern } from '$lib/types/pattern';
 import {
   indexPaths, indexPoints, pieceWorldOutline, pieceAllowancePolygon, pieceCutCounts, type Vec2
 } from './patternGeometry';
+import { boundingBox, convexHull, concaveHull } from './hull';
 
 export interface Placement {
   pieceId: string;
@@ -89,12 +90,38 @@ export function nestPieces(pattern: Pattern, fabricWidthMm = 1400, gapMm = 10): 
   return { fabricWidthMm, usedLengthMm: usedLength, gapMm, placements };
 }
 
+/**
+ * Cut-off boundary type — the wrap shape drawn around all placed pieces for cutting, mirroring the
+ * original studio's cutting-room "cut-off type" (ConvexHull / ConcaveHull / BoundingBox). `'none'`
+ * skips it. ConcaveHull hugs the pieces more tightly than the convex hull, saving fabric.
+ */
+export type CutOffType = 'none' | 'boundingBox' | 'convexHull' | 'concaveHull';
+
+/**
+ * Boundary polygon wrapping every placed piece's cut polygon, by the chosen cut-off type. Returns a
+ * closed polygon (last point === first) in marker space, or [] for `'none'`/empty layouts.
+ * `concavity` (≥1) tunes the concave hull: larger → closer to the convex hull.
+ */
+export function markerCutOff(layout: MarkerLayout, type: CutOffType, concavity = 2): Vec2[] {
+  if (type === 'none') return [];
+  const pts: Vec2[] = [];
+  for (const pl of layout.placements) for (const p of pl.poly) pts.push(p);
+  if (pts.length < 3) return [];
+  if (type === 'boundingBox') return boundingBox(pts);
+  if (type === 'convexHull') { const h = convexHull(pts); return h.length ? [...h, h[0]] : []; }
+  return concaveHull(pts, concavity);
+}
+
 /** Render a nesting layout as a true-scale SVG (mm), fabric outlined, pieces labelled. */
-export function markerToSVG(layout: MarkerLayout): string {
+export function markerToSVG(layout: MarkerLayout, cutOff: CutOffType = 'none'): string {
   const W = layout.fabricWidthMm;
   const H = Math.max(layout.usedLengthMm, 50);
   const path = (poly: Vec2[], closed = true) =>
     poly.map((v, i) => `${i === 0 ? 'M' : 'L'}${v.x.toFixed(2)},${v.y.toFixed(2)}`).join(' ') + (closed ? ' Z' : '');
+  const cut = markerCutOff(layout, cutOff);
+  const cutSVG = cut.length >= 3
+    ? `  <path d="${path(cut, false)}" fill="none" stroke="#ef4444" stroke-width="0.8" stroke-dasharray="6,3"/>\n`
+    : '';
   const body = layout.placements.map((pl) => {
     const cx = pl.poly.reduce((s, p) => s + p.x, 0) / (pl.poly.length || 1);
     const cy = pl.poly.reduce((s, p) => s + p.y, 0) / (pl.poly.length || 1);
@@ -107,6 +134,6 @@ export function markerToSVG(layout: MarkerLayout): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${W.toFixed(1)}mm" height="${H.toFixed(1)}mm" viewBox="0 0 ${W.toFixed(1)} ${H.toFixed(1)}">
   <rect x="0" y="0" width="${W.toFixed(1)}" height="${H.toFixed(1)}" fill="none" stroke="#0ea5e9" stroke-width="0.6"/>
-${body}
+${cutSVG}${body}
 </svg>`;
 }

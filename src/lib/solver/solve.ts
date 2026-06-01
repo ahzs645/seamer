@@ -104,14 +104,90 @@ function subLengths(formula: string, unit: string, solved: Map<string, Pt>, path
   return ok ? r : null;
 }
 
+// --- Geometric-reference tokens (the formula picker's Point coordinates / Point angles / Curve
+// handles categories). These resolve against already-solved geometry, so they return null when a
+// referenced point/path isn't solved yet (the solver retries on the next sweep, exactly like path
+// `.length`). All are no-ops on formulas that don't contain them, so existing formulas are unchanged.
+
+const RAD2DEG = 180 / Math.PI;
+/** The BezierHandle on `pointId` within `pathId`, if any. */
+function handleOf(pathById: Map<string, ConstrainablePath>, pathId: string, pointId: string): BezierHandle | undefined {
+  return pathById.get(pathId)?.pathPoints.find((pp) => pp.id === pointId)?.handle;
+}
+/** Tangent direction (deg) of `pathId` at `pointId`: outgoing handle if any, else toward the next (or previous) point. */
+function pointTangentDeg(path: ConstrainablePath | undefined, pointId: string, solved: Map<string, Pt>): number | null {
+  if (!path) return null;
+  const idx = path.pathPoints.findIndex((pp) => pp.id === pointId);
+  if (idx < 0) return null;
+  const cur = solved.get(pointId); if (!cur) return null;
+  const h = path.pathPoints[idx].handle;
+  if (h?.v2 && (h.v2.x || h.v2.y)) return Math.atan2(h.v2.y, h.v2.x) * RAD2DEG;
+  const nxt = idx + 1 < path.pathPoints.length ? solved.get(path.pathPoints[idx + 1].id) : undefined;
+  if (nxt) return Math.atan2(nxt.y - cur.y, nxt.x - cur.x) * RAD2DEG;
+  const prv = idx - 1 >= 0 ? solved.get(path.pathPoints[idx - 1].id) : undefined;
+  if (prv) return Math.atan2(cur.y - prv.y, cur.x - prv.x) * RAD2DEG;
+  return null;
+}
+
+/**
+ * Substitute length-like geometric tokens (expressed in `unit`): curve-handle lengths
+ * `Path.Point.handle.length` / `.length2` (v1 / v2 vector magnitude) and point coordinates
+ * `Point.x` / `Point.y`. Must run BEFORE subLengths so handle tokens are consumed before the bare
+ * `.length` regex sees them. Returns null if any reference is unresolved; unchanged if none present.
+ */
+function subGeometryLengths(formula: string, unit: string, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): string | null {
+  let f = formula.replace(/[{}]/g, '');
+  let ok = true;
+  const toUnit = (mm: number) => String(mm / unitToMm(unit));
+  // handle vector lengths (4-segment) first
+  f = f.replace(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\.handle\.length2\b/g, (_m, pa, pt) => {
+    const h = handleOf(pathById, pa, pt); if (!h) { ok = false; return '0'; } return toUnit(Math.hypot(h.v2.x, h.v2.y));
+  });
+  f = f.replace(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\.handle\.length\b/g, (_m, pa, pt) => {
+    const h = handleOf(pathById, pa, pt); if (!h) { ok = false; return '0'; } return toUnit(Math.hypot(h.v1.x, h.v1.y));
+  });
+  // point coordinates (mm) — x/y are absolute drafting coords
+  f = f.replace(/([A-Za-z_$][\w$]*)\.([xy])\b/g, (_m, id, axis) => {
+    const p = solved.get(id); if (!p) { ok = false; return '0'; } return toUnit(axis === 'x' ? p.x : p.y);
+  });
+  return ok ? f : null;
+}
+
+/**
+ * Substitute angle-like geometric tokens (degrees): curve-handle angles `Path.Point.handle.angle` /
+ * `.angle2` and per-point path tangents `Path.Point.angle`. Must run BEFORE the bare `.angle` regex
+ * so these are consumed first. Returns null if unresolved; unchanged if none present.
+ */
+function subGeometryAngles(formula: string, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): string | null {
+  let f = formula;
+  let ok = true;
+  f = f.replace(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\.handle\.angle2\b/g, (_m, pa, pt) => {
+    const h = handleOf(pathById, pa, pt); if (!h) { ok = false; return '0'; } return String(Math.atan2(h.v2.y, h.v2.x) * RAD2DEG);
+  });
+  f = f.replace(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\.handle\.angle\b/g, (_m, pa, pt) => {
+    const h = handleOf(pathById, pa, pt); if (!h) { ok = false; return '0'; } return String(Math.atan2(h.v1.y, h.v1.x) * RAD2DEG);
+  });
+  // per-point path tangent (2-segment): Path.Point.angle
+  f = f.replace(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\.angle\b/g, (_m, pa, pt) => {
+    const a = pointTangentDeg(pathById.get(pa), pt, solved); if (a === null) { ok = false; return '0'; } return String(a);
+  });
+  return ok ? f : null;
+}
+
 function evalLen(formula: string, unit: string, scope: Scope, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): number | null {
-  const sub = subLengths(formula, unit, solved, pathById);
+  const geo = subGeometryLengths(formula, unit, solved, pathById);
+  if (geo === null) return null;
+  const sub = subLengths(geo, unit, solved, pathById);
   if (sub === null) return null;
   const r = evalExpr(sub, scope);
   return r === null ? null : r * unitToMm(unit);
 }
 function evalAngleDeg(formula: string, unit: string | undefined, scope: Scope, solved: Map<string, Pt>, pathById: Map<string, ConstrainablePath>): number | null {
-  let f = subLengths(formula, 'mm', solved, pathById); // any path-length ref in an angle stays in mm
+  let f: string | null = subGeometryLengths(formula, 'mm', solved, pathById); // handle lengths / point coords stay in mm
+  if (f === null) return null;
+  f = subLengths(f, 'mm', solved, pathById); // any path-length ref in an angle stays in mm
+  if (f === null) return null;
+  f = subGeometryAngles(f, solved, pathById); // handle angles + per-point tangents (consumed before bare .angle)
   if (f === null) return null;
   if (/\.angle/.test(f)) {
     // `PathId.angle` → the path's direction (first→last endpoint), in degrees
