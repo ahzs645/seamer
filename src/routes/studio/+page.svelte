@@ -10,7 +10,7 @@
   import MaterialPanel from '$lib/components/MaterialPanel.svelte';
   import SeamPanel from '$lib/components/SeamPanel.svelte';
   import ObjectBrowser from '$lib/components/ObjectBrowser.svelte';
-  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo } from '$lib/stores/pattern';
+  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel } from '$lib/stores/pattern';
   import { loadPattern, savePattern as saveToDB } from '$lib/stores/localDB';
   import { EMPTY_PATTERN, type Pattern, type Piece, type ConstrainablePoint } from '$lib/types/pattern';
   import { isSimpleFormat, convertSimplePattern } from '$lib/utils/importSimplePattern';
@@ -150,7 +150,7 @@
       const id = $page.url.searchParams.get('id');
       if (id) {
         const loaded = await loadPattern(id);
-        if (loaded) { currentPattern = loaded; patternName = loaded.name; pushUndo(structuredClone(loaded)); }
+        if (loaded) { currentPattern = loaded; patternName = loaded.name; pushUndo(structuredClone(loaded), 'Open pattern'); }
         pattern.set(currentPattern);
       } else {
         await loadTemplate('simple-pants'); // auto-load a garment to drape
@@ -167,8 +167,8 @@
     return () => { clearInterval(autoSaveTimer); window.removeEventListener('beforeunload', handler); };
   });
 
-  function handlePatternUpdate(updated: Pattern) {
-    if (JSON.stringify(currentPattern) !== JSON.stringify(updated)) pushUndo($state.snapshot(currentPattern) as Pattern);
+  function handlePatternUpdate(updated: Pattern, label = 'Edit') {
+    if (JSON.stringify(currentPattern) !== JSON.stringify(updated)) pushUndo($state.snapshot(currentPattern) as Pattern, label);
     // live re-draft: recompute formula-constrained points from variables/measurements.
     // Frozen during alteration edit mode so manual point drags stick (they become the captured delta).
     if (hasConstraints(updated) && !alterationEdit) {
@@ -237,7 +237,7 @@
   }
 
   function applyImported(data: Pattern) {
-    currentPattern = data; patternName = data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
+    currentPattern = data; patternName = data.name; pattern.set(data); pushUndo(structuredClone(data), 'Import pattern'); saved = true;
     toastSuccess(`Imported "${data.name}"`);
   }
 
@@ -279,7 +279,7 @@
       });
       if (!ok) return;
     }
-    currentPattern = structuredClone(EMPTY_PATTERN); patternName = 'New Pattern'; pattern.set(currentPattern); pushUndo(structuredClone(EMPTY_PATTERN)); saved = true;
+    currentPattern = structuredClone(EMPTY_PATTERN); patternName = 'New Pattern'; pattern.set(currentPattern); pushUndo(structuredClone(EMPTY_PATTERN), 'New pattern'); saved = true;
     toastSuccess('Scene cleared');
   }
 
@@ -310,10 +310,10 @@
       data = normalizePattern(data);
       // recover parametric constructions from the baked template (no-op if already constrained / not recoverable)
       data = makeParametric(data);
-      currentPattern = data; patternName = tpl.name || data.name; pattern.set(data); pushUndo(structuredClone(data)); saved = true;
+      currentPattern = data; patternName = tpl.name || data.name; pattern.set(data); pushUndo(structuredClone(data), 'Load template'); saved = true;
     } catch {
       currentPattern = { ...EMPTY_PATTERN, name: tpl.name, description: tpl.description, enable3d: true, viewMode: 'both' };
-      patternName = tpl.name; pattern.set(currentPattern); pushUndo($state.snapshot(currentPattern) as Pattern); saved = true;
+      patternName = tpl.name; pattern.set(currentPattern); pushUndo($state.snapshot(currentPattern) as Pattern, 'Load template'); saved = true;
     }
   }
 
@@ -323,8 +323,8 @@
     selectedPathIds.set(new Set());
   }
 
-  function handleUndo() { const prev = undo(); if (prev) { currentPattern = prev; patternName = prev.name; pattern.set(prev); saved = false; } }
-  function handleRedo() { const next = redo(); if (next) { currentPattern = next; patternName = next.name; pattern.set(next); saved = false; } }
+  function handleUndo() { const prev = undo($state.snapshot(currentPattern) as Pattern); if (prev) { currentPattern = prev; patternName = prev.name; pattern.set(prev); saved = false; } }
+  function handleRedo() { const next = redo($state.snapshot(currentPattern) as Pattern); if (next) { currentPattern = next; patternName = next.name; pattern.set(next); saved = false; } }
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -343,7 +343,7 @@
       for (const id of $selectedPathIds) { p = deletePath(p, id); changed = true; }
       for (const id of $selectedPieceIds) { p = deletePiece(p, id); changed = true; }
       if (changed) {
-        handlePatternUpdate(p);
+        handlePatternUpdate(p, 'Delete');
         selectedPointIds.set(new Set());
         selectedPathIds.set(new Set());
         selectedPieceIds.set(new Set());
@@ -381,7 +381,7 @@
         for (const pp of [...c.mainPaths, ...c.internalPaths]) pp.id = uidFor('PiecePath');
         return c;
       });
-      handlePatternUpdate({ ...p, pieces: [...p.pieces, ...clones], hasChanged: true });
+      handlePatternUpdate({ ...p, pieces: [...p.pieces, ...clones], hasChanged: true }, 'Paste');
       selectedPieceIds.set(new Set(clones.map(c => c.id)));
       toastSuccess(`${plural(clones.length)} pasted`);
     } else {
@@ -390,7 +390,7 @@
       const names = new Set(p.points.map(q => q.name));
       const nextName = () => { while (names.has(`${prefix}${n}`)) n++; const nm = `${prefix}${n}`; names.add(nm); return nm; };
       const clones = clipboard.items.map(src => ({ ...structuredClone(src), id: uidFor('ConstrainablePoint'), name: nextName(), x: src.x + 25, y: src.y + 25 }) as ConstrainablePoint);
-      handlePatternUpdate({ ...p, points: [...p.points, ...clones], hasChanged: true });
+      handlePatternUpdate({ ...p, points: [...p.points, ...clones], hasChanged: true }, 'Paste');
       selectedPointIds.set(new Set(clones.map(c => c.id)));
       toastSuccess(`${plural(clones.length)} pasted`);
     }
@@ -407,7 +407,7 @@
     clone.name = `Copy of ${piece.name}`;
     clone.position = { x: piece.position.x + 50, y: piece.position.y - 50 };
     for (const pp of [...clone.mainPaths, ...clone.internalPaths]) pp.id = uid('PiecePath');
-    handlePatternUpdate({ ...p, pieces: [...p.pieces, clone], hasChanged: true });
+    handlePatternUpdate({ ...p, pieces: [...p.pieces, clone], hasChanged: true }, 'Duplicate piece');
     selectedPieceIds.set(new Set([clone.id]));
     toastSuccess(`Duplicated "${piece.name}"`);
   }
@@ -438,8 +438,8 @@
       </div>
     </div>
     <div class="flex items-center gap-1">
-      <button class="btn btn-ghost btn-xs" onclick={handleUndo} title="Undo (Ctrl+Z)">&#x21A9;</button>
-      <button class="btn btn-ghost btn-xs" onclick={handleRedo} title="Redo (Ctrl+Shift+Z)">&#x21AA;</button>
+      <button class="btn btn-ghost btn-xs" onclick={handleUndo} disabled={!$undoLabel} title={$undoLabel ? `Undo ${$undoLabel} (Ctrl+Z)` : 'Nothing to undo'}>&#x21A9;</button>
+      <button class="btn btn-ghost btn-xs" onclick={handleRedo} disabled={!$redoLabel} title={$redoLabel ? `Redo ${$redoLabel} (Ctrl+Shift+Z)` : 'Nothing to redo'}>&#x21AA;</button>
       <div class="dropdown dropdown-end">
         <div role="button" tabindex="0" class="btn btn-ghost btn-xs">Import</div>
         <ul class="dropdown-content menu bg-base-200 rounded-box z-50 w-52 p-2 shadow text-sm">

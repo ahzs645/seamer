@@ -106,6 +106,15 @@ export interface Notch {
   [k: string]: unknown;
 }
 
+/**
+ * How the seam-allowance corner at the *end* of a boundary edge is finished where it meets the
+ * neighbouring edge (faithful to the original ro.js seam-corner editor):
+ *  - 'intersection' (default): extend both allowance offsets until they cross, capped at maxLength
+ *  - 'radius': round the corner with the given radius
+ *  - 'byLength': cut the corner square at a fixed distance from the seam line
+ */
+export type SeamCornerJoinType = 'intersection' | 'radius' | 'byLength';
+
 /** A boundary edge of a piece: a span of a ConstrainablePath between two points. */
 export interface PiecePath {
   id: string; // PiecePath_xxx — distinct id used by seams
@@ -116,6 +125,11 @@ export interface PiecePath {
   reversed: boolean;
   isMirrorLine?: boolean;
   notches: Notch[];
+  // seam-allowance corner finishing (all optional; undefined => 'intersection' with no cap):
+  seamCornerJoinType?: SeamCornerJoinType;
+  cornerRadius?: number; // mm — used when join type is 'radius'
+  seamCornerMaxLength?: number; // mm — cap for the 'intersection' miter
+  seamCornerLength?: number; // mm — fixed corner length for 'byLength'
 }
 
 export interface PieceArrangement {

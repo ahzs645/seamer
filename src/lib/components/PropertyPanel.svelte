@@ -1,12 +1,16 @@
 <script lang="ts">
-  import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize, PointConstraint } from '$lib/types/pattern';
+  import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize, PointConstraint, SeamCornerJoinType, Notch, NotchType } from '$lib/types/pattern';
   import { selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
   import FormulaDialog from '$lib/components/FormulaDialog.svelte';
   import { toastSuccess, toastError } from '$lib/stores/toast';
+  import {
+    materialLibrary, libraryStatus, getLibraryItem, saveNewLibraryItem, overwriteLibraryItem,
+    instantiateFromLibrary, syncFromLibrary, type LibraryStatus
+  } from '$lib/stores/materialLibrary';
 
   interface Props {
     currentPattern: Pattern;
-    onchange: (p: Pattern) => void;
+    onchange: (p: Pattern, label?: string) => void;
     onclose?: () => void;
     labelDisplay?: 'off' | 'billboard' | 'flat';
     onlabeldisplaychange?: (v: 'off' | 'billboard' | 'flat') => void;
@@ -92,10 +96,47 @@
     else if (type === 'sliding') setConstraint({ type: 'sliding', path, positionFormula: '0' });
   }
 
-  function updatePiece(fn: (p: Piece) => Piece) {
+  function updatePiece(fn: (p: Piece) => Piece, label = 'Edit piece') {
     if (!editingPiece) return;
     const pieces = currentPattern.pieces.map((p) => (p.id === editingPiece.id ? fn(p) : p));
-    onchange({ ...currentPattern, pieces, hasChanged: true });
+    onchange({ ...currentPattern, pieces, hasChanged: true }, label);
+  }
+
+  // ---- Seam corner join (per boundary edge) — faithful to the original ro.js editor -----------
+  let cornerEditId = $state<string | null>(null);
+  const CORNER_TYPES: { id: SeamCornerJoinType; icon: string; title: string }[] = [
+    { id: 'intersection', icon: 'call_merge', title: 'Intersection (mitred corner, optionally capped)' },
+    { id: 'radius', icon: 'rounded_corner', title: 'Radius (rounded corner)' },
+    { id: 'byLength', icon: 'straighten', title: 'By length (square corner at a fixed distance)' }
+  ];
+  function updateMainPath(ppId: string, partial: Partial<PiecePath>, label = 'Edit corner join') {
+    updatePiece((p) => ({ ...p, mainPaths: p.mainPaths.map((x) => (x.id === ppId ? { ...x, ...partial } : x)) }), label);
+  }
+  // value (mm, displayed in the pattern unit) of the field that the active join type uses
+  function cornerValueMm(pp: PiecePath): number {
+    if (pp.seamCornerJoinType === 'radius') return pp.cornerRadius ?? 0;
+    if (pp.seamCornerJoinType === 'byLength') return pp.seamCornerLength ?? 0;
+    return pp.seamCornerMaxLength ?? 0; // intersection cap (0 = uncapped)
+  }
+  function setCornerValueMm(pp: PiecePath, mm: number) {
+    if (pp.seamCornerJoinType === 'radius') updateMainPath(pp.id, { cornerRadius: mm });
+    else if (pp.seamCornerJoinType === 'byLength') updateMainPath(pp.id, { seamCornerLength: mm });
+    else updateMainPath(pp.id, { seamCornerMaxLength: mm });
+  }
+
+  // ---- Notch editor (per boundary edge) -------------------------------------------------------
+  const NOTCH_TYPES: { id: NotchType; label: string }[] = [
+    { id: 'single', label: 'Single' }, { id: 'double', label: 'Double' }, { id: 'tee', label: 'Tee' }, { id: 'slit', label: 'Slit' }
+  ];
+  function addNotch(pp: PiecePath) {
+    const notch: Notch = { id: uid('Notch'), position: 0.5, size: currentPattern.defaultNotchSize, type: currentPattern.defaultNotchType ?? 'single' };
+    updateMainPath(pp.id, { notches: [...(pp.notches ?? []), notch] }, 'Add notch');
+  }
+  function updateNotch(pp: PiecePath, notchId: string, partial: Partial<Notch>) {
+    updateMainPath(pp.id, { notches: (pp.notches ?? []).map((n) => (n.id === notchId ? { ...n, ...partial } : n)) }, 'Edit notch');
+  }
+  function removeNotch(pp: PiecePath, notchId: string) {
+    updateMainPath(pp.id, { notches: (pp.notches ?? []).filter((n) => n.id !== notchId) }, 'Remove notch');
   }
   function updateArrangement(field: keyof PieceArrangement, value: string | number) {
     updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, arrangement: { ...p.settings3d.arrangement, [field]: value } } }));
@@ -225,13 +266,70 @@
       stretchWeftValue: which === 'weft' || linkWarpWeft ? value : m.stretchWeftValue
     }));
   }
-  function onPickImage(id: string, e: Event) {
+  const DEFAULT_SLOT = () => ({ url: '', mediaId: null, color: '#bbbbbb', scale: 100, normalUrl: '', normalMediaId: null, normalMapScale: 100, opacityUrl: '', opacityMediaId: null, opacityMapScale: 100 });
+  function setBackTexture(id: string, partial: Partial<NonNullable<Mat['backTexture']>>) {
+    updateMaterial(id, (m) => ({ ...m, backTexture: { ...(m.backTexture ?? DEFAULT_SLOT()), ...partial } }));
+  }
+  /** Read a picked image file as a data URL and hand it to `apply` (base/normal/opacity, front/back). */
+  function readImage(e: Event, apply: (dataUrl: string) => void) {
     const file = (e.target as HTMLInputElement).files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => setFrontTexture(id, { url: String(reader.result), mediaId: null });
+    reader.onload = () => apply(String(reader.result));
     reader.readAsDataURL(file);
   }
+  function onPickImage(id: string, e: Event) {
+    readImage(e, (url) => setFrontTexture(id, { url, mediaId: null }));
+  }
+
+  // ---- Material library (offline-first stand-in for the cloud library) -----------------------
+  const STATUS_META: Record<LibraryStatus, { label: string; cls: string; dot: string }> = {
+    local: { label: 'Local material', cls: 'opacity-60', dot: 'bg-base-300' },
+    synced: { label: 'Synced with library', cls: 'text-success', dot: 'bg-success' },
+    outdated: { label: 'Library has a newer version', cls: 'text-warning', dot: 'bg-warning' },
+    missing: { label: 'Linked item missing', cls: 'text-error', dot: 'bg-error' }
+  };
+  // Recompute status when either the material or the library store changes.
+  function statusOf(m: Mat): LibraryStatus {
+    void $materialLibrary; // reactive dependency
+    return libraryStatus(m);
+  }
+  function isWriteProtected(m: Mat): boolean {
+    const item = getLibraryItem(m.libraryItemId);
+    return !!item?.writeProtected;
+  }
+  function saveToLibrary(m: Mat) {
+    const link = saveNewLibraryItem(m, new Date().toISOString());
+    updateMaterial(m.id, (x) => ({ ...x, ...link }));
+    toastSuccess(`Saved "${m.name}" to library`);
+  }
+  function updateLibrary(m: Mat) {
+    const link = overwriteLibraryItem(m, new Date().toISOString());
+    if (!link) { toastError('Cannot overwrite — library item is write-protected or missing'); return; }
+    updateMaterial(m.id, (x) => ({ ...x, ...link }));
+    toastSuccess(`Updated library material "${m.name}"`);
+  }
+  function syncMaterial(m: Mat) {
+    const next = syncFromLibrary(m);
+    if (!next) { toastError('Library item not found'); return; }
+    updateMaterial(m.id, () => next);
+    toastSuccess(`Pulled latest "${next.name}" from library`);
+  }
+  function unlinkMaterial(m: Mat) {
+    updateMaterial(m.id, (x) => ({ ...x, libraryItemId: null, libraryVersion: null, libraryUpdatedAt: null }));
+    toastSuccess('Unlinked from library');
+  }
+  let showLibraryPicker = $state(false);
+  function addFromLibrary(itemId: string) {
+    const item = getLibraryItem(itemId);
+    if (!item) return;
+    const mat = instantiateFromLibrary(item, uid('mat'));
+    updatePattern({ materials: [...currentPattern.materials, mat] });
+    showLibraryPicker = false;
+    editingMaterialId = mat.id;
+    toastSuccess(`Added "${item.name}" from library`);
+  }
+
   function materialSwatch(m: Pattern['materials'][number]): string {
     const t = m.frontTexture;
     const color = t?.color || '#cccccc';
@@ -300,27 +398,80 @@
   </label>
 {/snippet}
 
+{#snippet textureMaps(m: Pattern['materials'][number], back: boolean)}
+  {@const slot = back ? m.backTexture : m.frontTexture}
+  {@const set = back ? (p: Partial<NonNullable<Mat['frontTexture']>>) => setBackTexture(m.id, p) : (p: Partial<NonNullable<Mat['frontTexture']>>) => setFrontTexture(m.id, p)}
+  <div class="flex items-center gap-2">
+    <div class="w-12 h-12 rounded border border-base-300 shrink-0"
+      style={slot?.url ? `background-color:${slot.color};background-image:url('${slot.url}');background-size:cover;background-position:center` : `background-color:${slot?.color ?? '#bbbbbb'}`}></div>
+    <div class="flex flex-col gap-1 flex-1">
+      <label class="flex items-center gap-2">Color
+        <input type="color" class="w-8 h-6 rounded border" value={slot?.color ?? '#bbbbbb'} oninput={(e) => set({ color: e.currentTarget.value })} /></label>
+      <div class="flex gap-1">
+        <label class="btn btn-xs btn-outline cursor-pointer"><span class="material-symbols-rounded text-base">image</span> Image
+          <input type="file" accept="image/*" class="hidden" onchange={(e) => readImage(e, (url) => set({ url, mediaId: null }))} /></label>
+        {#if slot?.url}<button class="btn btn-xs btn-ghost" onclick={() => set({ url: '', mediaId: null })}><span class="material-symbols-rounded text-base">clear</span> Clear</button>{/if}
+      </div>
+    </div>
+  </div>
+  <label class="flex flex-col gap-0.5">Tile size (mm)
+    <input type="number" step="1" class="input input-bordered input-xs" value={slot?.scale ?? 100} oninput={(e) => set({ scale: parseFloat(e.currentTarget.value) || 100 })} /></label>
+  <!-- Normal map -->
+  <div class="flex items-center gap-1">
+    <span class="flex-1 text-xs opacity-70">Normal map{slot?.normalUrl ? ' ✓' : ''}</span>
+    <label class="btn btn-xs btn-ghost cursor-pointer"><span class="material-symbols-rounded text-base">landscape</span>
+      <input type="file" accept="image/*" class="hidden" onchange={(e) => readImage(e, (url) => set({ normalUrl: url, normalMediaId: null }))} /></label>
+    {#if slot?.normalUrl}<button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Clear normal map" aria-label="Clear normal map" onclick={() => set({ normalUrl: '', normalMediaId: null })}>clear</button>{/if}
+  </div>
+  <!-- Opacity / cutwork map -->
+  <div class="flex items-center gap-1">
+    <span class="flex-1 text-xs opacity-70">Opacity map{slot?.opacityUrl ? ' ✓' : ''}</span>
+    <label class="btn btn-xs btn-ghost cursor-pointer"><span class="material-symbols-rounded text-base">opacity</span>
+      <input type="file" accept="image/*" class="hidden" onchange={(e) => readImage(e, (url) => set({ opacityUrl: url, opacityMediaId: null }))} /></label>
+    {#if slot?.opacityUrl}<button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Clear opacity map" aria-label="Clear opacity map" onclick={() => set({ opacityUrl: '', opacityMediaId: null })}>clear</button>{/if}
+  </div>
+{/snippet}
+
+{#snippet libraryBlock(m: Pattern['materials'][number])}
+  {@const status = statusOf(m)}
+  {@const meta = STATUS_META[status]}
+  {@const wp = isWriteProtected(m)}
+  <div class="space-y-1.5">
+    <span class="text-[11px] flex items-center gap-1 {meta.cls}"><span class="w-2 h-2 rounded-full {meta.dot}"></span>{meta.label}{wp ? ' · write-protected' : ''}</span>
+    <div class="flex flex-wrap gap-1">
+      {#if status === 'local'}
+        <button class="btn btn-xs btn-outline" onclick={() => saveToLibrary(m)}><span class="material-symbols-rounded text-base">cloud_upload</span> Save to library</button>
+      {:else}
+        <button class="btn btn-xs btn-outline" disabled={wp} title={wp ? 'Library material is write-protected' : 'Overwrite the library version with these edits'} onclick={() => updateLibrary(m)}><span class="material-symbols-rounded text-base">save</span> Update library</button>
+        {#if status === 'outdated'}<button class="btn btn-xs btn-warning btn-outline" onclick={() => syncMaterial(m)}><span class="material-symbols-rounded text-base">download</span> Pull latest</button>{/if}
+        <button class="btn btn-xs btn-ghost" onclick={() => unlinkMaterial(m)} title="Detach from the library item"><span class="material-symbols-rounded text-base">link_off</span> Unlink</button>
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
 {#snippet materialEditor(m: Pattern['materials'][number])}
   <div class="border-t border-base-300 p-3 space-y-3 text-sm bg-base-100">
     <label class="flex flex-col gap-0.5">Name
       <input type="text" class="input input-bordered input-xs" value={m.name} oninput={(e) => updateMaterial(m.id, (x) => ({ ...x, name: e.currentTarget.value }))} /></label>
 
+    <hr class="border-base-200" />
+    {@render libraryBlock(m)}
+
+    <hr class="border-base-200" />
     <div class="space-y-1">
       <span class="font-semibold">Front side</span>
-      <div class="flex items-center gap-2">
-        <div class="w-12 h-12 rounded border border-base-300 shrink-0" style={materialSwatch(m)}></div>
-        <div class="flex flex-col gap-1 flex-1">
-          <label class="flex items-center gap-2">Color
-            <input type="color" class="w-8 h-6 rounded border" value={m.frontTexture?.color ?? '#bbbbbb'} oninput={(e) => setFrontTexture(m.id, { color: e.currentTarget.value })} /></label>
-          <div class="flex gap-1">
-            <label class="btn btn-xs btn-outline cursor-pointer"><span class="material-symbols-rounded text-base">image</span> Image
-              <input type="file" accept="image/*" class="hidden" onchange={(e) => onPickImage(m.id, e)} /></label>
-            {#if m.frontTexture?.url}<button class="btn btn-xs btn-ghost" onclick={() => setFrontTexture(m.id, { url: '', mediaId: null })}><span class="material-symbols-rounded text-base">clear</span> Clear texture</button>{/if}
-          </div>
+      {@render textureMaps(m, false)}
+    </div>
+
+    <hr class="border-base-200" />
+    <div class="space-y-2">
+      <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={m.useSeparateBackSide} onchange={(e) => updateMaterial(m.id, (x) => ({ ...x, useSeparateBackSide: e.currentTarget.checked, backTexture: x.backTexture ?? DEFAULT_SLOT() }))} /> <span class="font-semibold">Separate back side</span></label>
+      {#if m.useSeparateBackSide}
+        <div class="pl-1 space-y-1 border-l-2 border-base-200">
+          {@render textureMaps(m, true)}
         </div>
-      </div>
-      <label class="flex flex-col gap-0.5">Tile size (mm)
-        <input type="number" step="1" class="input input-bordered input-xs" value={m.frontTexture?.scale ?? 100} oninput={(e) => setFrontTexture(m.id, { scale: parseFloat(e.currentTarget.value) || 100 })} /></label>
+      {/if}
     </div>
 
     <hr class="border-base-200" />
@@ -341,8 +492,10 @@
       <span class="font-semibold">Appearance</span>
       {@render matSlider('Roughness', m.roughness, 0, 1, 0.01, (v) => updateMaterial(m.id, (x) => ({ ...x, roughness: v })))}
       {@render matSlider('Metalness', m.metalness, 0, 1, 0.01, (v) => updateMaterial(m.id, (x) => ({ ...x, metalness: v })))}
+      {@render matSlider('Specular', m.specularIntensity, 0, 1, 0.01, (v) => updateMaterial(m.id, (x) => ({ ...x, specularIntensity: v })))}
       {@render matSlider('Opacity', m.opacity, 0, 1, 0.01, (v) => updateMaterial(m.id, (x) => ({ ...x, opacity: v })))}
-      <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={m.useSeparateBackSide} onchange={(e) => updateMaterial(m.id, (x) => ({ ...x, useSeparateBackSide: e.currentTarget.checked }))} /> Separate back side</label>
+      {@render matSlider('Normal strength', m.normalScale, 0, 3, 0.05, (v) => updateMaterial(m.id, (x) => ({ ...x, normalScale: v })))}
+      {@render matSlider('Alpha cutoff', m.alphaCutoff, 0, 1, 0.01, (v) => updateMaterial(m.id, (x) => ({ ...x, alphaCutoff: v })))}
     </div>
   </div>
 {/snippet}
@@ -457,19 +610,80 @@
               {@const list = s.id === 'seam' ? piece.mainPaths : piece.internalPaths}
               <div class="flex flex-col">
                 {#each list as pp}
-                  <div class="rounded-md border my-0.5 flex items-center px-2 py-1 gap-1"
+                  {@const notchCount = pp.notches?.length ?? 0}
+                  <div class="rounded-md border my-0.5"
                     class:border-accent={$selectedPathIds.has(pp.path)} class:border-base-200={!$selectedPathIds.has(pp.path)}>
-                    <button class="font-bold text-sm cursor-pointer hover:text-accent text-left" onclick={() => selectPath(pp)}>{pathName(pp.path)}</button>
-                    <span class="mx-1 text-xs opacity-70">({pointName(pp.from)} → {pointName(pp.to)})</span>
-                    <div class="flex items-center ml-auto gap-1">
-                      {#if s.id === 'seam'}
-                        <button class="material-symbols-rounded text-base" class:text-error={pp.isMirrorLine} class:opacity-60={!pp.isMirrorLine}
-                          title={pp.isMirrorLine ? 'Mirror/fold line (on) — cloth reflects across this edge' : 'Mark as mirror/fold line'}
-                          onclick={() => toggleMirrorLine(pp)}>flip</button>
-                      {/if}
-                      <button class="material-symbols-rounded text-base opacity-60" title="Condition">calculate</button>
-                      <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove" onclick={() => removeMainPath(pp)}>delete</button>
+                    <div class="flex items-center px-2 py-1 gap-1">
+                      <button class="font-bold text-sm cursor-pointer hover:text-accent text-left" onclick={() => selectPath(pp)}>{pathName(pp.path)}</button>
+                      <span class="mx-1 text-xs opacity-70">({pointName(pp.from)} → {pointName(pp.to)})</span>
+                      <div class="flex items-center ml-auto gap-1">
+                        {#if s.id === 'seam'}
+                          <button class="material-symbols-rounded text-base" class:text-error={pp.isMirrorLine} class:opacity-60={!pp.isMirrorLine}
+                            title={pp.isMirrorLine ? 'Mirror/fold line (on) — cloth reflects across this edge' : 'Mark as mirror/fold line'}
+                            onclick={() => toggleMirrorLine(pp)}>flip</button>
+                          <button class="material-symbols-rounded text-base" class:text-accent={cornerEditId === pp.id} class:opacity-60={cornerEditId !== pp.id}
+                            title="Seam corner join &amp; notches" aria-label="Edit corner join and notches"
+                            onclick={() => (cornerEditId = cornerEditId === pp.id ? null : pp.id)}>tune</button>
+                        {/if}
+                        <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove" onclick={() => removeMainPath(pp)}>delete</button>
+                      </div>
                     </div>
+
+                    {#if s.id === 'seam' && cornerEditId === pp.id}
+                      {@const joinType = pp.seamCornerJoinType ?? 'intersection'}
+                      <div class="border-t border-base-200 p-2 space-y-2 bg-base-100">
+                        <!-- Corner join -->
+                        <div class="space-y-1">
+                          <span class="text-[11px] font-semibold opacity-70 flex items-center gap-1"><span class="material-symbols-rounded text-sm">rounded_corner</span>Seam corner join</span>
+                          <div class="join w-full">
+                            {#each CORNER_TYPES as ct}
+                              <button class="join-item btn btn-xs flex-1" class:btn-active={joinType === ct.id} title={ct.title}
+                                onclick={() => updateMainPath(pp.id, { seamCornerJoinType: ct.id })}>
+                                <span class="material-symbols-rounded text-base">{ct.icon}</span>
+                              </button>
+                            {/each}
+                          </div>
+                          {#if joinType === 'radius'}
+                            <label class="flex items-center justify-between gap-2 text-[11px]">Radius ({unitLabel})
+                              <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(cornerValueMm(pp)).toFixed(2)}
+                                oninput={(e) => setCornerValueMm(pp, fromUnit(parseFloat(e.currentTarget.value) || 0))} /></label>
+                          {:else if joinType === 'byLength'}
+                            <label class="flex items-center justify-between gap-2 text-[11px]">Corner length ({unitLabel})
+                              <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(cornerValueMm(pp)).toFixed(2)}
+                                oninput={(e) => setCornerValueMm(pp, fromUnit(parseFloat(e.currentTarget.value) || 0))} /></label>
+                          {:else}
+                            <label class="flex items-center justify-between gap-2 text-[11px]">Max length ({unitLabel}, 0 = uncapped)
+                              <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(cornerValueMm(pp)).toFixed(2)}
+                                oninput={(e) => setCornerValueMm(pp, fromUnit(parseFloat(e.currentTarget.value) || 0))} /></label>
+                          {/if}
+                        </div>
+
+                        <!-- Notches -->
+                        <div class="space-y-1 border-t border-base-200 pt-2">
+                          <div class="flex items-center justify-between">
+                            <span class="text-[11px] font-semibold opacity-70 flex items-center gap-1"><span class="material-symbols-rounded text-sm">content_cut</span>Notches ({notchCount})</span>
+                            <button class="btn btn-xs btn-ghost" onclick={() => addNotch(pp)}><span class="material-symbols-rounded text-sm">add</span>Add</button>
+                          </div>
+                          {#each pp.notches ?? [] as n (n.id)}
+                            <div class="flex items-center gap-1">
+                              <input type="range" min="0" max="1" step="0.01" class="range range-xs flex-1" value={typeof n.position === 'number' ? n.position : 0.5}
+                                title="Position along edge" oninput={(e) => updateNotch(pp, n.id as string, { position: parseFloat(e.currentTarget.value) })} />
+                              <select class="select select-bordered select-xs w-16" value={(n.type as NotchType) ?? 'single'}
+                                onchange={(e) => updateNotch(pp, n.id as string, { type: e.currentTarget.value as NotchType })}>
+                                {#each NOTCH_TYPES as nt}<option value={nt.id}>{nt.label}</option>{/each}
+                              </select>
+                              <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-14" title="Size ({unitLabel})"
+                                value={toUnit((n.size as number) ?? currentPattern.defaultNotchSize).toFixed(1)}
+                                oninput={(e) => updateNotch(pp, n.id as string, { size: fromUnit(parseFloat(e.currentTarget.value) || 0) })} />
+                              <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove notch" aria-label="Remove notch"
+                                onclick={() => removeNotch(pp, n.id as string)}>delete</button>
+                            </div>
+                          {:else}
+                            <p class="text-[11px] opacity-50">No notches. Add one, or right-click the edge in the 2D view.</p>
+                          {/each}
+                        </div>
+                      </div>
+                    {/if}
                   </div>
                 {:else}
                   <p class="opacity-60">No {s.id === 'seam' ? 'boundary' : 'internal'} paths.</p>
@@ -707,7 +921,7 @@
                       <div class="w-10 h-10 rounded border border-base-300 shrink-0" aria-label="Material preview" style={materialSwatch(m)}></div>
                       <div class="flex flex-col flex-1 leading-tight min-w-0">
                         <span class="font-medium truncate">{m.name}</span>
-                        <span class="text-[11px] text-base-content/60 flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-base-300"></span> Local material</span>
+                        <span class="text-[11px] flex items-center gap-1 {STATUS_META[statusOf(m)].cls}"><span class="w-2 h-2 rounded-full {STATUS_META[statusOf(m)].dot}"></span>{STATUS_META[statusOf(m)].label}</span>
                       </div>
                       <button class="btn btn-ghost btn-xs p-1" title="Edit material" aria-label="Edit material" onclick={() => (editingMaterialId = editingMaterialId === m.id ? null : m.id)}><span class="material-symbols-rounded text-base">{editingMaterialId === m.id ? 'expand_less' : 'edit'}</span></button>
                       <button class="btn btn-ghost btn-xs p-1 text-error" title="Delete material" aria-label="Delete material" onclick={() => deleteMaterial(m.id)}><span class="material-symbols-rounded text-base">delete</span></button>
@@ -719,8 +933,22 @@
                 {:else}<p class="opacity-60">No materials yet.</p>{/each}
                 <div class="grid grid-cols-2 gap-2 mt-1">
                   <button class="btn btn-sm btn-primary" onclick={createMaterial}><span class="material-symbols-rounded text-base">add</span> Create material</button>
-                  <button class="btn btn-sm btn-secondary" title="Pick a material from your library"><span class="material-symbols-rounded text-base">library_add</span> Add from library</button>
+                  <button class="btn btn-sm btn-secondary" title="Pick a material from your library" onclick={() => (showLibraryPicker = !showLibraryPicker)}><span class="material-symbols-rounded text-base">library_add</span> Add from library</button>
                 </div>
+                {#if showLibraryPicker}
+                  <div class="border border-base-300 rounded-md p-2 bg-base-200 space-y-1">
+                    <span class="text-[11px] font-semibold opacity-70">Material library</span>
+                    {#each $materialLibrary as item (item.id)}
+                      <button class="flex items-center gap-2 w-full text-left p-1 rounded hover:bg-base-300" onclick={() => addFromLibrary(item.id)}>
+                        <span class="w-5 h-5 rounded border border-base-300 shrink-0" style={item.material.frontTexture?.url ? `background-image:url('${item.material.frontTexture.url}');background-size:cover` : `background-color:${item.material.frontTexture?.color ?? '#bbb'}`}></span>
+                        <span class="flex-1 truncate text-xs">{item.name}</span>
+                        <span class="text-[10px] opacity-50">v{item.version}{item.writeProtected ? ' 🔒' : ''}</span>
+                      </button>
+                    {:else}
+                      <p class="text-[11px] opacity-50">Library is empty. Edit a material and choose “Save to library”.</p>
+                    {/each}
+                  </div>
+                {/if}
               </div>
             {/if}
           </div>
