@@ -1,4 +1,5 @@
 import { writable, derived } from 'svelte/store';
+import { browser } from '$app/environment';
 import type { Pattern } from '$lib/types/pattern';
 import { EMPTY_PATTERN } from '$lib/types/pattern';
 import { saveHistory, loadHistory, deleteHistory } from '$lib/stores/localDB';
@@ -30,12 +31,13 @@ export const cursorMm = writable<{ x: number; y: number } | null>(null);
 /** Autosave cadence in seconds (user-configurable in Settings; persisted to localStorage). */
 function persisted<T>(key: string, initial: T) {
   let start = initial;
-  if (typeof localStorage !== 'undefined') {
-    const raw = localStorage.getItem(key);
-    if (raw != null) try { start = JSON.parse(raw) as T; } catch { /* ignore */ }
+  // Browser-only: guard with SvelteKit's `browser` AND a try/catch, since some SSR runtimes expose a
+  // `localStorage` global whose methods throw.
+  if (browser) {
+    try { const raw = localStorage.getItem(key); if (raw != null) start = JSON.parse(raw) as T; } catch { /* ignore */ }
   }
   const store = writable<T>(start);
-  if (typeof localStorage !== 'undefined') store.subscribe((v) => { try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* ignore */ } });
+  if (browser) store.subscribe((v) => { try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* ignore */ } });
   return store;
 }
 export const autoSaveSeconds = persisted<number>('seamer.autosaveSeconds', 5);
