@@ -869,23 +869,37 @@ export class PatternRenderer {
     }
   }
 
+  private simLoopActive = false;
   private async runSimLoop() {
-    while (this.simulating && this.sim && !this.disposed) {
-      try {
-        const positions = await this.sim.step();
-        if (positions.length) this.applyClothPositions(positions);
-        // Body-change adapt finished: pin to the new settled drape and re-enable self-collision.
-        if (this.adaptFramesLeft > 0 && --this.adaptFramesLeft === 0) {
-          this.sim.reanchorToSettled();
-          this.sim.setSelfCollision(true);
-          this.bodyDirty = false;
-          this.baseBodyKey = this.lastBodyKey;
+    if (this.simLoopActive) return; // exactly one loop at a time — two would fight over step()/inFlight
+    this.simLoopActive = true;
+    const nextFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+    try {
+      while (this.simulating && this.sim && !this.disposed) {
+        try {
+          const positions = await this.sim.step();
+          if (positions.length === 0) {
+            // step() skipped (a prior step still in flight, or a transient). YIELD a frame instead of
+            // tight-looping — a busy await-resolved loop starves rendering/input and freezes the tab.
+            await nextFrame();
+            continue;
+          }
+          this.applyClothPositions(positions);
+          // Body-change adapt finished: pin to the new settled drape and re-enable self-collision.
+          if (this.adaptFramesLeft > 0 && --this.adaptFramesLeft === 0) {
+            this.sim.reanchorToSettled();
+            this.sim.setSelfCollision(true);
+            this.bodyDirty = false;
+            this.baseBodyKey = this.lastBodyKey;
+          }
+        } catch (e) {
+          this.simulating = false;
+          this.onStatus('error', e instanceof Error ? e.message : String(e));
+          return;
         }
-      } catch (e) {
-        this.simulating = false;
-        this.onStatus('error', e instanceof Error ? e.message : String(e));
-        return;
       }
+    } finally {
+      this.simLoopActive = false;
     }
   }
 

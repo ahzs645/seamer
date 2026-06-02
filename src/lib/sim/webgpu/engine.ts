@@ -444,6 +444,16 @@ export class ClothEngine {
   async step(): Promise<Float32Array> {
     if (this.inFlight) return new Float32Array(0);
     this.inFlight = true;
+    try {
+      return await this.stepInner();
+    } finally {
+      // Always clear in-flight, even if the GPU readback rejects (device lost / buffer destroyed mid
+      // teardown). Otherwise every later step() short-circuits to empty and the sim loop busy-spins.
+      this.inFlight = false;
+    }
+  }
+
+  private async stepInner(): Promise<Float32Array> {
     const d = this.device;
     const encoder = d.createCommandEncoder();
     const pass = encoder.beginComputePass();
@@ -553,7 +563,6 @@ export class ClothEngine {
     await this.readback.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(this.readback.getMappedRange().slice(0));
     this.readback.unmap();
-    this.inFlight = false;
     return out;
   }
 
