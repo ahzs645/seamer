@@ -863,7 +863,7 @@
                   oninput={(e) => updateArrangement('v', parseFloat(e.currentTarget.value) || 0)} /></label>
               </div>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.settings3d.frozen}
-                onchange={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, frozen: e.currentTarget.checked } }))} /> Frozen (pinned)</label>
+                onchange={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, frozen: e.currentTarget.checked } }))} /> Freeze piece in simulation</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.settings3d.flipNormals}
                 onchange={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, flipNormals: e.currentTarget.checked } }))} /> Flip cloth normals</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={piece.settings3d.filterExternalCollisionsByClothNormal}
@@ -871,6 +871,10 @@
               <label class="flex items-center justify-between gap-2">Collision layer
                 <input type="number" min="0" step="1" class="input input-bordered input-xs w-16" value={piece.settings3d.collisionLayer}
                   oninput={(e) => updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, collisionLayer: Math.max(0, parseInt(e.currentTarget.value) || 0) } }))} /></label>
+              <label class="flex items-center justify-between gap-2">Particle distance
+                <input type="number" min="0" step="1" placeholder="default" class="input input-bordered input-xs w-16" value={piece.settings3d.particleDistance ?? ''}
+                  onchange={(e) => { const v = parseFloat(e.currentTarget.value); updatePiece((p) => ({ ...p, settings3d: { ...p.settings3d, particleDistance: Number.isFinite(v) && v > 0 ? v : null } })); }} /></label>
+              <p class="text-[11px] opacity-50">Lower values = more particles and slower simulation</p>
               <hr class="border-base-200" />
               {@render labelSetting()}
             {/if}

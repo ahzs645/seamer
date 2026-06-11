@@ -5,7 +5,7 @@
   import type { SimConfig } from '$lib/sim/config';
   import { isDarkTheme, toggleTheme, applyStoredTheme } from '$lib/utils/theme';
   import { pieceGeometrySignature } from '$lib/utils/patternGeometry';
-  import { show3dStats } from '$lib/stores/pattern';
+  import { show3dStats, simAnchors } from '$lib/stores/pattern';
 
   // lightweight FPS meter for the optional stats overlay (Settings → 3D stats)
   let fps = $state(0);
@@ -64,7 +64,9 @@
 
   function pieceSigs(p: Pattern): Map<string, string> {
     const m = new Map<string, string>();
-    for (const pc of p.pieces) m.set(pc.id, pieceGeometrySignature(p, pc));
+    // The per-piece particle-distance override changes the triangulation, so fold it into the
+    // signature: editing it marks the piece "changed" and forces a re-mesh at the new resolution.
+    for (const pc of p.pieces) m.set(pc.id, `${pieceGeometrySignature(p, pc)}|pd:${pc.settings3d.particleDistance ?? ''}`);
     return m;
   }
 
@@ -134,6 +136,9 @@
     const id = selectedPieceId;
     renderer?.setHighlightedPiece(id ?? null);
   });
+
+  // "Anchor to saved drape" toggle (persisted): OFF = source-parity free-run (anchor scale 0)
+  $effect(() => { renderer?.setAnchorsEnabled($simAnchors); });
 
   function toggleSimulate() {
     if (!renderer) return;
@@ -217,12 +222,13 @@
   function clearSnapshot() { renderer?.clearSnapshot(); hasSnap = false; }
   function setSnapOpacity(o: number) { snapOpacity = o; renderer?.setSnapshotOpacity(o); }
 
-  // 'A' toggles arrange mode (matches the source's keyboard shortcut).
+  // 'A' toggles arrange mode, Space starts/stops the simulation (matches the source's shortcuts).
   function handleKey(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === 'a' || e.key === 'A') { e.preventDefault(); toggleArrangeMode(); }
     if (e.key === 'm' || e.key === 'M') { e.preventDefault(); toggleManipulateMode(); }
+    if (e.key === ' ') { e.preventDefault(); toggleSimulate(); }
   }
 
   // Right-side 3D control rail — Material Symbols icons + hover-to-expand labels, mirroring the
@@ -315,11 +321,25 @@
         <input type="checkbox" class="toggle toggle-xs" checked={simCfg.handleSelfCollisions} onchange={(e) => setSim({ handleSelfCollisions: e.currentTarget.checked })} /></label>
       <label class="flex items-center justify-between gap-2"><span>Body collision</span>
         <input type="checkbox" class="toggle toggle-xs" checked={simCfg.handleExternalCollisions} onchange={(e) => setSim({ handleExternalCollisions: e.currentTarget.checked })} /></label>
+      <label class="flex items-center justify-between gap-2"><span>Use bending</span>
+        <input type="checkbox" class="toggle toggle-xs" checked={simCfg.useBending} onchange={(e) => setSim({ useBending: e.currentTarget.checked })} /></label>
+      <label class="flex items-center justify-between gap-2" title="ON: softly hold the saved drape while simulating. OFF: free-run like the original solver."><span>Anchor to saved drape</span>
+        <input type="checkbox" class="toggle toggle-xs" checked={$simAnchors} onchange={(e) => simAnchors.set(e.currentTarget.checked)} /></label>
+      <label class="flex items-center justify-between gap-2"><span>Time step</span>
+        <input type="number" class="input input-bordered input-xs w-20" min="0.001" max="1" step="0.001" value={simCfg.timeStep}
+          onchange={(e) => { const v = parseFloat(e.currentTarget.value); if (Number.isFinite(v) && v > 0) setSim({ timeStep: Math.min(1, Math.max(0.001, v)) }); }} /></label>
+      <label class="flex items-center justify-between gap-2"><span>Sub steps</span>
+        <input type="number" class="input input-bordered input-xs w-20" min="1" max="1000" step="1" value={simCfg.subSteps}
+          onchange={(e) => { const v = Math.round(parseFloat(e.currentTarget.value)); if (Number.isFinite(v) && v >= 1) setSim({ subSteps: Math.min(1000, v) }); }} /></label>
       {#each [
         { key: 'gravity', label: 'Gravity', min: 0, max: 20, step: 0.1, get: () => -simCfg!.gravity[1], set: setGravity, fmt: (v: number) => v.toFixed(1) },
+        { key: 'maxVelocity', label: 'Max velocity (m/s)', min: 0, max: 10, step: 0.5, get: () => simCfg!.maxVelocity, set: (v: number) => setSim({ maxVelocity: v }), fmt: (v: number) => v.toFixed(1) },
+        { key: 'minVelocity', label: 'Min velocity (m/s)', min: 0, max: 1, step: 0.001, get: () => simCfg!.minVelocity, set: (v: number) => setSim({ minVelocity: v }), fmt: (v: number) => v.toFixed(3) },
         { key: 'globalDamping', label: 'Global damping', min: 0, max: 1, step: 0.01, get: () => simCfg!.globalDamping, set: (v: number) => setSim({ globalDamping: v }), fmt: (v: number) => v.toFixed(2) },
+        { key: 'localDamping', label: 'Local damping', min: 0, max: 1, step: 0.01, get: () => simCfg!.localDamping, set: (v: number) => setSim({ localDamping: v }), fmt: (v: number) => v.toFixed(2) },
         { key: 'nearDamping', label: 'Near damping', min: 0, max: 1, step: 0.01, get: () => simCfg!.nearDamping, set: (v: number) => setSim({ nearDamping: v }), fmt: (v: number) => v.toFixed(2) },
-        { key: 'simulationThickness', label: 'Thickness (mm)', min: 0, max: 20, step: 0.5, get: () => simCfg!.simulationThickness * 1000, set: (v: number) => setSim({ simulationThickness: v / 1000, edgeThickness: v / 1000 }), fmt: (v: number) => v.toFixed(1) },
+        { key: 'simulationThickness', label: 'Simulation thickness', min: 0, max: 20, step: 0.5, get: () => simCfg!.simulationThickness * 1000, set: (v: number) => setSim({ simulationThickness: v / 1000 }), fmt: (v: number) => `${v.toFixed(1)} mm` },
+        { key: 'edgeThickness', label: 'Simulation edge thickness', min: 0, max: 20, step: 0.5, get: () => simCfg!.edgeThickness * 1000, set: (v: number) => setSim({ edgeThickness: v / 1000 }), fmt: (v: number) => `${v.toFixed(1)} mm` },
         { key: 'selfCollisionFriction', label: 'Self friction', min: 0, max: 1, step: 0.05, get: () => simCfg!.selfCollisionFriction, set: (v: number) => setSim({ selfCollisionFriction: v }), fmt: (v: number) => v.toFixed(2) },
         { key: 'externalCollisionFriction', label: 'Body friction', min: 0, max: 1, step: 0.05, get: () => simCfg!.externalCollisionFriction, set: (v: number) => setSim({ externalCollisionFriction: v }), fmt: (v: number) => v.toFixed(2) },
         { key: 'seamStrength', label: 'Seam strength', min: 0, max: 2, step: 0.1, get: () => simCfg!.seamStrength, set: (v: number) => setSim({ seamStrength: v }), fmt: (v: number) => v.toFixed(1) },

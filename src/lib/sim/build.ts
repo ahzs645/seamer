@@ -66,6 +66,17 @@ export interface ArrangedPiece {
   arranged3d?: Float32Array; // flat-on-body placement for the same particles (pre-drape); defaults to positions3d
 }
 
+export interface BuildSimOptions {
+  /**
+   * Repo extension (NOT in the original app): additionally sew boundary particles of different
+   * saved-drape pieces that are within 16 mm of each other in the cached drape. The original sews
+   * exclusively by seam definitions (equal-count resampled edges linked index-to-index), so this
+   * defaults to OFF for source parity. Turn on to re-attach saved drapes whose seam definitions
+   * are missing/incomplete.
+   */
+  proximitySeams?: boolean;
+}
+
 interface Instance {
   ap: ArrangedPiece;
   mirror: boolean;
@@ -78,12 +89,15 @@ function tri2DArea(a: Vec2, b: Vec2, c: Vec2): number {
 
 // Bend color groups for the dihedral bending shader. Each constraint moves p1/p2 (the opposite
 // vertices) and reads the hinge pair, so we colour by p1/p2 only (conflict-free Gauss-Seidel).
-// edges vec4 = [p1, p2, hingeA, hingeB]; props vec4 = [compliance, complianceBeyond, restLen, targetAngle].
+// edges vec4 = [p1, p2, hingeA, hingeB]; props vec4 = [bendAlpha, stretchAlpha, restLen, targetAngle]
+// — slot .y is the STRETCH compliance for the same material/edge direction, used by the shader when
+// the opposite vertices are beyond rest length (matching the original's [bendAlpha, stretchAlpha, ...]).
 function buildBendColorGroups(
   opp: [number, number][],
   hinge: [number, number][],
   restLen: number[],
   compliance: number[],
+  complianceBeyond: number[],
   targetAngle: number[]
 ): ColorGroup[] {
   const usedByVertex = new Map<number, Set<number>>();
@@ -108,7 +122,7 @@ function buildBendColorGroups(
   for (let i = 0; i < opp.length; i++) {
     const g = groups[colorOf[i]];
     g.e.push(opp[i][0], opp[i][1], hinge[i][0], hinge[i][1]);
-    g.p.push(compliance[i], compliance[i], restLen[i], targetAngle[i]);
+    g.p.push(compliance[i], complianceBeyond[i], restLen[i], targetAngle[i]);
   }
   return groups.map((g) => ({ edges: Float32Array.from(g.e), props: Float32Array.from(g.p), count: g.e.length / 4 }));
 }
@@ -146,7 +160,7 @@ function buildColorGroups(
   return groups.map((g) => ({ edges: Float32Array.from(g.e), props: Float32Array.from(g.p), count: g.e.length / 4 }));
 }
 
-export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimData {
+export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], options: BuildSimOptions = {}): SimData {
   const materials = new Map<string, Material>();
   for (const m of pattern.materials) materials.set(m.id, m);
 
@@ -185,6 +199,7 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
   const bendHinge: [number, number][] = [];
   const bendRest: number[] = [];
   const bendCompliance: number[] = [];
+  const bendComplianceBeyond: number[] = []; // stretch alpha for the same material/edge direction (shader slot .y)
   const bendTargetAngle: number[] = [];
 
   // `${pieceId}::${edgeKey}` -> global particle indices (for seams). edgeKey is a PiecePath id,
@@ -286,6 +301,19 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
       bendHinge.push([offset + hingeA, offset + hingeB]);
       bendRest.push(Math.hypot(pb.x - pa.x, pb.y - pa.y) / 1000);
       bendCompliance.push(bendA);
+      // Beyond-rest slot: the STRETCH compliance for this material, blended by the opposite-pair
+      // direction vs grain — the same anisotropic mapping used for stretch edges (the original's
+      // computeStretchAlpha on the bend edge a→b). The bending shader switches to this when the
+      // opposite vertices separate past rest length.
+      {
+        const dx = pb.x - pa.x, dy = pb.y - pa.y;
+        const len2d = Math.hypot(dx, dy);
+        const ex = len2d > 1e-9 ? dx / len2d : 1;
+        const ey = len2d > 1e-9 ? dy / len2d : 0;
+        const nWarp = Math.abs(ex * xHat.x + ey * xHat.y);
+        const nWeft = Math.abs(ex * yHat.x + ey * yHat.y);
+        bendComplianceBeyond.push(clampStretchAlpha((nWarp * warpA + nWeft * weftA) / Math.max(1e-8, nWarp + nWeft)));
+      }
       bendTargetAngle.push(0); // no internal fold lines in these pieces -> distance-mode bending
     }
 
@@ -341,18 +369,23 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
     return out;
   };
 
-  // Dense 1:1 seam pairing, matching the original (which sews equal-count resampled edges by index).
-  // The two chains are ordered along their shared edge; pair EVERY particle (walk the longer chain,
-  // map proportionally onto the shorter) so every seam particle gets a partner — not just the few
-  // that happened to be within a nearest-neighbour tolerance (which left long seams sparse/lumpy).
-  // Auto-detect edge direction: in the cached drape sewn edges are coincident, so the correct
-  // alignment (forward vs reversed) is the one with the smaller total paired distance.
+  // Seam pairing, matching the original: both edges are resampled to an EQUAL particle count and
+  // linked index-to-index (fromParticles[k] <-> toParticles[k]). Our ordered chains come from the
+  // piece boundary (edgeParticles preserves PiecePath direction) with SeamRef.reversed applied by
+  // chain(), so when the seam data carries explicit orientation (any ref with reversed=true) we
+  // trust it and link forward, exactly like the original. The repo's seam editors/importers however
+  // create every ref with reversed:false unconditionally — that data genuinely lacks orientation —
+  // so as a FALLBACK we auto-detect direction: in the cached drape sewn edges are coincident, so
+  // the correct alignment (forward vs reversed) is the one with the smaller total paired distance.
   const sampleIdx = (len: number, n: number, k: number) => (len <= 1 ? 0 : Math.round((k * (len - 1)) / (n - 1)));
   for (const seam of pattern.seams) {
     const fromChain = chain(seam.fromPaths);
     const toChain = chain(seam.toPaths);
     if (fromChain.length === 0 || toChain.length === 0) continue;
+    // Equal-count resampling: walk a common index range, mapping proportionally onto each chain.
     const n = Math.max(fromChain.length, toChain.length);
+    const hasExplicitOrientation =
+      seam.fromPaths.some((r) => r.reversed) || seam.toPaths.some((r) => r.reversed);
     const alignCost = (rev: boolean) => {
       let c = 0;
       for (let k = 0; k < n; k++) {
@@ -362,7 +395,7 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
       }
       return c;
     };
-    const rev = alignCost(true) < alignCost(false);
+    const rev = hasExplicitOrientation ? false : alignCost(true) < alignCost(false);
     for (let k = 0; k < n; k++) {
       const a = fromChain[sampleIdx(fromChain.length, n, k)];
       const b = toChain[sampleIdx(toChain.length, n, rev ? n - 1 - k : k)];
@@ -370,23 +403,24 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
     }
   }
 
-  // Proximity seams for saved-drape pieces: in the settled drape, sewn edges of adjacent pieces are
-  // coincident, so link boundary particles of different pieces that nearly touch. This keeps the
-  // garment sewn together when pulled / re-draped. Threshold ~> particle spacing so seam particles
-  // on both edges reliably pair up (else pieces detach under interaction).
-  const PROX = 0.016; // 16 mm
-  for (let i = 0; i < instBoundaryGlobals.length; i++) {
-    for (let j = i + 1; j < instBoundaryGlobals.length; j++) {
-      const A = instBoundaryGlobals[i];
-      const B = instBoundaryGlobals[j];
-      if (A.length === 0 || B.length === 0) continue;
-      for (const a of A) {
-        let best = -1, bd = PROX;
-        for (const b of B) {
-          const d = dist3(a, b);
-          if (d < bd) { bd = d; best = b; }
+  // Repo extension (default OFF — the original has no proximity-based sewing; see BuildSimOptions):
+  // link boundary particles of different saved-drape pieces that nearly touch in the settled drape,
+  // to keep a garment sewn together when its seam definitions are missing/incomplete.
+  if (options.proximitySeams) {
+    const PROX = 0.016; // 16 mm — ~> particle spacing so seam particles on both edges reliably pair
+    for (let i = 0; i < instBoundaryGlobals.length; i++) {
+      for (let j = i + 1; j < instBoundaryGlobals.length; j++) {
+        const A = instBoundaryGlobals[i];
+        const B = instBoundaryGlobals[j];
+        if (A.length === 0 || B.length === 0) continue;
+        for (const a of A) {
+          let best = -1, bd = PROX;
+          for (const b of B) {
+            const d = dist3(a, b);
+            if (d < bd) { bd = d; best = b; }
+          }
+          if (best >= 0) { addSeamLink(a, best); addSeamLink(best, a); }
         }
-        if (best >= 0) { addSeamLink(a, best); addSeamLink(best, a); }
       }
     }
   }
@@ -400,13 +434,21 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[]): SimDa
     const [a, b] = allStretchEdges[i];
     if (isSeam[a] && isSeam[b]) stretchCompliance[i] = DISABLED_COMPLIANCE;
   }
+  // A bend constraint is disabled when EITHER the opposite-vertex pair OR the hinge pair lies fully
+  // on a seam (the original checks both: `t.has(f.a)&&t.has(f.b) || t.has(m)&&t.has(P)`), zeroing
+  // both compliance slots to DISABLED and the fold angle.
   for (let i = 0; i < allBendEdges.length; i++) {
     const [a, b] = allBendEdges[i];
-    if (isSeam[a] && isSeam[b]) bendCompliance[i] = DISABLED_COMPLIANCE;
+    const [ha, hb] = bendHinge[i];
+    if ((isSeam[a] && isSeam[b]) || (isSeam[ha] && isSeam[hb])) {
+      bendCompliance[i] = DISABLED_COMPLIANCE;
+      bendComplianceBeyond[i] = DISABLED_COMPLIANCE;
+      bendTargetAngle[i] = 0;
+    }
   }
 
   const stretchColors = buildColorGroups(allStretchEdges, stretchRest, stretchCompliance, stretchLong);
-  const bendColors = buildBendColorGroups(allBendEdges, bendHinge, bendRest, bendCompliance, bendTargetAngle);
+  const bendColors = buildBendColorGroups(allBendEdges, bendHinge, bendRest, bendCompliance, bendComplianceBeyond, bendTargetAngle);
 
   // Per-piece collision layer + flip flag (matches the original: layered garments self-collide in
   // layer order; flipNormals encodes the triangle's outside sign). Looked up from settings3d.

@@ -18,12 +18,16 @@ export interface SimConfig {
   externalCollisionFriction: number;
   handleSelfCollisions: boolean;
   handleExternalCollisions: boolean;
+  useBending: boolean; // original "Use bending": dispatch the bending-constraint passes
   staticCollisionRadius: number; // m (cloth self-collision search radius)
   externalStaticCollisionRadius: number; // m (body)
   minDistance2d: number; // m (skip self-collision tris closer than this in 2D)
   clothSpacing: number; // m (internal spatial-hash cell size)
+  externalHashSpacing: number; // m (body spatial-hash cell size; original getHashSpacingMeters = particleDistance/1000)
   numInternalCollisionConstraintsPerParticle: number;
+  numExternalCollisionConstraintsPerParticle: number; // body tris gathered per particle (original 32)
   internalHashTableMultiplier: number;
+  externalHashTableMultiplier: number; // body hash table size = mult * numBodyTris + 1 (original 5)
   // Substeps between self-collision near-triangle re-gathers. Original = subSteps (once/frame);
   // smaller re-gathers more often against current positions (stable when the cloth is moving).
   selfCollisionGatherInterval: number;
@@ -62,12 +66,16 @@ export const SIM_CONFIG: SimConfig = {
   // measured to NOT reduce the curl and to cost ~9x, so we keep the original's once-per-frame gather.
   handleSelfCollisions: true,
   handleExternalCollisions: true,
+  useBending: true,
   staticCollisionRadius: designParticleDistance / 1000, // 0.01 m
   externalStaticCollisionRadius: (designParticleDistance / 1000) * 2.5, // 0.025 m
   minDistance2d: (3 * designParticleDistance) / 1000, // 0.03 m
   clothSpacing: 0.02, // ClothConfig.spacing
+  externalHashSpacing: designParticleDistance / 1000, // 0.01 m (original getHashSpacingMeters)
   numInternalCollisionConstraintsPerParticle: 16,
+  numExternalCollisionConstraintsPerParticle: 32,
   internalHashTableMultiplier: 5,
+  externalHashTableMultiplier: 5,
   selfCollisionGatherInterval: subSteps, // once per frame (matches original; re-gathering more was no better and ~9x slower)
   seamIterations: 1 // matches original (one seam Gauss-Seidel pass per substep); dense pairing makes the extra pass unnecessary
 };

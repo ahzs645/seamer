@@ -239,165 +239,231 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }`;
 }
 
-/** Cloth-vs-body collision using a CPU-built uniform grid. Accumulates into corrections. When a piece
- *  opts into `filterExternalCollisionsByClothNormal`, a contact is only applied if the body surface
- *  faces the same way as the cloth's own normal (estimated from the particle's incident cloth
- *  triangles) — this stops the cloth being pulled onto body backfaces in cavities (crotch, armpit). */
-export function bodyCollisionWGSL(cfg: SimConfig, maxIncident: number, withFilter: boolean): string {
-  const incidentStride = maxIncident + 1;
-  // The cloth-normal filter needs 2 extra storage buffers (clothTriangles, incidentTriangles), taking
-  // the shader to 9 storage buffers — above WebGPU's default per-stage limit of 8. The engine only
-  // passes withFilter=true when the device grants ≥9; otherwise we emit the plain 8-buffer shader.
-  const filterBindings = withFilter ? /* wgsl */ `
-@group(0) @binding(8) var<storage, read> clothTriangles: array<vec4u>;
-@group(0) @binding(9) var<storage, read> incidentTriangles: array<i32>;
-const maxIncident = ${maxIncident}u;
-const incidentStride = ${incidentStride}u;
-
-fn getNormalFilterFlag(particleIndex: u32) -> i32 {
-  return incidentTriangles[particleIndex * incidentStride];
-}
-fn computeClothNormal(particleIndex: u32) -> vec3f {
-  var accumulated = vec3f(0.0);
-  let base = particleIndex * incidentStride + 1u;
-  for (var slot = 0u; slot < maxIncident; slot++) {
-    let triIndex = incidentTriangles[base + slot];
-    if (triIndex < 0) { break; }
-    let tri = clothTriangles[u32(triIndex)];
-    let nrm = cross(positions[tri.y].xyz - positions[tri.x].xyz, positions[tri.z].xyz - positions[tri.x].xyz);
-    let l = length(nrm);
-    if (l > 1e-6) { accumulated += nrm / l; }
-  }
-  let al = length(accumulated);
-  if (al < 1e-5) { return vec3f(0.0); }
-  return accumulated / al;
-}` : '';
+/** External (body) collision gather — ported from the original's InitExternalCollisionsShader.
+ *  Once per frame: walk the GPU spatial hash over body-triangle centres and record up to
+ *  numExternalCollisionConstraintsPerParticle nearby body triangles per particle (within
+ *  externalStaticCollisionRadius of the triangle centre). Indices are stored +2 so 0 means
+ *  "no triangle" (matching the self-collision encoding; the external list carries no sideness sign). */
+export function initExternalCollisionWGSL(cfg: SimConfig, hashTableSize: number): string {
   return /* wgsl */ `
-struct GridParams {
-  origin: vec3f,
-  cellSize: f32,
-  dims: vec3u,
-  _pad: u32,
-};
+@group(0) @binding(0) var<storage, read> positions: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> nearTriangles: array<i32>;
+@group(0) @binding(2) var<storage, read> hashTable: array<u32>;
+@group(0) @binding(3) var<storage, read> hashPositions: array<u32>;
+@group(0) @binding(4) var<storage, read> triangleCenters: array<vec4f>;
+${hashFunctions(hashTableSize, cfg.externalHashSpacing)}
+const maxDist = ${cfg.externalStaticCollisionRadius}f;
+const maxDist2 = maxDist * maxDist;
+const numCollisionConstraintsPerParticle = ${cfg.numExternalCollisionConstraintsPerParticle}u;
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let index = gid.x;
+  if (index >= arrayLength(&positions)) { return; }
+  for (var i : u32 = 0u; i < numCollisionConstraintsPerParticle; i++) {
+    nearTriangles[index * numCollisionConstraintsPerParticle + i] = 0;
+  }
+  let pos = positions[index].xyz;
+  let x0 = intCoord(pos.x - maxDist); let y0 = intCoord(pos.y - maxDist); let z0 = intCoord(pos.z - maxDist);
+  let x1 = intCoord(pos.x + maxDist); let y1 = intCoord(pos.y + maxDist); let z1 = intCoord(pos.z + maxDist);
+  var num : u32 = 0u;
+  for (var xi = x0; xi <= x1; xi++) {
+    for (var yi = y0; yi <= y1; yi++) {
+      for (var zi = z0; zi <= z1; zi++) {
+        let h = hashCoords(xi, yi, zi);
+        let start = hashTable[h];
+        let end = hashTable[h + 1];
+        for (var i = start; i < end; i++) {
+          let triangleIndex = hashPositions[i];
+          if (triangleIndex >= arrayLength(&triangleCenters)) { continue; }
+          let trianglePosition = triangleCenters[triangleIndex].xyz;
+          let distVec = pos - trianglePosition;
+          if (dot(distVec, distVec) > maxDist2) { continue; }
+          let encodedIndex : i32 = i32(triangleIndex) + 2i; // +2 so 0 means "no triangle"
+          nearTriangles[index * numCollisionConstraintsPerParticle + num] = encodedIndex;
+          num++;
+          if (num >= numCollisionConstraintsPerParticle) { return; }
+        }
+      }
+    }
+  }
+}`;
+}
+
+/** External (body) collision solve — ported from the original's SolveExternalCollisionsShader.
+ *  Per substep: against the frozen per-frame gather list, pick the best contact (preferring body
+ *  surfaces whose normal faces the particle), then push out along the normal with friction.
+ *  The per-piece cloth-normal filter (incidentTriangles flag) rejects cavity backfaces (crotch,
+ *  armpit); flag sign flips the cloth normal for flipNormals pieces. 8 storage buffers — fits the
+ *  default per-stage limit. */
+export function solveExternalCollisionWGSL(cfg: SimConfig, maxIncident: number): string {
+  const incidentStride = maxIncident + 1;
+  return /* wgsl */ `
 @group(0) @binding(0) var<storage, read> positions: array<vec4f>;
 @group(0) @binding(1) var<storage, read_write> positionCorrection: array<vec4f>;
-@group(0) @binding(2) var<storage, read> lastPositions: array<vec4f>;
-@group(0) @binding(3) var<storage, read> bodyPositions: array<vec4f>;
-@group(0) @binding(4) var<storage, read> bodyTriangles: array<vec4u>;
-@group(0) @binding(5) var<storage, read> cellStart: array<u32>;
-@group(0) @binding(6) var<storage, read> cellTris: array<u32>;
-@group(0) @binding(7) var<uniform> grid: GridParams;
-${filterBindings}
+@group(0) @binding(2) var<storage, read_write> nearTriangles: array<i32>;
+@group(0) @binding(3) var<storage, read> triangles: array<vec4u>;
+@group(0) @binding(4) var<storage, read> externalPositions: array<vec4f>;
+@group(0) @binding(5) var<storage, read> lastPositions: array<vec4f>;
+@group(0) @binding(6) var<storage, read> clothTriangles: array<vec4u>;
+@group(0) @binding(7) var<storage, read> incidentTriangles: array<i32>;
 
 const thickness = ${cfg.simulationThickness}f;
-const friction = ${cfg.externalCollisionFriction}f;
+const numCollisionConstraintsPerParticle = ${cfg.numExternalCollisionConstraintsPerParticle}u;
+const frictionCoefficient = ${cfg.externalCollisionFriction}f;
+const maxIncidentTrianglesPerParticle = ${maxIncident}u;
+const incidentStride = ${incidentStride}u;
 
-fn closestPointOnTriangle(p: vec3f, a: vec3f, b: vec3f, c: vec3f) -> vec3f {
-  let ab = b - a; let ac = c - a; let ap = p - a;
-  let d1 = dot(ab, ap); let d2 = dot(ac, ap);
-  if (d1 <= 0.0 && d2 <= 0.0) { return a; }
-  let bp = p - b; let d3 = dot(ab, bp); let d4 = dot(ac, bp);
-  if (d3 >= 0.0 && d4 <= d3) { return b; }
-  let vc = d1 * d4 - d3 * d2;
-  if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) { let v = d1 / (d1 - d3); return a + v * ab; }
-  let cp = p - c; let d5 = dot(ab, cp); let d6 = dot(ac, cp);
-  if (d6 >= 0.0 && d5 <= d6) { return c; }
-  let vb = d5 * d2 - d1 * d6;
-  if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) { let w = d2 / (d2 - d6); return a + w * ac; }
-  let va = d3 * d6 - d5 * d4;
-  if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
-    let w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); return b + w * (c - b);
+fn getClosestPointOnTriangle(p0: vec3f, p1: vec3f, p2: vec3f, point: vec3f) -> vec3f {
+  let edge0 = p1 - p0; let edge1 = p2 - p0; let v0 = point - p0;
+  let a = dot(edge0, edge0); let b = dot(edge0, edge1); let c = dot(edge1, edge1);
+  let d = dot(edge0, v0); let e = dot(edge1, v0);
+  let det = a * c - b * b;
+  var s = b * e - c * d; var t = b * d - a * e;
+  if (s + t < det) {
+    if (s < 0.0) {
+      if (t < 0.0) {
+        if (d < 0.0) { s = clamp(-d / a, 0.0, 1.0); t = 0.0; }
+        else { s = 0.0; t = clamp(-e / c, 0.0, 1.0); }
+      } else { s = 0.0; t = clamp(-e / c, 0.0, 1.0); }
+    } else if (t < 0.0) { s = clamp(-d / a, 0.0, 1.0); t = 0.0; }
+    else { let invDet = 1.0 / det; s *= invDet; t *= invDet; }
+  } else {
+    if (s < 0.0) {
+      let tmp0 = b + d; let tmp1 = c + e;
+      if (tmp1 > tmp0) { let numer = tmp1 - tmp0; let denom = a - 2.0 * b + c; s = clamp(numer / denom, 0.0, 1.0); t = 1.0 - s; }
+      else { t = clamp(-e / c, 0.0, 1.0); s = 0.0; }
+    } else if (t < 0.0) {
+      if (a + d > b + e) { let numer = c + e - b - d; let denom = a - 2.0 * b + c; s = clamp(numer / denom, 0.0, 1.0); t = 1.0 - s; }
+      else { s = clamp(-e / c, 0.0, 1.0); t = 0.0; }
+    } else { let numer = c + e - b - d; let denom = a - 2.0 * b + c; s = clamp(numer / denom, 0.0, 1.0); t = 1.0 - s; }
   }
-  let denom = 1.0 / (va + vb + vc);
-  let v = vb * denom; let w = vc * denom;
-  return a + ab * v + ac * w;
+  return p0 + s * edge0 + t * edge1;
 }
 
-fn applyFriction(particleDelta: vec3f, n: vec3f, penetration: f32) -> vec3f {
-  if (friction <= 0.0 || penetration <= 0.0) { return vec3f(0.0); }
-  let tangential = particleDelta - n * dot(particleDelta, n);
-  let tl = length(tangential);
-  if (tl <= 1e-6) { return vec3f(0.0); }
-  let maxF = friction * penetration;
-  let mag = min(tl, maxF);
-  return -mag * (tangential / tl);
+fn computeClothNormal(particleIndex: u32) -> vec3f {
+  if (maxIncidentTrianglesPerParticle == 0u || incidentStride == 0u) { return vec3f(0.0); }
+  var accumulated = vec3f(0.0);
+  let base = particleIndex * incidentStride + 1u;
+  for (var slot = 0u; slot < maxIncidentTrianglesPerParticle; slot++) {
+    let incidentIndex = base + slot;
+    if (incidentIndex >= arrayLength(&incidentTriangles)) { break; }
+    let triIndex = incidentTriangles[incidentIndex];
+    if (triIndex < 0) { break; }
+    let clothTri = clothTriangles[u32(triIndex)];
+    let c0Index = u32(clothTri.x); let c1Index = u32(clothTri.y); let c2Index = u32(clothTri.z);
+    if (c0Index >= arrayLength(&positions) || c1Index >= arrayLength(&positions) || c2Index >= arrayLength(&positions)) { continue; }
+    let c0 = positions[c0Index].xyz;
+    let c1 = positions[c1Index].xyz;
+    let c2 = positions[c2Index].xyz;
+    let triNormal = cross(c1 - c0, c2 - c0);
+    let triNormalLength = length(triNormal);
+    if (triNormalLength < 1e-6) { continue; }
+    accumulated += triNormal / triNormalLength;
+  }
+  let accumulatedLength = length(accumulated);
+  if (accumulatedLength < 1e-5) { return vec3f(0.0); }
+  return accumulated / accumulatedLength;
+}
+
+fn getNormalFilterFlag(particleIndex: u32) -> i32 {
+  if (incidentStride == 0u) { return 0; }
+  let flagIndex = particleIndex * incidentStride;
+  if (flagIndex >= arrayLength(&incidentTriangles)) { return 0; }
+  return incidentTriangles[flagIndex];
+}
+
+fn applyFriction(particleDelta: vec3f, contactNormal: vec3f, penetration: f32, surfaceDelta: vec3f) -> vec3f {
+  if (frictionCoefficient <= 0.0 || penetration <= 0.0) { return vec3f(0.0); }
+  let relativeDelta = particleDelta - surfaceDelta;
+  let tangential = relativeDelta - contactNormal * dot(relativeDelta, contactNormal);
+  let tangentialLength = length(tangential);
+  if (tangentialLength <= 1e-6) { return vec3f(0.0); }
+  let maxFriction = frictionCoefficient * penetration;
+  if (maxFriction <= 0.0) { return vec3f(0.0); }
+  return -min(tangentialLength, maxFriction) * (tangential / tangentialLength);
 }
 
 @compute @workgroup_size(${WG})
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let index = gid.x;
   if (index >= arrayLength(&positions)) { return; }
+  let pos = positions[index].xyz;
   let invMass = positions[index].w;
   if (invMass <= 0.0) { return; }
-  let pos = positions[index].xyz;
-  let particleDelta = pos - lastPositions[index].xyz;
+  if (index >= arrayLength(&lastPositions)) { return; }
+  let particleLast = lastPositions[index].xyz;
+  let particleDelta = pos - particleLast;
 
-  // Cloth-normal filter (per piece): when enabled, only collide with body surfaces that face the
-  // same way as this particle's cloth normal. flag sign flips the cloth normal (flipNormals pieces).
-  var wantsFilter = false;
   var clothNormal = vec3f(0.0);
-${withFilter ? `  let filterFlag = getNormalFilterFlag(index);
-  wantsFilter = filterFlag != 0;
-  if (wantsFilter) {
-    let flipFactor = select(1.0, -1.0, filterFlag < 0);
+  var wantsFilter = false;
+  var flipFactor = 1.0;
+  let filterFlag = getNormalFilterFlag(index);
+  if (filterFlag != 0) {
+    wantsFilter = true;
+    if (filterFlag < 0) { flipFactor = -1.0; }
     clothNormal = computeClothNormal(index) * flipFactor;
-    if (length(clothNormal) < 1e-5) { wantsFilter = false; }
-  }` : ''}
+  }
 
-  let gx = i32(floor((pos.x - grid.origin.x) / grid.cellSize));
-  let gy = i32(floor((pos.y - grid.origin.y) / grid.cellSize));
-  let gz = i32(floor((pos.z - grid.origin.z) / grid.cellSize));
-  let dx = i32(grid.dims.x); let dy = i32(grid.dims.y); let dz = i32(grid.dims.z);
-
-  var bestDist2 = 3.40282e38f;
-  var bestPlane = 0.0;
+  var bestDistance2 = 3.40282e38f;
+  var bestPlaneDistance = 0.0;
   var bestNormal = vec3f(0.0);
   var hasContact = false;
-  var bestPositive = false;
+  var bestWasPositive = false;
 
-  for (var ox = -1; ox <= 1; ox++) {
-    for (var oy = -1; oy <= 1; oy++) {
-      for (var oz = -1; oz <= 1; oz++) {
-        let cx = gx + ox; let cy = gy + oy; let cz = gz + oz;
-        if (cx < 0 || cy < 0 || cz < 0 || cx >= dx || cy >= dy || cz >= dz) { continue; }
-        let cell = u32((cz * dy + cy) * dx + cx);
-        let start = cellStart[cell];
-        let end = cellStart[cell + 1u];
-        for (var e = start; e < end; e++) {
-          let tri = bodyTriangles[cellTris[e]];
-          let p0 = bodyPositions[tri.x].xyz;
-          let p1 = bodyPositions[tri.y].xyz;
-          let p2 = bodyPositions[tri.z].xyz;
-          let raw = cross(p1 - p0, p2 - p0);
-          let nl = length(raw);
-          if (nl < 1e-6) { continue; }
-          let n = raw / nl;
-          let cpt = closestPointOnTriangle(pos, p0, p1, p2);
-          let off = pos - cpt;
-          let dist2 = dot(off, off);
-          let plane = dot(pos - p0, n);
-          if (plane < -thickness) { continue; }
-          let positive = plane >= 0.0;
-          var choose = false;
-          if (positive) {
-            if (!bestPositive || dist2 < bestDist2) { choose = true; bestPositive = true; }
-          } else if (!bestPositive && dist2 < bestDist2) { choose = true; }
-          if (choose) { bestDist2 = dist2; bestPlane = plane; bestNormal = n; hasContact = true; }
-        }
-      }
+  for (var collisionIndex = 0u; collisionIndex < numCollisionConstraintsPerParticle; collisionIndex++) {
+    let encodedTriangleIndex = nearTriangles[index * numCollisionConstraintsPerParticle + collisionIndex];
+    if (encodedTriangleIndex < 1) { break; }
+    let decodedTriangleIndex = encodedTriangleIndex - 2;
+    if (decodedTriangleIndex < 0) { continue; }
+    let triangleIndex = u32(decodedTriangleIndex);
+    if (triangleIndex >= arrayLength(&triangles)) { continue; }
+    let triData = triangles[triangleIndex];
+    let p0Index = u32(triData.x); let p1Index = u32(triData.y); let p2Index = u32(triData.z);
+    if (p0Index >= arrayLength(&externalPositions) || p1Index >= arrayLength(&externalPositions) || p2Index >= arrayLength(&externalPositions)) { continue; }
+    let p0 = externalPositions[p0Index].xyz;
+    let p1 = externalPositions[p1Index].xyz;
+    let p2 = externalPositions[p2Index].xyz;
+    let triNormalRaw = cross(p1 - p0, p2 - p0);
+    let normalLength = length(triNormalRaw);
+    if (normalLength < 0.000001) { continue; }
+    let triNormal = triNormalRaw / normalLength;
+    let closestPoint = getClosestPointOnTriangle(p0, p1, p2, pos);
+    let offset = pos - closestPoint;
+    let dist2 = dot(offset, offset);
+    let planeDistance = dot(pos - p0, triNormal);
+    // Discard triangles well behind the particle (prevents getting pulled by cavity backfaces).
+    if (planeDistance < -thickness) { continue; }
+    // Prefer surfaces where the particle is on the positive side of the normal; otherwise fall back
+    // to the nearest triangle that passed the backface test.
+    let isPositiveSide = planeDistance >= 0.0;
+    var shouldChoose = false;
+    if (isPositiveSide) {
+      if (!bestWasPositive || dist2 < bestDistance2) { shouldChoose = true; bestWasPositive = true; }
+    } else if (!bestWasPositive && dist2 < bestDistance2) { shouldChoose = true; }
+    if (shouldChoose) {
+      bestDistance2 = dist2;
+      bestPlaneDistance = planeDistance;
+      bestNormal = triNormal;
+      hasContact = true;
     }
   }
 
-  var apply = hasContact && bestPlane < thickness;
-  if (bestPositive) { apply = apply && bestPlane >= 0.0; }
-  if (apply && dot(particleDelta, bestNormal) >= 0.0) { apply = false; }
-  // Reject contacts where the body surface faces opposite the cloth's own normal (cavity backfaces).
-  if (apply && wantsFilter && dot(clothNormal, bestNormal) < 0.0) { apply = false; }
-  if (apply) {
-    let penetration = thickness - bestPlane;
+  var shouldApplyContact = hasContact && bestPlaneDistance < thickness;
+  if (bestWasPositive) { shouldApplyContact = shouldApplyContact && bestPlaneDistance >= 0.0; }
+  // Only collide when moving into the surface; avoids jitter when already separating.
+  if (shouldApplyContact && dot(particleDelta, bestNormal) >= 0.0) { shouldApplyContact = false; }
+  if (shouldApplyContact && wantsFilter) {
+    let clothNormalLength = length(clothNormal);
+    if (clothNormalLength > 1e-5) { shouldApplyContact = dot(clothNormal, bestNormal) >= 0.0; }
+  }
+  if (shouldApplyContact) {
+    let penetration = thickness - bestPlaneDistance;
     if (penetration > 0.0) {
       var correction = bestNormal * penetration;
-      correction += applyFriction(particleDelta, bestNormal, penetration);
+      if (frictionCoefficient > 0.0) {
+        correction += applyFriction(particleDelta, bestNormal, penetration, vec3f(0.0));
+      }
       positionCorrection[index] += vec4f(correction, 1.0);
     }
   }
@@ -843,6 +909,209 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let riSelf = positions[index].xyz - xcm;
   let targetVelocity = vcm + cross(omega, riSelf);
   vel = vel + kdamping * (targetVelocity - vel);
+  if (length(vel) > maxVelocity) { vel = normalize(vel) * maxVelocity; }
+  velocities[index] = vec4f(vel, 0.0);
+}`;
+}
+
+/** Local (whole-garment rigid-body) damping, state pass — ported from the original's
+ *  ComputeDampingStateShader. A single-workgroup two-stage reduction over ALL particles:
+ *  total mass + centre of mass + centre-of-mass velocity, then angular momentum + inertia tensor
+ *  (and its inverse) to get the rigid-body angular velocity omega. Dispatch with EXACTLY 1
+ *  workgroup. Velocities use the repo's vec4 convention (.w padding; original used array<vec3f>,
+ *  same 16-byte stride). dampingState is 3 vec4f: xcm(+totalMass in .w), vcm, omega. */
+export function computeDampingStateWGSL(): string {
+  return /* wgsl */ `
+struct DampingState {
+  xcm : vec4f,
+  vcm : vec4f,
+  omega : vec4f,
+};
+
+@group(0) @binding(0) var<storage, read> positions: array<vec4f>;
+@group(0) @binding(1) var<storage, read> velocities: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dampingState: DampingState;
+
+const WORKGROUP_SIZE : u32 = ${WG}u;
+
+var<workgroup> massShared : array<f32, ${WG}>;
+var<workgroup> posShared : array<vec3f, ${WG}>;
+var<workgroup> velShared : array<vec3f, ${WG}>;
+
+var<workgroup> LShared : array<vec3f, ${WG}>;
+var<workgroup> ICol0Shared : array<vec3f, ${WG}>;
+var<workgroup> ICol1Shared : array<vec3f, ${WG}>;
+var<workgroup> ICol2Shared : array<vec3f, ${WG}>;
+
+var<workgroup> xcmShared : vec3f;
+var<workgroup> vcmShared : vec3f;
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_id) local_id: vec3u) {
+  let particleCount = arrayLength(&positions);
+
+  var massLocal = 0.0;
+  var posMassLocal = vec3f(0.0);
+  var velMassLocal = vec3f(0.0);
+
+  var index = local_id.x;
+  loop {
+    if (index >= particleCount) { break; }
+    let invMass = positions[index].w;
+    if (invMass > 0.0) {
+      let mass = 1.0 / invMass;
+      let pos = positions[index].xyz;
+      let vel = velocities[index].xyz;
+      massLocal += mass;
+      posMassLocal += pos * mass;
+      velMassLocal += vel * mass;
+    }
+    index += WORKGROUP_SIZE;
+  }
+
+  massShared[local_id.x] = massLocal;
+  posShared[local_id.x] = posMassLocal;
+  velShared[local_id.x] = velMassLocal;
+  workgroupBarrier();
+
+  var stride = WORKGROUP_SIZE / 2u;
+  loop {
+    if (stride == 0u) { break; }
+    if (local_id.x < stride) {
+      massShared[local_id.x] += massShared[local_id.x + stride];
+      posShared[local_id.x] += posShared[local_id.x + stride];
+      velShared[local_id.x] += velShared[local_id.x + stride];
+    }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+
+  if (local_id.x == 0u) {
+    let totalMass = massShared[0];
+    var xcm = vec3f(0.0);
+    var vcm = vec3f(0.0);
+    if (totalMass > 0.0) {
+      xcm = posShared[0] / totalMass;
+      vcm = velShared[0] / totalMass;
+    }
+    dampingState.xcm = vec4f(xcm, totalMass);
+    dampingState.vcm = vec4f(vcm, 0.0);
+    xcmShared = xcm;
+    vcmShared = vcm;
+  }
+  storageBarrier();
+  workgroupBarrier();
+
+  let totalMass = massShared[0];
+  let hasMass = totalMass > 0.0;
+
+  var LLocal = vec3f(0.0);
+  var ICol0Local = vec3f(0.0);
+  var ICol1Local = vec3f(0.0);
+  var ICol2Local = vec3f(0.0);
+
+  if (hasMass) {
+    var index2 = local_id.x;
+    loop {
+      if (index2 >= particleCount) { break; }
+      let invMass = positions[index2].w;
+      if (invMass > 0.0) {
+        let mass = 1.0 / invMass;
+        let pos = positions[index2].xyz;
+        let vel = velocities[index2].xyz;
+        let ri = pos - xcmShared;
+        let miVi = vel * mass;
+        LLocal += cross(ri, miVi);
+
+        let diagTerm = dot(ri, ri) * mass;
+        let rx = ri.x; let ry = ri.y; let rz = ri.z;
+        ICol0Local += vec3f(diagTerm - mass * rx * rx, -mass * rx * ry, -mass * rx * rz);
+        ICol1Local += vec3f(-mass * ry * rx, diagTerm - mass * ry * ry, -mass * ry * rz);
+        ICol2Local += vec3f(-mass * rz * rx, -mass * rz * ry, diagTerm - mass * rz * rz);
+      }
+      index2 += WORKGROUP_SIZE;
+    }
+  }
+
+  LShared[local_id.x] = LLocal;
+  ICol0Shared[local_id.x] = ICol0Local;
+  ICol1Shared[local_id.x] = ICol1Local;
+  ICol2Shared[local_id.x] = ICol2Local;
+  workgroupBarrier();
+
+  var stride2 = WORKGROUP_SIZE / 2u;
+  loop {
+    if (stride2 == 0u) { break; }
+    if (local_id.x < stride2) {
+      LShared[local_id.x] += LShared[local_id.x + stride2];
+      ICol0Shared[local_id.x] += ICol0Shared[local_id.x + stride2];
+      ICol1Shared[local_id.x] += ICol1Shared[local_id.x + stride2];
+      ICol2Shared[local_id.x] += ICol2Shared[local_id.x + stride2];
+    }
+    workgroupBarrier();
+    stride2 = stride2 / 2u;
+  }
+
+  if (local_id.x == 0u) {
+    var omega = vec3f(0.0);
+    if (hasMass) {
+      let inertia = mat3x3<f32>(ICol0Shared[0], ICol1Shared[0], ICol2Shared[0]);
+      let det = dot(inertia[0], cross(inertia[1], inertia[2]));
+      let LTotal = LShared[0];
+      if (abs(det) > 1e-9) {
+        let invDet = 1.0 / det;
+        let invInertia = mat3x3<f32>(
+          cross(inertia[1], inertia[2]) * invDet,
+          cross(inertia[2], inertia[0]) * invDet,
+          cross(inertia[0], inertia[1]) * invDet
+        );
+        omega = invInertia * LTotal;
+      }
+    }
+    dampingState.omega = vec4f(omega, 0.0);
+  }
+  storageBarrier();
+}`;
+}
+
+/** Local damping, apply pass — ported from the original's ApplyLocalDampingShader: damp each
+ *  particle's velocity toward the whole-garment rigid-body motion (vcm + omega x ri). */
+export function applyLocalDampingWGSL(cfg: SimConfig): string {
+  return /* wgsl */ `
+struct DampingState {
+  xcm : vec4f,
+  vcm : vec4f,
+  omega : vec4f,
+};
+
+@group(0) @binding(0) var<storage, read> positions: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> velocities: array<vec4f>;
+@group(0) @binding(2) var<storage, read> dampingState: DampingState;
+
+const kdamping = ${cfg.localDamping}f;
+const maxVelocity = ${cfg.maxVelocity}f;
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= arrayLength(&positions) || kdamping <= 0.0) { return; }
+  let index = gid.x;
+  let invMass = positions[index].w;
+  if (invMass <= 0.0) { return; }
+
+  let pos = positions[index].xyz;
+  var vel = velocities[index].xyz;
+
+  let xcm = dampingState.xcm.xyz;
+  let vcm = dampingState.vcm.xyz;
+  let totalMass = dampingState.xcm.w;
+  let omega = dampingState.omega.xyz;
+
+  if (totalMass <= 0.0) { return; }
+
+  let ri = pos - xcm;
+  let globalMotion = vcm + cross(omega, ri);
+  let delta = globalMotion - vel;
+  vel = vel + kdamping * delta;
   if (length(vel) > maxVelocity) { vel = normalize(vel) * maxVelocity; }
   velocities[index] = vec4f(vel, 0.0);
 }`;

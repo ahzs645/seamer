@@ -47,6 +47,9 @@ export const interactionMode = persisted<'fast' | 'safe'>('seamer.interactionMod
 export const frozenSnapshotOpacity = persisted<number>('seamer.frozenSnapshotOpacity', 0.35);
 /** Show the live cursor / selection coordinate readout in the status bar. */
 export const showCoordinates = persisted<boolean>('seamer.showCoordinates', true);
+/** "Anchor to saved drape": ON (default) softly holds the cached drape while simulating; OFF is the
+ *  source-parity free-run (anchor scale 0 — the solver settles unaided). */
+export const simAnchors = persisted<boolean>('seamer.simAnchors', true);
 
 // --- Labeled undo/redo history ------------------------------------------------
 // Faithful in spirit to the original application's named editor.execute() commands: each

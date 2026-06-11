@@ -94,6 +94,22 @@ export class PatternRenderer {
   // closer to the source's free feel, while staying comfortably on the held side of the cliff.
   private static readonly LIVE_ANCHOR = 0.08;
   private liveAnchorScale = PatternRenderer.LIVE_ANCHOR; // restored after an interactive grab
+  // "Anchor to saved drape" toggle: ON (default) = the gentle LIVE_ANCHOR hold above; OFF =
+  // source-parity free-run (anchor scale 0, the solver settles unaided like the original).
+  private anchorsEnabled = true;
+
+  /** The live hold strength honouring the "Anchor to saved drape" toggle. */
+  private holdAnchor(): number {
+    return this.anchorsEnabled ? PatternRenderer.LIVE_ANCHOR : 0;
+  }
+
+  /** Enable/disable the saved-drape anchor. Applies live to a running user sim. */
+  setAnchorsEnabled(on: boolean): void {
+    if (this.anchorsEnabled === on) return;
+    this.anchorsEnabled = on;
+    this.liveAnchorScale = this.holdAnchor();
+    if (this.userSimulating && !this.grabbing) this.sim?.setAnchorScale(this.liveAnchorScale);
+  }
 
   private pattern: Pattern | null = null;
   private rafId = 0;
@@ -838,7 +854,7 @@ export class PatternRenderer {
         // no physics re-settle, so it can't splay/curl the way per-piece rigid fit or free settling did.
         const cylName = this.cylinderNameForPiece.bind(this);
         const refit = cylinderRefit(sim.positions, this.prepared!.simData.pieces, cylName, this.baseCylinders, this.cylinders);
-        sim.seedAndHold(refit, PatternRenderer.LIVE_ANCHOR);
+        sim.seedAndHold(refit, this.holdAnchor());
         this.applyClothPositions(refit);
         sim.setSelfCollision(true);
         this.adaptFramesLeft = 0;
@@ -855,10 +871,10 @@ export class PatternRenderer {
         // (not a rigid pin) lets the cloth settle/respond like a live sim while staying faithful to
         // the source's drape and not curling the free waistband edge.
         sim.setSelfCollision(true);
-        sim.setAnchorScale(PatternRenderer.LIVE_ANCHOR);
+        sim.setAnchorScale(this.holdAnchor());
         this.adaptFramesLeft = 0;
       }
-      this.liveAnchorScale = this.bodyDirty ? 0.3 : PatternRenderer.LIVE_ANCHOR; // restore after a grab
+      this.liveAnchorScale = this.bodyDirty ? 0.3 : this.holdAnchor(); // restore after a grab
       this.userSimulating = true; // user-started: keep running across grab/release
       this.simulating = true;
       this.onStatus('simulating');
@@ -1123,8 +1139,8 @@ export class PatternRenderer {
       // Move mode: the anchors still target the settled drape, so a soft hold eases the displaced
       // pieces back into place — they "fly back" — then the live sim keeps running until stopped.
       sim.setSelfCollision(true);
-      sim.setAnchorScale(PatternRenderer.LIVE_ANCHOR);
-      this.liveAnchorScale = PatternRenderer.LIVE_ANCHOR;
+      sim.setAnchorScale(this.holdAnchor());
+      this.liveAnchorScale = this.holdAnchor();
       this.userSimulating = true; // stays live across grabs; Stop bakes the result
     } else {
       // Flat-arrangement drape: free settle from the user's layout (no cached drape applies);
@@ -1169,9 +1185,14 @@ export class PatternRenderer {
    */
   async setSimConfig(partial: Partial<SimConfig>): Promise<void> {
     Object.assign(SIM_CONFIG, partial);
+    // deltaT is derived from timeStep/subSteps (the shaders bake it), so keep it in sync.
+    if ('timeStep' in partial || 'subSteps' in partial) {
+      SIM_CONFIG.deltaT = SIM_CONFIG.timeStep / Math.max(1, SIM_CONFIG.subSteps);
+    }
     if (this.sim) this.sim.setSelfCollision(SIM_CONFIG.handleSelfCollisions);
     // Params that change shader code need a rebuilt engine; preserve the live positions across it.
-    const bakedKeys: (keyof SimConfig)[] = ['gravity', 'globalDamping', 'localDamping', 'nearDamping', 'simulationThickness', 'edgeThickness', 'seamStrength', 'selfCollisionFriction', 'externalCollisionFriction', 'seamIterations', 'handleExternalCollisions'];
+    // (timeStep/subSteps/max/minVelocity are baked as WGSL constants; useBending gates the bend pass.)
+    const bakedKeys: (keyof SimConfig)[] = ['gravity', 'globalDamping', 'localDamping', 'nearDamping', 'simulationThickness', 'edgeThickness', 'seamStrength', 'selfCollisionFriction', 'externalCollisionFriction', 'seamIterations', 'handleExternalCollisions', 'timeStep', 'subSteps', 'maxVelocity', 'minVelocity', 'useBending'];
     if (!this.sim || !bakedKeys.some((k) => k in partial)) return;
     const pos = this.sim.positions.slice();
     const wasSim = this.simulating;

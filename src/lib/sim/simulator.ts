@@ -1,20 +1,39 @@
 // Orchestrates the cloth simulation. prepare() does all GPU-free work (triangulate + arrange +
-// assemble sim data + body grid) so the avatar and arranged panels render even without WebGPU;
-// the live XPBD drape (ClothSimulation) is created on demand once a GPU device is available.
+// assemble sim data + body mesh packing) so the avatar and arranged panels render even without
+// WebGPU; the live XPBD drape (ClothSimulation) is created on demand once a GPU device is available.
 
 import type { Pattern } from '$lib/types/pattern';
 import type { CylinderFrame } from '$lib/geometry/cylinders';
 import { buildPieceCloth, buildSavedCloth, reuseSavedDrape } from '$lib/geometry/boundary';
 import { arrangeParticles } from '$lib/geometry/arrangement';
 import { buildSimData, type SimData, type ArrangedPiece } from './build';
-import { buildBodyGrid, type BodyGrid } from './bodyGrid';
-import { ClothEngine } from './webgpu/engine';
+import { ClothEngine, type BodyMesh } from './webgpu/engine';
 import { SIM_CONFIG } from './config';
 import { kabschRigid, applyRigid } from './refit';
 
 export interface PreparedCloth {
   simData: SimData;
-  grid: BodyGrid;
+  body: BodyMesh;
+}
+
+/** Pack the avatar mesh into the engine's vec4 layout (positions x,y,z,0; triangles i0,i1,i2,0).
+ *  The body broad-phase itself (a triangle spatial hash) is built on the GPU, like the original. */
+export function packBodyMesh(vertexPositions: Float32Array, indices: Uint32Array): BodyMesh {
+  const numVerts = vertexPositions.length / 3;
+  const numTris = indices.length / 3;
+  const positions = new Float32Array(numVerts * 4);
+  for (let i = 0; i < numVerts; i++) {
+    positions[i * 4] = vertexPositions[i * 3];
+    positions[i * 4 + 1] = vertexPositions[i * 3 + 1];
+    positions[i * 4 + 2] = vertexPositions[i * 3 + 2];
+  }
+  const triangles = new Uint32Array(numTris * 4);
+  for (let t = 0; t < numTris; t++) {
+    triangles[t * 4] = indices[t * 3];
+    triangles[t * 4 + 1] = indices[t * 3 + 1];
+    triangles[t * 4 + 2] = indices[t * 3 + 2];
+  }
+  return { positions, triangles, numTriangles: numTris };
 }
 
 export interface PrepareInit {
@@ -86,8 +105,8 @@ export function prepareCloth(
   }
   if (arranged.length === 0) return null;
   const simData = buildSimData(pattern, arranged);
-  const grid = buildBodyGrid(init.avatarVertices, init.avatarIndices);
-  return { simData, grid };
+  const body = packBodyMesh(init.avatarVertices, init.avatarIndices);
+  return { simData, body };
 }
 
 export class ClothSimulation {
@@ -97,7 +116,7 @@ export class ClothSimulation {
 
   constructor(device: GPUDevice, prepared: PreparedCloth) {
     this.simData = prepared.simData;
-    this.engine = new ClothEngine(device, prepared.simData, prepared.grid, SIM_CONFIG);
+    this.engine = new ClothEngine(device, prepared.simData, prepared.body, SIM_CONFIG);
     this.latest = prepared.simData.positions.slice();
   }
 
@@ -192,7 +211,7 @@ export class ClothSimulation {
   }
 
   rebuildBodyGrid(avatarVertices: Float32Array, avatarIndices: Uint32Array) {
-    this.engine.updateBodyGrid(buildBodyGrid(avatarVertices, avatarIndices));
+    this.engine.updateBodyMesh(packBodyMesh(avatarVertices, avatarIndices));
   }
 
   dispose() {
