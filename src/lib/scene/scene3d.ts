@@ -22,6 +22,7 @@ import { cylinderRefit } from '$lib/sim/cylinderRefit';
 import { requestClothDevice, isWebGPUAvailable } from '$lib/sim/webgpu/device';
 import { createGarmentMaterial, createAvatarMaterial, hasSeparateBack, disposeGarmentMaterial } from './materials';
 import { isDarkTheme, onThemeChange } from '$lib/utils/theme';
+import { samePick, type SeamPick, type SeamToolState } from '$lib/utils/seamTool';
 
 export type RendererStatus = 'idle' | 'loading' | 'ready' | 'simulating' | 'error';
 
@@ -424,6 +425,12 @@ export class PatternRenderer {
       setNdc(ev);
       // refresh bounding spheres so raycasting matches the current (draped) geometry
       for (const e of this.clothMeshes) e.geometry.computeBoundingSphere();
+      // Seam tool active: clicks pick piece edges on the garment instead of selecting/grabbing.
+      if (this.seamToolState) {
+        const pick = this.pickSeamEdge(ndc);
+        if (pick) this.onSeamEdgePick(pick);
+        return; // miss -> orbit, but never enter manipulate/grab while the seam tool is up
+      }
       this.raycaster.setFromCamera(ndc, this.camera);
       const hits = this.raycaster.intersectObjects(this.clothMeshes.map((e) => e.mesh), false);
       const hit = hits[0];
@@ -466,6 +473,18 @@ export class PatternRenderer {
     });
 
     dom.addEventListener('pointermove', (ev) => {
+      // seam tool hover: highlight the edge run the cursor is over (throttled raycast)
+      if (this.seamToolState && !this.grabbing && this.mode === 'view' && this.clothMeshes.length) {
+        const now = performance.now();
+        if (now - this.lastSeamHoverAt > 50) {
+          this.lastSeamHoverAt = now;
+          setNdc(ev);
+          const pick = this.pickSeamEdge(ndc);
+          const changed = !!pick !== !!this.seamToolHover ||
+            (pick && this.seamToolHover && (!samePick(pick, this.seamToolHover) || pick.reversed !== this.seamToolHover.reversed));
+          if (changed) { this.seamToolHover = pick; this.rebuildSeamToolOverlay(); }
+        }
+      }
       // arrangement-marker hover highlight (cheap raycast against the small marker set)
       if (!this.grabbing && this.apGroup.visible && this.apMarkers.length) {
         setNdc(ev);
@@ -741,6 +760,7 @@ export class PatternRenderer {
 
   private applyClothPositions(global: Float32Array) {
     this.lastClothPositions = global;
+    this.updateSeamToolOverlayPositions();
     for (const entry of this.clothMeshes) {
       const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
       const arr = attr.array as Float32Array;
@@ -1425,6 +1445,168 @@ export class PatternRenderer {
     if (this.seamLines) {
       this.seamLines.visible = on;
       if (on) this.updateSeamLines(this.lastClothPositions ?? this.prepared?.simData.positions ?? new Float32Array());
+    }
+  }
+
+  // ---- 3D seam tool: pick piece edges on the draped garment (the original's handleSeamPointerDown /
+  // updateSeamToolVisualization — cylinder tubes along selected runs + a cone direction arrow). ----
+  private seamToolState: SeamToolState | null = null;
+  private seamToolHover: SeamPick | null = null;
+  private seamToolGroup = new THREE.Group();
+  private seamToolEntries: { mesh: THREE.InstancedMesh; cone: THREE.Mesh; run: number[]; reversed: boolean }[] = [];
+  private lastSeamHoverAt = 0;
+  /** A 3D edge click while a seam tool is active; the component routes it through the shared tool. */
+  onSeamEdgePick: (pick: SeamPick) => void = () => {};
+
+  private seamToolKind: 'single' | 'multi' = 'single';
+
+  /** Push the shared seam-tool selection into the 3D overlay (null = tool inactive). */
+  setSeamToolState(state: SeamToolState | null, kind: 'single' | 'multi' = 'single'): void {
+    this.seamToolState = state ? { from: [...state.from], to: [...state.to], phase: state.phase } : null;
+    this.seamToolKind = kind;
+    if (!state) this.seamToolHover = null;
+    this.rebuildSeamToolOverlay();
+  }
+
+  /** Find the edge run for a pick (`${pieceId}::${ppId}` or `...#M` in simData.edgeRuns). */
+  private seamRunFor(pick: { id: string; mirrored: boolean }): number[] | null {
+    if (!this.prepared) return null;
+    const suffix = `::${pick.id}${pick.mirrored ? '#M' : ''}`;
+    for (const [key, run] of this.prepared.simData.edgeRuns) {
+      if (key.endsWith(suffix) && run.length >= 2) return run;
+    }
+    return null;
+  }
+
+  /** Raycast the garment and resolve the nearest piece-edge run + click position along it. */
+  private pickSeamEdge(ndc: THREE.Vector2): SeamPick | null {
+    if (!this.prepared || this.clothMeshes.length === 0) return null;
+    this.raycaster.setFromCamera(ndc, this.camera);
+    const hits = this.raycaster.intersectObjects(this.clothMeshes.map((e) => e.mesh), false);
+    const hit = hits[0];
+    if (!hit) return null;
+    const entry = this.clothMeshes.find((e) => e.mesh === hit.object);
+    if (!entry) return null;
+    const pos = this.lastClothPositions ?? this.prepared.simData.positions;
+    let bestKey: string | null = null;
+    let bestRun: number[] | null = null;
+    let bestIdx = 0;
+    let bd = Infinity;
+    for (const [key, run] of this.prepared.simData.edgeRuns) {
+      if (run.length < 2) continue;
+      if (run[0] < entry.start || run[0] >= entry.start + entry.count) continue; // other instance
+      for (let i = 0; i < run.length; i++) {
+        const g = run[i];
+        const dx = pos[g * 4] - hit.point.x;
+        const dy = pos[g * 4 + 1] - hit.point.y;
+        const dz = pos[g * 4 + 2] - hit.point.z;
+        const d = dx * dx + dy * dy + dz * dz;
+        if (d < bd) { bd = d; bestKey = key; bestRun = run; bestIdx = i; }
+      }
+    }
+    if (!bestKey || !bestRun) return null;
+    // accept hits within ~2.5 particle spacings of the edge (else the click was mid-panel)
+    const a = bestRun[0], b = bestRun[1];
+    const spacing = Math.hypot(pos[a * 4] - pos[b * 4], pos[a * 4 + 1] - pos[b * 4 + 1], pos[a * 4 + 2] - pos[b * 4 + 2]);
+    if (Math.sqrt(bd) > Math.max(0.025, spacing * 2.5)) return null;
+    const cut = bestKey.lastIndexOf('::');
+    let edgeKey = bestKey.slice(cut + 2);
+    const mirrored = edgeKey.endsWith('#M');
+    if (mirrored) edgeKey = edgeKey.slice(0, -2);
+    // click nearer the run's end ⇒ reversed (same inference as the 2D tool)
+    return { id: edgeKey, mirrored, reversed: bestIdx / Math.max(1, bestRun.length - 1) > 0.5 };
+  }
+
+  private clearSeamToolOverlay(): void {
+    for (const e of this.seamToolEntries) {
+      this.seamToolGroup.remove(e.mesh);
+      this.seamToolGroup.remove(e.cone);
+      e.mesh.geometry.dispose();
+      (e.mesh.material as THREE.Material).dispose();
+      e.cone.geometry.dispose();
+    }
+    this.seamToolEntries = [];
+  }
+
+  private rebuildSeamToolOverlay(): void {
+    this.clearSeamToolOverlay();
+    const state = this.seamToolState;
+    if (!state) { this.seamToolGroup.visible = false; return; }
+    if (!this.seamToolGroup.parent) this.scene.add(this.seamToolGroup);
+    this.seamToolGroup.visible = true;
+    const addRun = (pick: SeamPick, color: number, opacity = 0.95) => {
+      const run = this.seamRunFor(pick);
+      if (!run) return;
+      const radius = 0.0025; // the original's seamToolRadius
+      const cylGeo = new THREE.CylinderGeometry(radius, radius, 1, 5, 1);
+      cylGeo.translate(0, 0.5, 0); // unit Y cylinder, base at origin -> scaled per segment
+      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthTest: false });
+      const mesh = new THREE.InstancedMesh(cylGeo, mat, run.length - 1);
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 11;
+      const cone = new THREE.Mesh(new THREE.ConeGeometry(0.007, 0.018, 10), mat);
+      cone.frustumCulled = false;
+      cone.renderOrder = 12;
+      this.seamToolGroup.add(mesh);
+      this.seamToolGroup.add(cone);
+      this.seamToolEntries.push({ mesh, cone, run, reversed: pick.reversed });
+    };
+    for (const pick of state.from) addRun(pick, 0xd946ef);
+    for (const pick of state.to) addRun(pick, 0x2563eb);
+    const hov = this.seamToolHover;
+    if (hov &&
+        !state.from.some((r) => samePick(r, hov)) &&
+        !state.to.some((r) => samePick(r, hov))) {
+      // hover previews the side the click would land on: blue for "to" candidates, magenta for "from"
+      const toPhase = this.seamToolKind === 'multi' ? state.phase === 'to' : state.from.length > 0;
+      addRun(hov, toPhase ? 0x60a5fa : 0xe879f9, 0.6);
+    }
+    this.updateSeamToolOverlayPositions();
+  }
+
+  /** Re-place the overlay tubes/cones on the CURRENT particle positions (runs each cloth update). */
+  private updateSeamToolOverlayPositions(): void {
+    if (this.seamToolEntries.length === 0 || !this.prepared) return;
+    const pos = this.lastClothPositions ?? this.prepared.simData.positions;
+    const v0 = new THREE.Vector3();
+    const v1 = new THREE.Vector3();
+    const dir = new THREE.Vector3();
+    const up = new THREE.Vector3(0, 1, 0);
+    const q = new THREE.Quaternion();
+    const m = new THREE.Matrix4();
+    const s = new THREE.Vector3();
+    for (const e of this.seamToolEntries) {
+      const run = e.reversed ? [...e.run].reverse() : e.run;
+      let total = 0;
+      for (let i = 0; i + 1 < run.length; i++) {
+        const a = run[i], b = run[i + 1];
+        v0.set(pos[a * 4], pos[a * 4 + 1], pos[a * 4 + 2]);
+        v1.set(pos[b * 4], pos[b * 4 + 1], pos[b * 4 + 2]);
+        dir.subVectors(v1, v0);
+        const len = dir.length() || 1e-6;
+        total += len;
+        q.setFromUnitVectors(up, dir.normalize());
+        m.compose(v0, q, s.set(1, len, 1));
+        e.mesh.setMatrixAt(i, m);
+      }
+      e.mesh.instanceMatrix.needsUpdate = true;
+      // direction cone at the arc-length midpoint, pointing along the (possibly reversed) run
+      let upto = 0;
+      const half = total / 2;
+      for (let i = 0; i + 1 < run.length; i++) {
+        const a = run[i], b = run[i + 1];
+        v0.set(pos[a * 4], pos[a * 4 + 1], pos[a * 4 + 2]);
+        v1.set(pos[b * 4], pos[b * 4 + 1], pos[b * 4 + 2]);
+        dir.subVectors(v1, v0);
+        const len = dir.length() || 1e-6;
+        if (upto + len >= half || i === run.length - 2) {
+          const f = Math.max(0, Math.min(1, (half - upto) / len));
+          e.cone.position.copy(v0).addScaledVector(dir, f);
+          e.cone.quaternion.setFromUnitVectors(up, dir.normalize());
+          break;
+        }
+        upto += len;
+      }
     }
   }
 

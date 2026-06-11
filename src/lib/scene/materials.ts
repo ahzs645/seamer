@@ -37,6 +37,7 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
     specularIntensity: (material?.specularIntensity ?? 0.25) * pSpec,
     opacity: material?.opacity ?? 1,
     transparent: (material?.opacity ?? 1) < 1,
+    alphaTest: (material?.alphaCutoff ?? 0) > 0 ? material!.alphaCutoff : 0,
     side: opts.side ?? THREE.DoubleSide,
     shadowSide: THREE.DoubleSide,
     sheen: 0.2,

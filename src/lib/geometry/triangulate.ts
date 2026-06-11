@@ -13,6 +13,9 @@ export interface ClothMesh {
   // Aligned to the input outer order: boundary[i] = particle index of outer[i] (or -1 if pruned).
   boundary: number[];
   numBoundary: number;
+  // Aligned to the input internalPoints order: internal[k] = particle index (or -1 if pruned).
+  // Lets internal-line constraint points be addressed after compaction (fold hinges, internal seams).
+  internal: number[];
 }
 
 export interface TriangulateInput {
@@ -117,9 +120,15 @@ export function triangulate(input: TriangulateInput): ClothMesh {
     }
   }
 
+  // index of the first internal constraint point within `constraints`/`all`
+  const internalBase = constraints.length - internal.length;
+
   const all: Vec2[] = [...constraints, ...steiner];
   if (all.length < 3) {
-    return { points: all.slice(), triangles: [], edges: [], boundary: outer.map((_, i) => i), numBoundary };
+    return {
+      points: all.slice(), triangles: [], edges: [], boundary: outer.map((_, i) => i), numBoundary,
+      internal: internal.map((_, k) => internalBase + k)
+    };
   }
 
   const coords: number[] = [];
@@ -182,5 +191,9 @@ export function triangulate(input: TriangulateInput): ClothMesh {
     if (origToNew[i] !== -1) kept++;
   }
 
-  return { points, triangles, edges, boundary, numBoundary: kept };
+  // internal constraint points aligned to internalPoints order (or -1 if pruned)
+  const internalIdx: number[] = new Array(internal.length);
+  for (let k = 0; k < internal.length; k++) internalIdx[k] = origToNew[internalBase + k];
+
+  return { points, triangles, edges, boundary, numBoundary: kept, internal: internalIdx };
 }

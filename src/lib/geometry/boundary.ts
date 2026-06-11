@@ -34,11 +34,12 @@ function polylineLength(poly: Vec2[]): number {
   return len;
 }
 
-/** Resample a polyline to evenly spaced points (~spacing apart), keeping both endpoints. */
-function resample(poly: Vec2[], spacing: number): Vec2[] {
+/** Resample a polyline to evenly spaced points (~spacing apart), keeping both endpoints.
+ *  `forceIntervals` overrides the interval count (seam-matched edges resample both sides equally). */
+function resample(poly: Vec2[], spacing: number, forceIntervals?: number): Vec2[] {
   if (poly.length < 2) return poly.slice();
   const total = polylineLength(poly);
-  const n = Math.max(1, Math.round(total / spacing));
+  const n = Math.max(1, forceIntervals ?? Math.round(total / spacing));
   const out: Vec2[] = [poly[0]];
   const step = total / n;
   let segIdx = 0;
@@ -101,7 +102,59 @@ function stitchLoop(edges: LoopEdge[]): LoopEdge[] {
   return loop;
 }
 
-export function buildPieceCloth(pattern: Pattern, piece: Piece, particleDistanceMm?: number): PieceCloth | null {
+/**
+ * Seam-matched boundary sub-segmentation (the original's buildSeamComposite/getSubSegmentPointCount):
+ * compute a forced interval count per PiecePath so BOTH sides of every seam resample to the same
+ * total interval count. Each seam's target N is the larger side's natural count; a side's N is
+ * distributed over its edges by length (largest remainder, ≥1 each). An edge in several seams takes
+ * the max — exact pairing can then no longer be guaranteed for every seam simultaneously; the sim
+ * builder warns and falls back to proportional sampling for the ones that still mismatch.
+ */
+export function computeSeamEdgeIntervals(pattern: Pattern): Map<string, number> {
+  const paths = indexPaths(pattern);
+  const points = indexPoints(pattern);
+  const out = new Map<string, number>();
+  // pd + polyline length per PiecePath id (owner piece determines pd)
+  const info = new Map<string, { len: number; pd: number }>();
+  for (const piece of pattern.pieces) {
+    const pd = piece.settings3d.particleDistance ?? DEFAULT_PARTICLE_DISTANCE;
+    for (const pp of [...piece.mainPaths, ...piece.internalPaths]) {
+      const poly = piecePathPolyline(pp, paths, points, Math.min(4, pd / 2));
+      if (poly.length >= 2) info.set(pp.id, { len: polylineLength(poly), pd });
+    }
+  }
+  for (const seam of pattern.seams) {
+    const side = (refs: { id: string }[]) => {
+      const items = refs.map((r) => info.get(r.id)).filter((x): x is { len: number; pd: number } => !!x);
+      const natural = items.reduce((s, it) => s + Math.max(1, Math.round(it.len / it.pd)), 0);
+      return { items, refs: refs.filter((r) => info.has(r.id)), natural };
+    };
+    const from = side(seam.fromPaths);
+    const to = side(seam.toPaths);
+    if (from.items.length === 0 || to.items.length === 0) continue;
+    const N = Math.max(from.natural, to.natural);
+    // distribute N intervals over a side's edges by length share (largest remainder, ≥1 each)
+    const distribute = (s: typeof from) => {
+      const totalLen = s.items.reduce((a, it) => a + it.len, 0) || 1;
+      const raw = s.items.map((it) => (N * it.len) / totalLen);
+      const base = raw.map((r) => Math.max(1, Math.floor(r)));
+      let rem = N - base.reduce((a, b) => a + b, 0);
+      const order = raw.map((r, i) => ({ i, frac: r - Math.floor(r) })).sort((a, b) => b.frac - a.frac);
+      for (let k = 0; rem > 0 && k < order.length; k++, rem--) base[order[k].i]++;
+      s.refs.forEach((r, i) => out.set(r.id, Math.max(out.get(r.id) ?? 0, base[i])));
+    };
+    distribute(from);
+    distribute(to);
+  }
+  return out;
+}
+
+export function buildPieceCloth(
+  pattern: Pattern,
+  piece: Piece,
+  particleDistanceMm?: number,
+  edgeIntervals?: Map<string, number>
+): PieceCloth | null {
   const paths = indexPaths(pattern);
   const points = indexPoints(pattern);
   const pd = particleDistanceMm ?? piece.settings3d.particleDistance ?? DEFAULT_PARTICLE_DISTANCE;
@@ -131,7 +184,7 @@ export function buildPieceCloth(pattern: Pattern, piece: Piece, particleDistance
   const edgeOuterRanges = new Map<string, number[]>();
   for (let li = 0; li < loop.length; li++) {
     const e = loop[li];
-    const rs = resample(e.poly, pd);
+    const rs = resample(e.poly, pd, edgeIntervals?.get(e.ppId));
     const idxs: number[] = [];
     for (let i = 0; i < rs.length; i++) {
       // skip the first point if it duplicates the current tail (shared endpoint)
@@ -178,11 +231,15 @@ export function buildPieceCloth(pattern: Pattern, piece: Piece, particleDistance
     }
   }
 
-  // internal lines -> constraint points (darts / internal seams)
+  // internal lines -> constraint points (darts / internal seams / fold hinges), tracking which
+  // range of internalPoints belongs to each internal PiecePath so its particles stay addressable.
   const internalPoints: Vec2[] = [];
+  const internalRanges = new Map<string, { start: number; count: number }>();
   for (const ip of piece.internalPaths) {
     const poly = piecePathPolyline(ip, paths, points, Math.min(4, pd / 2));
-    for (const p of resample(poly, pd)) internalPoints.push(p);
+    const rs = resample(poly, pd, edgeIntervals?.get(ip.id));
+    internalRanges.set(ip.id, { start: internalPoints.length, count: rs.length });
+    for (const p of rs) internalPoints.push(p);
   }
 
   const mesh = triangulate({
@@ -201,6 +258,17 @@ export function buildPieceCloth(pattern: Pattern, piece: Piece, particleDistance
       if (oi < outerToParticle.length && outerToParticle[oi] >= 0) mapped.push(outerToParticle[oi]);
     }
     edgeParticles.set(ppId, mapped);
+  }
+
+  // Internal paths register their ordered particle runs too, so seams can reference an internal
+  // line (pockets, yokes) and fold hinges (foldAngle) can be located in the mesh.
+  for (const [ppId, range] of internalRanges) {
+    const mapped: number[] = [];
+    for (let k = range.start; k < range.start + range.count; k++) {
+      const pi = mesh.internal[k];
+      if (pi !== undefined && pi >= 0) mapped.push(pi);
+    }
+    if (mapped.length >= 2) edgeParticles.set(ppId, mapped);
   }
 
   return { pieceId: piece.id, materialId: piece.materialId, mesh, edgeParticles, particleDistanceMm: pd };
@@ -271,7 +339,7 @@ export function buildSavedCloth(piece: Piece): SavedCloth | null {
     if (count === 1) { boundarySet.add(a); boundarySet.add(b); }
   }
 
-  const mesh: ClothMesh = { points, triangles, edges, boundary: [...boundarySet], numBoundary: boundarySet.size };
+  const mesh: ClothMesh = { points, triangles, edges, boundary: [...boundarySet], numBoundary: boundarySet.size, internal: [] };
   const pd = piece.settings3d.particleDistance ?? median;
   return {
     cloth: { pieceId: piece.id, materialId: piece.materialId, mesh, edgeParticles: new Map(), particleDistanceMm: pd },

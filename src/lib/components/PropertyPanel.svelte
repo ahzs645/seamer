@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize, PointConstraint, SeamCornerJoinType, Notch, NotchType } from '$lib/types/pattern';
-  import { selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
+  import { selectedPointIds, selectedPathIds, selectedPieceIds, panelRequest } from '$lib/stores/pattern';
   import FormulaDialog from '$lib/components/FormulaDialog.svelte';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import {
@@ -169,7 +169,12 @@
   const CORNER_TYPES: { id: SeamCornerJoinType; icon: string; title: string }[] = [
     { id: 'intersection', icon: 'call_merge', title: 'Intersection (mitred corner, optionally capped)' },
     { id: 'radius', icon: 'rounded_corner', title: 'Radius (rounded corner)' },
-    { id: 'byLength', icon: 'straighten', title: 'By length (square corner at a fixed distance)' }
+    { id: 'byLength', icon: 'straighten', title: 'By length (square corner at a fixed distance)' },
+    { id: 'noJoin', icon: 'close_fullscreen', title: 'No join (allowance pinches back to the corner)' },
+    { id: 'firstEdgeSymmetry', icon: 'align_horizontal_left', title: 'First edge symmetry (fold-back cut mirrored over the second edge)' },
+    { id: 'secondEdgeSymmetry', icon: 'align_horizontal_right', title: 'Second edge symmetry (fold-back cut mirrored over the first edge)' },
+    { id: 'firstEdgeRightAngle', icon: 'square', title: 'First edge right angle (square cut to the first edge)' },
+    { id: 'secondEdgeRightAngle', icon: 'crop_square', title: 'Second edge right angle (square cut to the second edge)' }
   ];
   function updateMainPath(ppId: string, partial: Partial<PiecePath>, label = 'Edit corner join') {
     updatePiece((p) => ({ ...p, mainPaths: p.mainPaths.map((x) => (x.id === ppId ? { ...x, ...partial } : x)) }), label);
@@ -229,13 +234,26 @@
     { id: 'orientation', icon: 'explore', title: 'Orientation' },
     { id: 'seam', icon: 'select', title: 'Seam boundary' },
     { id: 'internal', icon: 'conversion_path', title: 'Internal paths' },
+    { id: 'piecePoints', icon: 'adjust', title: 'Piece points' },
     { id: 'material', icon: 'texture', title: 'Material' },
     { id: '3d', icon: 'view_in_ar', title: '3D Settings' }
   ];
 
+  // ---- piece points (piece-local construction points) ----------------------
+  function updatePiecePointLocal(id: string, patch: { name?: string; x?: number; y?: number }) {
+    updatePiece((p) => ({ ...p, piecePoints: (p.piecePoints ?? []).map((pt) => (pt.id === id ? { ...pt, ...patch } : pt)) }), 'Edit piece point');
+  }
+  function removePiecePoint(id: string) {
+    updatePiece((p) => ({ ...p, piecePoints: (p.piecePoints ?? []).filter((pt) => pt.id !== id) }), 'Delete piece point');
+  }
+
   // ---- pattern-level (no selection) -----------------------------------------
   let patternOpen = $state<string>('materials');
   function togglePattern(id: string) { patternOpen = patternOpen === id ? '' : id; }
+  // One-shot section-open requests (e.g. Shift+V → Sizes & Variables) from the studio page.
+  $effect(() => panelRequest.subscribe((r) => {
+    if (r) { patternOpen = r.section; panelRequest.set(null); }
+  }));
 
   function updatePattern(partial: Partial<Pattern>) {
     onchange({ ...currentPattern, ...partial, hasChanged: true });
@@ -660,11 +678,30 @@
         {a.centerId ? 'Centred on a live point — move it to move the arc.' : 'Free arc (three-point).'}
         Dragging an arc anchor detaches it.
       </p>
-      <label class="flex items-center justify-between gap-2 text-xs">Radius ({edgeUnit})
-        <input type="number" min="0.1" step="0.5" class="input input-bordered input-xs w-24"
-          value={Number(edgeToDisp(a.r).toFixed(2))}
-          onchange={(e) => { const v = edgeToMm(parseFloat(e.currentTarget.value)); if (v > 0) patchArc({ r: v }); }} />
-      </label>
+      {#if a.kind === 'circle'}
+        <!-- circles/ellipses: independent X/Y radii + axis rotation (true ellipse) -->
+        <div class="grid grid-cols-2 gap-1 text-xs">
+          <label class="flex flex-col gap-0.5">Radius X ({edgeUnit})
+            <input type="number" min="0.1" step="0.5" class="input input-bordered input-xs"
+              value={Number(edgeToDisp(a.rx ?? a.r).toFixed(2))}
+              onchange={(e) => { const v = edgeToMm(parseFloat(e.currentTarget.value)); if (v > 0) patchArc({ rx: v, r: v }); }} /></label>
+          <label class="flex flex-col gap-0.5">Radius Y ({edgeUnit})
+            <input type="number" min="0.1" step="0.5" class="input input-bordered input-xs"
+              value={Number(edgeToDisp(a.ry ?? a.r).toFixed(2))}
+              onchange={(e) => { const v = edgeToMm(parseFloat(e.currentTarget.value)); if (v > 0) patchArc({ ry: v }); }} /></label>
+        </div>
+        <label class="flex items-center justify-between gap-2 text-xs">Rotation (°)
+          <input type="number" step="1" class="input input-bordered input-xs w-24"
+            value={Number(rad2deg(a.rotation ?? 0).toFixed(1))}
+            onchange={(e) => { const d = parseFloat(e.currentTarget.value); if (Number.isFinite(d)) patchArc({ rotation: deg2rad(d) }); }} />
+        </label>
+      {:else}
+        <label class="flex items-center justify-between gap-2 text-xs">Radius ({edgeUnit})
+          <input type="number" min="0.1" step="0.5" class="input input-bordered input-xs w-24"
+            value={Number(edgeToDisp(a.r).toFixed(2))}
+            onchange={(e) => { const v = edgeToMm(parseFloat(e.currentTarget.value)); if (v > 0) patchArc({ r: v }); }} />
+        </label>
+      {/if}
       {#if a.kind !== 'circle'}
         <div class="grid grid-cols-2 gap-1 text-xs">
           <label class="flex flex-col gap-0.5">Start (°)
@@ -765,7 +802,7 @@
   {#if editingPiece}
     {@const piece = editingPiece}
     {#each sections as s}
-      {@const count = s.id === 'seam' ? piece.mainPaths.length : s.id === 'internal' ? piece.internalPaths.length : null}
+      {@const count = s.id === 'seam' ? piece.mainPaths.length : s.id === 'internal' ? piece.internalPaths.length : s.id === 'piecePoints' ? (piece.piecePoints?.length ?? 0) : null}
       <div class="w-full bg-base-200 block mt-[-1px]" class:bg-base-300={openSection === s.id}>
         <button type="button" class="w-full flex items-center p-2 px-3 text-sm" aria-expanded={openSection === s.id} onclick={() => toggle(s.id)}>
           <span class="material-symbols-rounded mr-2">{s.icon}</span>
@@ -833,6 +870,23 @@
                   oninput={(e) => updatePiece((p) => ({ ...p, grainVector: { ...p.grainVector, y: parseFloat(e.currentTarget.value) || 0 } }))} /></label>
               </div>
 
+            {:else if s.id === 'piecePoints'}
+              {#each piece.piecePoints ?? [] as pt (pt.id)}
+                <div class="flex items-center gap-1">
+                  <input type="text" class="input input-bordered input-xs w-16" value={pt.name} title="Name"
+                    onchange={(e) => updatePiecePointLocal(pt.id, { name: e.currentTarget.value })} />
+                  <input type="number" step="0.1" class="input input-bordered input-xs w-20" value={pt.x.toFixed(1)} title="X (mm, drafting)"
+                    onchange={(e) => updatePiecePointLocal(pt.id, { x: parseFloat(e.currentTarget.value) || 0 })} />
+                  <input type="number" step="0.1" class="input input-bordered input-xs w-20" value={pt.y.toFixed(1)} title="Y (mm, drafting)"
+                    onchange={(e) => updatePiecePointLocal(pt.id, { y: parseFloat(e.currentTarget.value) || 0 })} />
+                  <button class="btn btn-xs btn-ghost text-error px-1" title="Delete piece point" onclick={() => removePiecePoint(pt.id)}>
+                    <span class="material-symbols-rounded text-sm">delete</span>
+                  </button>
+                </div>
+              {:else}
+                <p class="opacity-60">No piece points. Use the piece-point tool (right toolbar) and click inside the piece to add construction points that travel with it.</p>
+              {/each}
+
             {:else if s.id === 'seam' || s.id === 'internal'}
               {@const list = s.id === 'seam' ? piece.mainPaths : piece.internalPaths}
               <div class="flex flex-col">
@@ -870,9 +924,9 @@
                         <!-- Corner join -->
                         <div class="space-y-1">
                           <span class="text-[11px] font-semibold opacity-70 flex items-center gap-1"><span class="material-symbols-rounded text-sm">rounded_corner</span>Seam corner join</span>
-                          <div class="join w-full">
+                          <div class="grid grid-cols-4 gap-0.5">
                             {#each CORNER_TYPES as ct}
-                              <button class="join-item btn btn-xs flex-1" class:btn-active={joinType === ct.id} title={ct.title}
+                              <button class="btn btn-xs" class:btn-active={joinType === ct.id} title={ct.title}
                                 onclick={() => updateMainPath(pp.id, { seamCornerJoinType: ct.id })}>
                                 <span class="material-symbols-rounded text-base">{ct.icon}</span>
                               </button>
@@ -886,10 +940,12 @@
                             <label class="flex items-center justify-between gap-2 text-[11px]">Corner length ({unitLabel})
                               <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(cornerValueMm(pp)).toFixed(2)}
                                 oninput={(e) => setCornerValueMm(pp, fromUnit(parseFloat(e.currentTarget.value) || 0))} /></label>
-                          {:else}
+                          {:else if joinType === 'intersection'}
                             <label class="flex items-center justify-between gap-2 text-[11px]">Max length ({unitLabel}, 0 = uncapped)
                               <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(cornerValueMm(pp)).toFixed(2)}
                                 oninput={(e) => setCornerValueMm(pp, fromUnit(parseFloat(e.currentTarget.value) || 0))} /></label>
+                          {:else}
+                            <p class="text-[10px] opacity-50">{CORNER_TYPES.find((c) => c.id === joinType)?.title}</p>
                           {/if}
                         </div>
 
@@ -920,18 +976,37 @@
                             <button class="btn btn-xs btn-ghost" onclick={() => addNotch(pp)}><span class="material-symbols-rounded text-sm">add</span>Add</button>
                           </div>
                           {#each pp.notches ?? [] as n (n.id)}
-                            <div class="flex items-center gap-1">
-                              <input type="range" min="0" max="1" step="0.01" class="range range-xs flex-1" value={typeof n.position === 'number' ? n.position : 0.5}
-                                title="Position along edge" oninput={(e) => updateNotch(pp, n.id as string, { position: parseFloat(e.currentTarget.value) })} />
-                              <select class="select select-bordered select-xs w-16" value={(n.type as NotchType) ?? 'single'}
-                                onchange={(e) => updateNotch(pp, n.id as string, { type: e.currentTarget.value as NotchType })}>
-                                {#each NOTCH_TYPES as nt}<option value={nt.id}>{nt.label}</option>{/each}
-                              </select>
-                              <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-14" title="Size ({unitLabel})"
-                                value={toUnit((n.size as number) ?? currentPattern.defaultNotchSize).toFixed(1)}
-                                oninput={(e) => updateNotch(pp, n.id as string, { size: fromUnit(parseFloat(e.currentTarget.value) || 0) })} />
-                              <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove notch" aria-label="Remove notch"
-                                onclick={() => removeNotch(pp, n.id as string)}>delete</button>
+                            {@const anchored = !!n.referencePointId}
+                            <div class="space-y-0.5">
+                              <div class="flex items-center gap-1">
+                                {#if anchored}
+                                  <input type="number" min="0" step="0.1" class="input input-bordered input-xs flex-1" title="Distance from point ({unitLabel})"
+                                    value={toUnit((n.distance as number) ?? 0).toFixed(1)}
+                                    oninput={(e) => updateNotch(pp, n.id as string, { distance: fromUnit(parseFloat(e.currentTarget.value) || 0) })} />
+                                {:else}
+                                  <input type="range" min="0" max="1" step="0.01" class="range range-xs flex-1" value={typeof n.position === 'number' ? n.position : 0.5}
+                                    title="Position along edge" oninput={(e) => updateNotch(pp, n.id as string, { position: parseFloat(e.currentTarget.value) })} />
+                                {/if}
+                                <select class="select select-bordered select-xs w-16" value={(n.type as NotchType) ?? 'single'}
+                                  onchange={(e) => updateNotch(pp, n.id as string, { type: e.currentTarget.value as NotchType })}>
+                                  {#each NOTCH_TYPES as nt}<option value={nt.id}>{nt.label}</option>{/each}
+                                </select>
+                                <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-14" title="Size ({unitLabel})"
+                                  value={toUnit((n.size as number) ?? currentPattern.defaultNotchSize).toFixed(1)}
+                                  oninput={(e) => updateNotch(pp, n.id as string, { size: fromUnit(parseFloat(e.currentTarget.value) || 0) })} />
+                                <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove notch" aria-label="Remove notch"
+                                  onclick={() => removeNotch(pp, n.id as string)}>delete</button>
+                              </div>
+                              <label class="flex items-center justify-between gap-2 text-[10px] opacity-80">From point
+                                <select class="select select-bordered select-xs w-28" value={n.referencePointId ?? ''}
+                                  onchange={(e) => {
+                                    const v = e.currentTarget.value;
+                                    updateNotch(pp, n.id as string, v ? { referencePointId: v, distance: (n.distance as number) ?? 0 } : { referencePointId: undefined, distance: undefined });
+                                  }}>
+                                  <option value="">— slider —</option>
+                                  <option value={pp.from}>{pointName(pp.from)} (start)</option>
+                                  <option value={pp.to}>{pointName(pp.to)} (end)</option>
+                                </select></label>
                             </div>
                           {:else}
                             <p class="text-[11px] opacity-50">No notches. Add one, or right-click the edge in the 2D view.</p>

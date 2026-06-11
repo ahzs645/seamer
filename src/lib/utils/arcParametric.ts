@@ -3,7 +3,7 @@
 // seams and notches referencing them survive the edit.
 
 import type { Pattern, ConstrainablePath, PathPoint, BezierHandle, ArcParams } from '$lib/types/pattern';
-import { arcAnchors, type Vec2 } from './arcGeometry';
+import { ellipseAnchors, type Vec2 } from './arcGeometry';
 
 const mkHandle = (v1: Vec2, v2: Vec2): BezierHandle => ({
   v1: { ...v1 }, v2: { ...v2 }, sameLength: false, sameAngle: false,
@@ -52,7 +52,9 @@ export function rebakeArc(p: Pattern, pathId: string, params: ArcParams, uid: (p
   if (!path || !path.arc) return null;
   const center = arcCenter(p, params);
   const stored: ArcParams = { ...params, cx: center.x, cy: center.y };
-  const anchors = arcAnchors(center, Math.max(0.01, params.r), params.a0, params.a1);
+  const rx = Math.max(0.01, params.rx ?? params.r);
+  const ry = Math.max(0.01, params.ry ?? params.r);
+  const anchors = ellipseAnchors(center, rx, ry, params.rotation ?? 0, params.a0, params.a1);
   const { ids, closed } = distinctAnchorIds(path);
   const want = params.closed ? anchors.length - 1 : anchors.length; // closed: last anchor == first
   const used = params.closed ? anchors.slice(0, -1) : anchors;

@@ -4,7 +4,7 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import type { CylinderFrame } from '$lib/geometry/cylinders';
-import { buildPieceCloth, buildSavedCloth, reuseSavedDrape } from '$lib/geometry/boundary';
+import { buildPieceCloth, buildSavedCloth, reuseSavedDrape, computeSeamEdgeIntervals } from '$lib/geometry/boundary';
 import { arrangeParticles } from '$lib/geometry/arrangement';
 import { buildSimData, type SimData, type ArrangedPiece } from './build';
 import { ClothEngine, type BodyMesh } from './webgpu/engine';
@@ -56,6 +56,9 @@ export function prepareCloth(
 ): PreparedCloth | null {
   const { pattern, cylinders } = init;
   const arranged: ArrangedPiece[] = [];
+  // Seam-matched sub-segmentation: both sides of every seam resample to equal interval counts so
+  // the sim links particles 1:1 (the original's boundary slicing at seam-range boundaries).
+  const edgeIntervals = computeSeamEdgeIntervals(pattern);
   for (const piece of pattern.pieces) {
     if (piece.type !== 'dynamic' || piece.settings3d.enable3d === false) continue;
 
@@ -64,7 +67,7 @@ export function prepareCloth(
     // POSITIONS via the source's 3-way reuse below. Building topology from the saved blob instead
     // (buildSavedCloth) leaves edgeParticles empty — seams can't link such pieces, and a free-running
     // garment falls apart (it only held together via the anchor hold + proximity sewing).
-    const cloth = buildPieceCloth(pattern, piece);
+    const cloth = buildPieceCloth(pattern, piece, undefined, edgeIntervals);
     if (!cloth || cloth.mesh.points.length < 3) {
       // Fallback for degenerate 2D path data: rebuild from the saved blob (no edgeParticles —
       // the proximity-sewing pass covers these).

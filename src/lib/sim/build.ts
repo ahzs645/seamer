@@ -55,6 +55,9 @@ export interface SimData {
   // (maxIncidentTrianglesPerParticle+1). flag: 0 = no filter, +1 = filter, -1 = filter + flip normal.
   incidentTriangles: Int32Array;
   maxIncidentTrianglesPerParticle: number;
+  // Ordered global particle runs per piece edge, keyed `${pieceId}::${piecePathId}` (mirror copies
+  // suffix the edge with `#M`). Used by the 3D seam tool to pick edges on the draped garment.
+  edgeRuns: Map<string, number[]>;
 }
 
 export interface ArrangedPiece {
@@ -283,6 +286,20 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
     // (no fold line) it falls back to a distance constraint between p1 and p2 (our previous behaviour).
     const edgeToOpp = new Map<number, number[]>();
     const ekey = (x: number, y: number) => Math.min(x, y) * n + Math.max(x, y);
+
+    // Fold hinges (the original's getFoldInfos/findFoldAngle): consecutive particles along an
+    // internal path with a non-zero foldAngle form hinge segments; bend constraints whose hinge
+    // matches get that dihedral target. Mirror instances flip the sign (their winding is reversed).
+    const foldByHinge = new Map<number, number>();
+    for (const ip of piece.internalPaths) {
+      const ang = ((ip.foldAngle ?? 0) * Math.PI) / 180;
+      if (Math.abs(ang) < 1e-6) continue;
+      const locals = ap.cloth.edgeParticles.get(ip.id);
+      if (!locals || locals.length < 2) continue;
+      for (let i = 1; i < locals.length; i++) {
+        foldByHinge.set(ekey(locals[i - 1], locals[i]), inst.mirror ? -ang : ang);
+      }
+    }
     for (let t = 0; t < mesh.triangles.length; t += 3) {
       const v = [mesh.triangles[t], mesh.triangles[t + 1], mesh.triangles[t + 2]];
       for (let e = 0; e < 3; e++) {
@@ -314,7 +331,7 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
         const nWeft = Math.abs(ex * yHat.x + ey * yHat.y);
         bendComplianceBeyond.push(clampStretchAlpha((nWarp * warpA + nWeft * weftA) / Math.max(1e-8, nWarp + nWeft)));
       }
-      bendTargetAngle.push(0); // no internal fold lines in these pieces -> distance-mode bending
+      bendTargetAngle.push(foldByHinge.get(k) ?? 0); // dihedral target along fold lines, else distance-mode
     }
 
     // Base instance registers edgeKey as-is; the mirror instance registers `${edgeKey}#M`, which is
@@ -355,18 +372,43 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
   const dist3 = (a: number, b: number) => Math.hypot(
     positions[a * 4] - positions[b * 4], positions[a * 4 + 1] - positions[b * 4 + 1], positions[a * 4 + 2] - positions[b * 4 + 2]
   );
-  const chain = (refs: { id: string; mirrored: boolean; reversed: boolean }[]): number[] => {
+  const chain = (refs: { id: string; mirrored: boolean; reversed: boolean }[], seamId: string): number[] => {
     const out: number[] = [];
     for (const r of refs) {
       // a mirrored ref targets the mirror instance; find the owning piece for this PiecePath id
       const owner = pattern.pieces.find((p) => p.mainPaths.some((mp) => mp.id === r.id) || p.internalPaths.some((mp) => mp.id === r.id));
-      if (!owner) continue;
+      if (!owner) {
+        console.warn(`Seam ${seamId}: ref ${r.id} has no owning piece — dropped`);
+        continue;
+      }
       const edgeKey = r.mirrored ? `${r.id}#M` : r.id;
       const arr = edgeParticlesGlobal.get(key(owner.id, edgeKey));
-      if (!arr) continue;
-      out.push(...(r.reversed ? arr.slice().reverse() : arr.slice()));
+      if (!arr) {
+        // the original logs "Missing seam subsegment" — surface the drop instead of silently skipping
+        console.warn(`Seam ${seamId}: edge ${edgeKey} of piece "${owner.name}" has no particles in the sim mesh — dropped`);
+        continue;
+      }
+      const run = r.reversed ? arr.slice().reverse() : arr.slice();
+      // contiguous edges share their endpoint particle — drop the duplicate so composite chains
+      // count particles once (keeps equal-interval sides at equal particle counts)
+      for (const idx of run) {
+        if (out.length && out[out.length - 1] === idx) continue;
+        out.push(idx);
+      }
     }
     return out;
+  };
+  // 2D rest-space arc length of a chain (mm) for the length-mismatch diagnostic
+  const chainLen2d = (chainIdx: number[]): number => {
+    let len = 0;
+    for (let i = 1; i < chainIdx.length; i++) {
+      const a = chainIdx[i - 1], b = chainIdx[i];
+      len += Math.hypot(
+        positions2d[a * 4] - positions2d[b * 4],
+        positions2d[a * 4 + 1] - positions2d[b * 4 + 1]
+      ) * 1000;
+    }
+    return len;
   };
 
   // Seam pairing, matching the original: both edges are resampled to an EQUAL particle count and
@@ -379,9 +421,25 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
   // the correct alignment (forward vs reversed) is the one with the smaller total paired distance.
   const sampleIdx = (len: number, n: number, k: number) => (len <= 1 ? 0 : Math.round((k * (len - 1)) / (n - 1)));
   for (const seam of pattern.seams) {
-    const fromChain = chain(seam.fromPaths);
-    const toChain = chain(seam.toPaths);
-    if (fromChain.length === 0 || toChain.length === 0) continue;
+    const fromChain = chain(seam.fromPaths, seam.id);
+    const toChain = chain(seam.toPaths, seam.id);
+    if (fromChain.length === 0 || toChain.length === 0) {
+      if (seam.fromPaths.length || seam.toPaths.length) {
+        console.warn(`Seam ${seam.id}: one side resolved to no particles — seam not simulated`);
+      }
+      continue;
+    }
+    // Diagnostics matching the original's runtime warnings
+    {
+      const lf = chainLen2d(fromChain), lt = chainLen2d(toChain);
+      const rel = Math.abs(lf - lt) / Math.max(lf, lt, 1);
+      if (rel > 0.15 && Math.abs(lf - lt) > 10) {
+        console.warn(`Seam length mismatch (${seam.id}): from ${lf.toFixed(0)}mm vs to ${lt.toFixed(0)}mm — the longer edge will gather/ease`);
+      }
+      if (fromChain.length !== toChain.length) {
+        console.warn(`Seam particle count mismatch (${seam.id}): ${fromChain.length} vs ${toChain.length} — fallback proportional sampling applied`);
+      }
+    }
     // Equal-count resampling: walk a common index range, mapping proportionally onto each chain.
     const n = Math.max(fromChain.length, toChain.length);
     const hasExplicitOrientation =
@@ -513,6 +571,7 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
     particleCount: total, positions, arrangedPositions, positions2d, anchors,
     stretchColors, bendColors, seams, pieces: simPieces,
     triangles, triangleCount: triCount, particleLayers, neighborIndices,
-    incidentTriangles, maxIncidentTrianglesPerParticle: MAX_INCIDENT
+    incidentTriangles, maxIncidentTrianglesPerParticle: MAX_INCIDENT,
+    edgeRuns: edgeParticlesGlobal
   };
 }

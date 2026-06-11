@@ -11,7 +11,7 @@
   import MaterialPanel from '$lib/components/MaterialPanel.svelte';
   import SeamPanel from '$lib/components/SeamPanel.svelte';
   import ObjectBrowser from '$lib/components/ObjectBrowser.svelte';
-  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel, restoreHistory, pendingPaste } from '$lib/stores/pattern';
+  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel, restoreHistory, pendingPaste, panelRequest } from '$lib/stores/pattern';
   import { loadPattern, savePattern as saveToDB } from '$lib/stores/localDB';
   import { EMPTY_PATTERN, type Pattern, type Piece, type ConstrainablePoint } from '$lib/types/pattern';
   import { isSimpleFormat, convertSimplePattern } from '$lib/utils/importSimplePattern';
@@ -488,6 +488,15 @@
     if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); handleCopy(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); handlePaste(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); showCommandPalette = !showCommandPalette; }
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); showRightPanel = !showRightPanel; }
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'l' || e.key === 'L')) {
+      e.preventDefault();
+      if (showLeftPanel && leftTab === 'layers') showLeftPanel = false;
+      else { showLeftPanel = true; leftTab = 'layers'; }
+    }
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && e.shiftKey && (e.key === 'V' || e.key === 'v')) {
+      e.preventDefault(); showRightPanel = true; panelRequest.set({ section: 'sizes' });
+    }
     if (e.key === '?' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); showShortcuts = !showShortcuts; }
     // Selection batch transforms (no modifier): arrows nudge, [ ] rotate, < > scale, M mirror.
     {

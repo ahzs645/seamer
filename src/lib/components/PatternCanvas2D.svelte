@@ -6,7 +6,8 @@
   import DrawingTools from '$lib/components/DrawingTools.svelte';
   import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
   import { toast } from '$lib/stores/toast';
-  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, cursorMm, interactionMode, frozenSnapshotOpacity, pendingPaste, type PendingPaste } from '$lib/stores/pattern';
+  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, selectedSeamId, seamTool, cursorMm, interactionMode, frozenSnapshotOpacity, pendingPaste, type PendingPaste } from '$lib/stores/pattern';
+  import { EMPTY_SEAM_TOOL, applySeamPick, advanceSeamToolPhase, samePick, type SeamPick } from '$lib/utils/seamTool';
   import {
     indexPoints,
     indexPaths,
@@ -21,6 +22,10 @@
     placedPoints,
     allSeamGeometry,
     seamColor,
+    notchRatio,
+    pieceMirrorAxis,
+    reflectAcrossLine,
+    resamplePolyline,
     polygonCentroid,
     pointInPolygon,
     offsetPolygon,
@@ -33,6 +38,7 @@
   import { breakoutPiece, type BreakoutMode } from '$lib/utils/breakout';
   import { traceFromHPGL, traceImageRegion } from '$lib/utils/autoTrace';
   import { pieceAddPath } from '$lib/commands/piece';
+  import { piecePointAdd, piecePointUpdate } from '$lib/commands/create';
   import { draggablePanel } from '$lib/utils/draggablePanel';
   import { rebakeArc, arcPathsCenteredOn, detachArcsTouchingAnchor } from '$lib/utils/arcParametric';
   import { buildWarp, drawWarpedImage } from '$lib/utils/thinPlateSpline';
@@ -285,8 +291,12 @@
   let penDraft = $state<string[]>([]);
   let draftPathId: string | null = null;
   // seam tool: first picked piece-path edge (single) / accumulated edges (multi)
-  let seamFirstEdge: string | null = $state(null);
-  let seamMultiEdges: string[] = $state([]);
+  // Seam tool selection lives in the shared `seamTool` store (the 3D viewport picks edges into the
+  // same selection). Locals mirror it for rendering; hover is canvas-local.
+  let seamFromPicks = $state<SeamPick[]>([]);
+  let seamToPicks = $state<SeamPick[]>([]);
+  let seamPhase = $state<'from' | 'to'>('from');
+  let seamHover = $state<SeamPick | null>(null);
   let contextMenu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   // marquee (rubber-band) selection
   let isMarquee = $state(false);
@@ -528,26 +538,38 @@
     const unsubSelPt = selectedPointIds.subscribe(() => render());
     const unsubSelPath = selectedPathIds.subscribe(() => render());
     const unsubTool = selectedTool.subscribe(() => render());
+    const unsubSelSeam = selectedSeamId.subscribe(() => render());
+    // mirror the shared seam-tool selection (2D + 3D picks) into the render locals
+    const unsubSeamTool = seamTool.subscribe((s) => {
+      seamFromPicks = s.from; seamToPicks = s.to; seamPhase = s.phase;
+      render();
+    });
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const drawing = isDrawingTool($selectedTool);
       if (e.key === 'Enter') {
         if (penDraft.length > 0) { e.preventDefault(); finishDraft(); }
-        else if (seamMultiEdges.length > 0) { e.preventDefault(); finishMultiSeam(); }
+        else if ($selectedTool === 'seam-multi' && (seamFromPicks.length || seamToPicks.length)) { e.preventDefault(); advanceSeamPhase(); }
       } else if (e.key === 'Escape') {
         if (calibrating) { e.preventDefault(); calibrating = null; render(); return; }
         if ($pendingPaste) { e.preventDefault(); pendingPaste.set(null); render(); return; }
-        if (penDraft.length || seamFirstEdge || seamMultiEdges.length || measureFrom || measureChain.length || drawing) { e.preventDefault(); cancelOperation(); }
+        if (penDraft.length || seamFromPicks.length || seamToPicks.length || measureFrom || measureChain.length || drawing) { e.preventDefault(); cancelOperation(); }
       } else if ((e.key === 'v' || e.key === 'V') && drawing && !e.metaKey && !e.ctrlKey) {
         // 'V' returns to select and cancels the in-progress operation (like the source)
         e.preventDefault(); cancelOperation();
+      } else if ((e.metaKey || e.ctrlKey) && e.key === '0') {
+        e.preventDefault(); fitView(); render();
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === '-' || e.key === '=' || e.key === '+')) {
+        e.preventDefault();
+        const f = e.key === '-' ? 1 / 1.25 : 1.25;
+        zoom.update((z) => Math.max(0.05, Math.min(20, z * f)));
       }
     };
     window.addEventListener('keydown', onKey);
     isDark = isDarkTheme();
     const unsubTheme = onThemeChange(() => { isDark = isDarkTheme(); render(); });
     render();
-    return () => { observer.disconnect(); unsubZoom(); unsubPan(); unsubSelPc(); unsubSelPt(); unsubSelPath(); unsubTool(); unsubTheme(); window.removeEventListener('keydown', onKey); };
+    return () => { observer.disconnect(); unsubZoom(); unsubPan(); unsubSelPc(); unsubSelPt(); unsubSelPath(); unsubTool(); unsubSelSeam(); unsubSeamTool(); unsubTheme(); window.removeEventListener('keydown', onKey); };
   });
 
   let lastFitKey = '';
@@ -836,6 +858,28 @@
       c.strokeStyle = GRAIN_MAGENTA;
       c.lineWidth = 1.5;
       c.beginPath(); c.moveTo(g0.x, g0.y); c.lineTo(g1.x, g1.y); c.stroke();
+
+      // piece points (piece-local construction points): teal diamonds, labeled when selected
+      if (baseScale() > 0.12) {
+        for (const pt of piece.piecePoints ?? []) {
+          const cp = toCanvas(tf(pt));
+          c.save();
+          c.translate(cp.x, cp.y);
+          c.rotate(Math.PI / 4);
+          c.fillStyle = '#0d9488';
+          c.fillRect(-3.5, -3.5, 7, 7);
+          c.strokeStyle = '#fff';
+          c.lineWidth = 1.25;
+          c.strokeRect(-3.5, -3.5, 7, 7);
+          c.restore();
+          if (isSelected && baseScale() > 0.18) {
+            c.font = '10px sans-serif';
+            c.textAlign = 'left';
+            c.fillStyle = '#0d9488';
+            c.fillText(pt.name, cp.x + 6, cp.y - 5);
+          }
+        }
+      }
       // little arrow head at the top of the grain line
       const ah = 6, adx = (gd.x / glen), ady = (gd.y / glen);
       c.beginPath();
@@ -875,7 +919,7 @@
         for (let i = 1; i < poly.length; i++) cum.push(cum[i - 1] + Math.hypot(poly[i].x - poly[i - 1].x, poly[i].y - poly[i - 1].y));
         const total = cum[cum.length - 1] || 1;
         for (const notch of pp.notches) {
-          const t = typeof notch.position === 'number' ? notch.position : 0.5;
+          const t = notchRatio(notch, pp, paths, points);
           const target = t * total;
           let i = 1; while (i < poly.length - 1 && cum[i] < target) i++;
           const seg = cum[i] - cum[i - 1] || 1;
@@ -953,17 +997,27 @@
     // seams — shown only while a seam tool is active (or pinned via the Seams toggle),
     // matching the source. Each seam's two sewn edges are stroked in the seam's own colour
     // (golden-angle hue spacing) so matching colours = same seam; faint dashed "rungs" link them.
-    if (showSeams || isSeamToolActive()) {
+    // A selected seam shows even when "Show seams" is off (the original's shouldDisplaySeams),
+    // with extra emphasis + direction arrows on both sides.
+    const selSeam = $selectedSeamId;
+    if (showSeams || isSeamToolActive() || selSeam) {
+      const onlySelected = !showSeams && !isSeamToolActive();
       const sel = $selectedPieceIds;
       for (const sg of allSeamGeometry(currentPattern, paths, points, 4)) {
-        const focused = sel.size > 0 && sg.pieceIds.some((id) => sel.has(id));
+        if (onlySelected && sg.id !== selSeam) continue;
+        const isSel = sg.id === selSeam;
+        const focused = isSel || (sel.size > 0 && sg.pieceIds.some((id) => sel.has(id)));
         const col = seamColor(sg.index);
         c.strokeStyle = col;
         c.globalAlpha = sel.size === 0 || focused ? 1 : 0.35;
-        c.lineWidth = focused ? 4 : 3;
+        c.lineWidth = isSel ? 5 : focused ? 4 : 3;
         c.setLineDash([]);
         tracePoly(c, sg.fromEdge, false); c.stroke();
         tracePoly(c, sg.toEdge, false); c.stroke();
+        if (isSel) {
+          drawDirectionArrow(c, sg.fromEdge, col);
+          drawDirectionArrow(c, sg.toEdge, col);
+        }
         if (focused || sel.size === 0) {
           c.lineWidth = 0.8;
           c.globalAlpha = focused ? 0.5 : 0.18;
@@ -1078,14 +1132,40 @@
       for (const p of pts) { const cp = toCanvas(p); c.beginPath(); c.arc(cp.x, cp.y, 4, 0, Math.PI * 2); c.fillStyle = '#0ea5e9'; c.fill(); c.strokeStyle = '#fff'; c.lineWidth = 1.25; c.stroke(); }
     }
 
-    // seam tool: highlight the picked edge(s)
-    for (const id of [...(seamFirstEdge ? [seamFirstEdge] : []), ...seamMultiEdges]) {
-      const owners = pieceOwnerOf(id);
-      if (!owners) continue;
-      const tf = pieceTransform(owners.piece, points, pieceShrinkageScale(currentPattern, owners.piece));
-      const poly = piecePathPolyline(owners.pp, paths, points, 4).map(tf);
-      c.strokeStyle = PATH_MAGENTA; c.lineWidth = 3; c.setLineDash([]);
-      tracePoly(c, poly, false); c.stroke();
+    // seam tool overlays: mirrored-half ghosts, per-side picked edges with direction arrows,
+    // hover highlight, and live preview rungs to the candidate side (like the original).
+    if (isSeamToolActive()) {
+      // faint ghost of mirrored halves so the mirrored copy is visible + clickable
+      for (const piece of currentPattern.pieces) {
+        if (piece.hidden || !layerVisible(piece.layerId)) continue;
+        const axis = pieceMirrorAxis(piece, points);
+        if (!axis) continue;
+        const tf = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
+        c.strokeStyle = isDark ? 'rgba(148,163,184,0.4)' : 'rgba(100,116,139,0.35)';
+        c.lineWidth = 1; c.setLineDash([3, 4]);
+        for (const pp of piece.mainPaths) {
+          if (pp.isMirrorLine) continue;
+          const ghost = piecePathPolyline(pp, paths, points, 4).map((p) => reflectAcrossLine(p, axis.a, axis.b)).map(tf);
+          tracePoly(c, ghost, false); c.stroke();
+        }
+        c.setLineDash([]);
+      }
+      const drawPick = (pick: SeamPick, color: string, width: number) => {
+        const poly = seamPickPoly(pick, paths, points);
+        if (!poly) return;
+        c.strokeStyle = color; c.lineWidth = width; c.setLineDash([]);
+        tracePoly(c, poly, false); c.stroke();
+        drawDirectionArrow(c, poly, color);
+      };
+      for (const pick of seamFromPicks) drawPick(pick, PATH_MAGENTA, 3);
+      for (const pick of seamToPicks) drawPick(pick, '#2563eb', 3);
+      if (seamHover &&
+          !seamFromPicks.some((r) => samePick(r, seamHover!)) &&
+          !seamToPicks.some((r) => samePick(r, seamHover!))) {
+        const toPhase = $selectedTool === 'seam-multi' ? seamPhase === 'to' : seamFromPicks.length > 0;
+        drawPick(seamHover, toPhase ? 'rgba(37,99,235,0.6)' : 'rgba(217,70,239,0.6)', 2);
+      }
+      drawSeamPreviewRungs(c, paths, points);
     }
 
     // arc/circle tool: placed clicks + a live preview to the cursor
@@ -1783,7 +1863,7 @@
 
   /** Reset any in-progress operation and return to the select tool (Esc / V / Cancel button). */
   function cancelOperation() {
-    penDraft = []; draftPathId = null; seamFirstEdge = null; seamMultiEdges = []; arcClicks = []; measureFrom = null; measureChain = [];
+    penDraft = []; draftPathId = null; seamFromPicks = []; seamToPicks = []; seamPhase = 'from'; seamHover = null; arcClicks = []; measureFrom = null; measureChain = [];
     pendingPaste.set(null);
     selectedTool.set('select');
     render();
@@ -1801,8 +1881,14 @@
       case 'pen': return penDraft.length ? 'Click to add points · Enter to finish · Esc to cancel' : 'Click to start a path';
       case 'piece': return penDraft.length ? 'Click points to outline the piece · click the first point to close' : 'Click points to outline a new piece';
       case 'internal': return $selectedPieceIds.size !== 1 ? 'Select one piece first, then draw a dart / fold line' : penDraft.length ? 'Click to add points · Enter to attach to the piece · Esc to cancel' : 'Click to start an internal path in the selected piece';
-      case 'seam': case 'seam-single': return seamFirstEdge ? 'Click the matching edge to sew it' : 'Click an edge to start a seam';
-      case 'seam-multi': return seamMultiEdges.length ? `Click more edges to join (${seamMultiEdges.length}) · Enter to finish` : 'Click the first edge of the seam';
+      case 'seam': case 'seam-single': return seamFromPicks.length
+        ? 'Click the matching edge to sew it (near the end where the seam starts)'
+        : 'Click an edge to start a seam — click near the end where the seam starts';
+      case 'seam-multi': return seamPhase === 'from'
+        ? (seamFromPicks.length
+            ? `Select seam segments (${seamFromPicks.length}). Press Enter or tap Next to choose matching segments.`
+            : 'Select seam segments. Press Enter or tap Next to choose matching segments.')
+        : `Select matching segments (${seamToPicks.length}). Press Enter or tap Finish.`;
       case 'circle': return arcClicks.length ? 'Click to set the radius' : 'Click to set the centre of the circle';
       case 'arc-center': return ['Click to set the centre of the arc', 'Click to set the radius / start', 'Click to set the end of the arc'][arcClicks.length] ?? '';
       case 'arc-3pt': return ['Click the first point of the arc', 'Click a point on the arc', 'Click the last point of the arc'][arcClicks.length] ?? '';
@@ -1848,25 +1934,91 @@
     input.click();
   }
 
-  /** Hit-test a piece boundary edge (returns the PiecePath id), for the seam tool. */
-  function hitTestEdge(pos: Vec2): string | null {
+  // ---- Piece points (piece-local construction points, the original's AddPiecePointTool) ----------
+  let dragPiecePt: { id: string; invert: (w: Vec2) => Vec2 } | null = null;
+
+  function piecePointClick(pos: Vec2) {
+    const world = toPattern(pos.x, pos.y);
+    const paths = indexPaths(currentPattern);
+    const points = indexPoints(currentPattern);
+    for (const piece of currentPattern.pieces) {
+      if (piece.hidden || !layerVisible(piece.layerId) || layerLocked(piece.layerId)) continue;
+      if (piece.type !== 'dynamic') continue;
+      if (!pointInPolygon(world, pieceWorldOutline(currentPattern, piece, paths, points, 6))) continue;
+      const draft = pieceInverseTransform(piece, points)(world);
+      const next = piecePointAdd($state.snapshot(currentPattern) as Pattern, piece.id, draft.x, draft.y, undefined, uid);
+      if (next !== currentPattern) { onchange(next, 'Add piece point'); toast('Piece point added', 'success'); }
+      return;
+    }
+    toast('Click inside a dynamic piece to add a piece point', 'error');
+  }
+
+  function hitTestPiecePoint(cx: number, cy: number): { id: string; invert: (w: Vec2) => Vec2 } | null {
+    const points = indexPoints(currentPattern);
+    for (const piece of currentPattern.pieces) {
+      if (piece.hidden || !layerVisible(piece.layerId) || layerLocked(piece.layerId)) continue;
+      const tf = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
+      for (const pt of piece.piecePoints ?? []) {
+        const cp = toCanvas(tf(pt));
+        if (Math.hypot(cp.x - cx, cp.y - cy) <= HOVER_THRESHOLD) {
+          return { id: pt.id, invert: pieceInverseTransform(piece, points) };
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Rich edge hit-test for the seam tools: nearest PiecePath plus the arc-length ratio `t` of the
+   *  click projection (drives reversed inference) and whether the MIRRORED half was hit. In seam
+   *  mode, mirrored halves AND internal paths (pockets/yokes sew to internal lines) are candidates. */
+  function hitTestSeamEdge(pos: Vec2, seamMode = false): { id: string; t: number; mirrored: boolean } | null {
     const paths = indexPaths(currentPattern);
     const points = indexPoints(currentPattern);
     const world = toPattern(pos.x, pos.y);
     const tol = 10 / baseScale();
-    let best: string | null = null, bestD = tol;
+    let best: { id: string; t: number; mirrored: boolean } | null = null;
+    let bestD = tol;
+    const testPoly = (poly: Vec2[], id: string, mirrored: boolean) => {
+      let hitSeg = -1, hitT = 0;
+      for (let i = 1; i < poly.length; i++) {
+        const d = distToSeg(world, poly[i - 1], poly[i]);
+        if (d < bestD) { bestD = d; hitSeg = i; hitT = projOnSeg(world, poly[i - 1], poly[i]); }
+      }
+      if (hitSeg < 0) return;
+      // arc-length ratio of the projection along the whole polyline
+      let total = 0, upto = 0;
+      for (let i = 1; i < poly.length; i++) {
+        const l = Math.hypot(poly[i].x - poly[i - 1].x, poly[i].y - poly[i - 1].y);
+        if (i < hitSeg) upto += l;
+        else if (i === hitSeg) upto += l * hitT;
+        total += l;
+      }
+      best = { id, t: total > 0 ? upto / total : 0, mirrored };
+    };
     for (const piece of currentPattern.pieces) {
       if (piece.hidden || !layerVisible(piece.layerId) || layerLocked(piece.layerId)) continue;
       const tf = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
-      for (const pp of piece.mainPaths) {
-        const poly = piecePathPolyline(pp, paths, points, 4).map(tf);
-        for (let i = 1; i < poly.length; i++) {
-          const d = distToSeg(world, poly[i - 1], poly[i]);
-          if (d < bestD) { bestD = d; best = pp.id; }
+      const axis = seamMode ? pieceMirrorAxis(piece, points) : null;
+      const candidates = seamMode ? [...piece.mainPaths, ...piece.internalPaths] : piece.mainPaths;
+      for (const pp of candidates) {
+        const raw = piecePathPolyline(pp, paths, points, 4);
+        testPoly(raw.map(tf), pp.id, false);
+        if (axis && !pp.isMirrorLine) {
+          testPoly(raw.map((p) => reflectAcrossLine(p, axis.a, axis.b)).map(tf), pp.id, true);
         }
       }
     }
     return best;
+  }
+
+  /** Hit-test a piece boundary edge (returns the PiecePath id), for edge selection. */
+  function hitTestEdge(pos: Vec2): string | null {
+    return hitTestSeamEdge(pos)?.id ?? null;
+  }
+  function projOnSeg(p: Vec2, a: Vec2, b: Vec2): number {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const l2 = dx * dx + dy * dy || 1;
+    return Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
   }
   function distToSeg(p: Vec2, a: Vec2, b: Vec2): number {
     const dx = b.x - a.x, dy = b.y - a.y;
@@ -1876,40 +2028,161 @@
     return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
   }
 
-  function seamClick(pos: Vec2) {
-    const edge = hitTestEdge(pos);
-    if (!edge) return;
-    if (!seamFirstEdge) { seamFirstEdge = edge; render(); return; }
-    if (edge === seamFirstEdge) { seamFirstEdge = null; render(); return; }
+  /** Resolve a click into a seam pick: edge id + orientation inferred from the click position
+   *  (nearer the path's end ⇒ reversed, the original computeReverseForPoint) + mirrored-half flag. */
+  function seamPickAt(pos: Vec2): SeamPick | null {
+    const hit = hitTestSeamEdge(pos, true);
+    if (!hit) return null;
+    return { id: hit.id, reversed: hit.t > 0.5, mirrored: hit.mirrored };
+  }
+
+  function commitSeam(from: SeamPick[], to: SeamPick[]) {
     const p = $state.snapshot(currentPattern) as Pattern;
     const seam = {
       id: uid('Seam'), name: '',
-      fromPaths: [{ id: seamFirstEdge, mirrored: false, reversed: false }],
-      toPaths: [{ id: edge, mirrored: false, reversed: false }]
+      fromPaths: from.map((r) => ({ ...r })),
+      toPaths: to.map((r) => ({ ...r }))
     };
-    onchange({ ...p, seams: [...p.seams, seam], hasChanged: true });
-    seamFirstEdge = null; render();
+    onchange({ ...p, seams: [...p.seams, seam], hasChanged: true }, 'Add seam');
+    selectedSeamId.set(seam.id); // the original selects the seam it just created
+    resetSeamTool();
   }
 
-  /** Multi-seam: first edge is the "from" side, each later edge joins the "to" side. Enter finishes. */
+  function resetSeamTool() {
+    seamTool.set(EMPTY_SEAM_TOOL);
+    seamHover = null;
+  }
+
+  /** Route a pick through the shared tool state machine; commit when it completes a seam. */
+  function routeSeamPick(kind: 'single' | 'multi', pick: SeamPick) {
+    const res = applySeamPick(kind, { from: seamFromPicks, to: seamToPicks, phase: seamPhase }, pick);
+    if (res.commit) commitSeam(res.commit.from, res.commit.to);
+    else seamTool.set(res.state);
+    render();
+  }
+
+  function seamClick(pos: Vec2) {
+    const pick = seamPickAt(pos);
+    if (pick) routeSeamPick('single', pick);
+  }
+
+  /** Multi-seam, two-phase (like the original MultiSeamTool): select any number of "from" segments,
+   *  Enter/Next, then the matching "to" segments, Enter/Finish. Clicking a picked segment deselects. */
   function seamMultiClick(pos: Vec2) {
-    const edge = hitTestEdge(pos);
-    if (!edge) return;
-    if (seamMultiEdges.includes(edge)) { seamMultiEdges = seamMultiEdges.filter((e) => e !== edge); render(); return; }
-    seamMultiEdges = [...seamMultiEdges, edge];
+    const pick = seamPickAt(pos);
+    if (pick) routeSeamPick('multi', pick);
+  }
+  function advanceSeamPhase() {
+    const res = advanceSeamToolPhase({ from: seamFromPicks, to: seamToPicks, phase: seamPhase });
+    if (res.commit) commitSeam(res.commit.from, res.commit.to);
+    else seamTool.set(res.state);
+    if (res.message) toast(res.message);
     render();
   }
   function finishMultiSeam() {
-    if (seamMultiEdges.length >= 2) {
-      const p = $state.snapshot(currentPattern) as Pattern;
-      const seam = {
-        id: uid('Seam'), name: '',
-        fromPaths: [{ id: seamMultiEdges[0], mirrored: false, reversed: false }],
-        toPaths: seamMultiEdges.slice(1).map((id) => ({ id, mirrored: false, reversed: false }))
-      };
-      onchange({ ...p, seams: [...p.seams, seam], hasChanged: true });
+    if (seamFromPicks.length > 0 && seamToPicks.length > 0) commitSeam(seamFromPicks, seamToPicks);
+    else resetSeamTool();
+    render();
+  }
+
+  /** World polyline for a seam pick/ref: mirrored reflection + piece transform + reversed applied. */
+  function seamPickPoly(
+    pick: { id: string; reversed?: boolean; mirrored?: boolean },
+    paths = indexPaths(currentPattern),
+    points = indexPoints(currentPattern)
+  ): Vec2[] | null {
+    const owner = pieceOwnerOf(pick.id);
+    if (!owner) return null;
+    const tf = pieceTransform(owner.piece, points, pieceShrinkageScale(currentPattern, owner.piece));
+    let raw = piecePathPolyline(owner.pp, paths, points, 4);
+    if (pick.mirrored) {
+      const ax = pieceMirrorAxis(owner.piece, points);
+      if (ax) raw = raw.map((p) => reflectAcrossLine(p, ax.a, ax.b));
     }
-    seamMultiEdges = []; render();
+    let poly = raw.map(tf);
+    if (pick.reversed) poly = poly.slice().reverse();
+    return poly.length >= 2 ? poly : null;
+  }
+
+  /** Mid-path direction arrow (the original's PathDirectionOverlay): a small triangle at the
+   *  polyline's arc-length midpoint pointing along its (possibly reversed) direction. */
+  function drawDirectionArrow(c: CanvasRenderingContext2D, polyWorld: Vec2[], color: string) {
+    if (polyWorld.length < 2) return;
+    let total = 0;
+    for (let i = 1; i < polyWorld.length; i++) total += Math.hypot(polyWorld[i].x - polyWorld[i - 1].x, polyWorld[i].y - polyWorld[i - 1].y);
+    if (total <= 0) return;
+    let upto = 0, j = 1;
+    const half = total / 2;
+    for (; j < polyWorld.length; j++) {
+      const l = Math.hypot(polyWorld[j].x - polyWorld[j - 1].x, polyWorld[j].y - polyWorld[j - 1].y);
+      if (upto + l >= half) break;
+      upto += l;
+    }
+    j = Math.min(j, polyWorld.length - 1);
+    const a = toCanvas(polyWorld[j - 1]);
+    const b = toCanvas(polyWorld[j]);
+    const segLenW = Math.hypot(polyWorld[j].x - polyWorld[j - 1].x, polyWorld[j].y - polyWorld[j - 1].y) || 1;
+    const f = Math.max(0, Math.min(1, (half - upto) / segLenW));
+    const mx = a.x + (b.x - a.x) * f, my = a.y + (b.y - a.y) * f;
+    const dl = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    const dx = (b.x - a.x) / dl, dy = (b.y - a.y) / dl;
+    const s = 9; // px
+    c.save();
+    c.fillStyle = color;
+    c.beginPath();
+    c.moveTo(mx + dx * s, my + dy * s);
+    c.lineTo(mx - dx * s * 0.6 - dy * s * 0.6, my - dy * s * 0.6 + dx * s * 0.6);
+    c.lineTo(mx - dx * s * 0.6 + dy * s * 0.6, my - dy * s * 0.6 - dx * s * 0.6);
+    c.closePath();
+    c.fill();
+    c.restore();
+  }
+
+  /** Live preview "rungs" between the candidate from/to sides while the seam tool is active —
+   *  the original's calculateSeamPreviewConnections (includes the hovered, not-yet-clicked edge). */
+  function drawSeamPreviewRungs(
+    c: CanvasRenderingContext2D,
+    paths = indexPaths(currentPattern),
+    points = indexPoints(currentPattern)
+  ) {
+    if (seamFromPicks.length === 0) return;
+    let toSide: SeamPick[];
+    if ($selectedTool === 'seam-multi') {
+      toSide = [...seamToPicks];
+      if (seamPhase === 'to' && seamHover &&
+          !seamFromPicks.some((r) => samePick(r, seamHover!)) &&
+          !seamToPicks.some((r) => samePick(r, seamHover!))) toSide.push(seamHover);
+    } else {
+      toSide = seamHover && !samePick(seamFromPicks[0], seamHover) ? [seamHover] : [];
+    }
+    if (toSide.length === 0) return;
+    const composite = (picks: SeamPick[]): Vec2[] => {
+      const out: Vec2[] = [];
+      for (const pk of picks) {
+        const poly = seamPickPoly(pk, paths, points);
+        if (!poly) continue;
+        if (out.length) out.push(...poly.slice(1)); else out.push(...poly);
+      }
+      return out;
+    };
+    const fromC = composite(seamFromPicks);
+    const toC = composite(toSide);
+    if (fromC.length < 2 || toC.length < 2) return;
+    const n = Math.max(2, Math.min(12, Math.round(Math.max(
+      fromC.reduce((s, p, i) => i ? s + Math.hypot(p.x - fromC[i - 1].x, p.y - fromC[i - 1].y) : 0, 0),
+      toC.reduce((s, p, i) => i ? s + Math.hypot(p.x - toC[i - 1].x, p.y - toC[i - 1].y) : 0, 0)
+    ) / 40)));
+    const a = resamplePolyline(fromC, n);
+    const b = resamplePolyline(toC, n);
+    c.save();
+    c.strokeStyle = isDark ? 'rgba(226,232,240,0.5)' : 'rgba(51,65,85,0.45)';
+    c.lineWidth = 1;
+    c.setLineDash([4, 4]);
+    for (let i = 0; i < n; i++) {
+      const pa = toCanvas(a[i]), pb = toCanvas(b[i]);
+      c.beginPath(); c.moveTo(pa.x, pa.y); c.lineTo(pb.x, pb.y); c.stroke();
+    }
+    c.restore();
   }
 
   // ---- Measure tool: persistent distance + angle measurements ------------------------------------
@@ -2372,6 +2645,7 @@
     if (tool === 'text') { insertTextAt(pos); return; }
     if (tool === 'image') { insertImageAt(pos); return; }
     if (tool === 'trace') { traceClick(pos); return; }
+    if (tool === 'piece-point') { piecePointClick(pos); return; }
     if (tool === 'seam' || tool === 'seam-single') { seamClick(pos); return; }
     if (tool === 'seam-multi') { seamMultiClick(pos); return; }
     if (tool === 'circle' || tool === 'arc-center' || tool === 'arc-3pt') { arcClick(pos); return; }
@@ -2383,6 +2657,10 @@
     // bezier-handle drag takes priority over anchor selection (handles sit on top of anchors)
     const hHit = hitTestHandle(pos.x, pos.y);
     if (hHit) { dragHandle = hHit; isDragging = true; return; }
+
+    // piece-local construction points are draggable like anchors
+    const ppt = hitTestPiecePoint(pos.x, pos.y);
+    if (ppt) { dragPiecePt = ppt; isDragging = true; return; }
 
     const hit = hitTestPlaced(pos.x, pos.y);
     if (hit) {
@@ -2488,6 +2766,11 @@
       onchange({ ...currentPattern, paths, hasChanged: true });
       return;
     }
+    if (isDragging && dragPiecePt) {
+      const draft = dragPiecePt.invert(toPattern(pos.x, pos.y));
+      onchange(piecePointUpdate($state.snapshot(currentPattern) as Pattern, dragPiecePt.id, { x: draft.x, y: draft.y }), 'Move piece point');
+      return;
+    }
     if (isDragging && dragPointId) {
       // map the cursor (world) back into the dragged point's drafting space
       const world = toPattern(pos.x, pos.y);
@@ -2503,6 +2786,15 @@
         onchange(afterPointsMoved({ ...currentPattern, points, hasChanged: true }, [dragPointId]));
       }
       return;
+    }
+    if (isSeamToolActive()) {
+      const next = seamPickAt(pos);
+      const cur = seamHover;
+      if (!!next !== !!cur || (next && cur && (!samePick(next, cur) || next.reversed !== cur.reversed))) {
+        seamHover = next;
+      }
+    } else if (seamHover) {
+      seamHover = null;
     }
     hoveredPointId = hitTestPoint(pos.x, pos.y);
     render();
@@ -2526,6 +2818,7 @@
     isDragging = false;
     dragPointId = null;
     dragHandle = null;
+    dragPiecePt = null;
     dragInvert = null;
     dragStartWorld = null;
     dragDraftStart = null;
@@ -2557,6 +2850,23 @@
   oncontextmenu={handleContextMenu}
   style="cursor: {$selectedTool === 'pan' ? 'grab' : 'crosshair'}; touch-action: none;"
 ></canvas>
+
+{#if $selectedTool === 'seam-multi' && (seamFromPicks.length > 0 || seamPhase === 'to')}
+  <!-- multi-seam phase helper: Next/Finish mirrors the Enter key (the original's tap targets) -->
+  <div class="absolute bottom-14 left-1/2 -translate-x-1/2 z-10 bg-base-200/95 rounded-box shadow px-3 py-1.5 text-xs flex items-center gap-2">
+    <span>
+      {seamPhase === 'from'
+        ? `Selecting "from" segments (${seamFromPicks.length})`
+        : `Selecting "to" segments (${seamToPicks.length})`}
+    </span>
+    <button
+      class="btn btn-xs btn-primary"
+      onclick={advanceSeamPhase}
+      disabled={seamPhase === 'from' ? seamFromPicks.length === 0 : seamToPicks.length === 0}
+    >{seamPhase === 'from' ? 'Next' : 'Finish'}</button>
+    <button class="btn btn-xs btn-ghost" onclick={() => { resetSeamTool(); render(); }}>Cancel</button>
+  </div>
+{/if}
 
 {#if contextMenu}
   <ContextMenu x={contextMenu.x} y={contextMenu.y} items={contextMenu.items} onclose={() => (contextMenu = null)} />

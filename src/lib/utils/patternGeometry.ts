@@ -178,7 +178,7 @@ export function piecePathPolyline(
  * endpoints. Robust to arbitrary edge order/orientation.
  */
 /** Reflect a point across the infinite line through a and b. */
-function reflectAcrossLine(p: Vec2, a: Vec2, b: Vec2): Vec2 {
+export function reflectAcrossLine(p: Vec2, a: Vec2, b: Vec2): Vec2 {
   const dx = b.x - a.x, dy = b.y - a.y;
   const len2 = dx * dx + dy * dy;
   if (len2 < 1e-9) return { x: 2 * a.x - p.x, y: 2 * a.y - p.y };
@@ -221,6 +221,18 @@ function firstEdgeEndpoints(piece: Piece, points: Map<string, ConstrainablePoint
   const a = points.get(fold.from), b = points.get(fold.to);
   if (!a || !b) return null;
   return { a: { x: a.x, y: a.y }, b: { x: b.x, y: b.y } };
+}
+
+/** The piece's mirror axis in drafting space: an explicit isMirrorLine path wins, else the
+ *  first-edge fold when firstEdgeSymmetry is set. Null when the piece has no mirrored half. */
+export function pieceMirrorAxis(piece: Piece, points: Map<string, ConstrainablePoint>): { a: Vec2; b: Vec2 } | null {
+  const ml = [...piece.mainPaths, ...piece.internalPaths].find((pp) => pp.isMirrorLine);
+  if (ml) {
+    const a = points.get(ml.from), b = points.get(ml.to);
+    if (a && b) return { a: { x: a.x, y: a.y }, b: { x: b.x, y: b.y } };
+  }
+  if (piece.firstEdgeSymmetry) return firstEdgeEndpoints(piece, points);
+  return null;
 }
 
 export function pieceOutline(
@@ -475,10 +487,11 @@ function seamRefLabel(
 }
 
 /**
- * Faithful seam label matching the original app, e.g.
- *   "Piece2: LineA8A4 -> Piece: LineA2A3 (reversed)"
- * Falls back to a stored seam.name if one was set. Uses the first ref of each side (the original
- * shows one edge per side; multi-edge sides still read correctly from their first edge).
+ * Faithful seam label matching the original app's getSeamTitle:
+ *   - "Unassigned seam" when a side has no entries
+ *   - "Seam (N -> M)" when either side has more than one entry
+ *   - "Piece2: LineA8A4 -> Piece: LineA2A3 (mirrored) (reversed)" otherwise
+ * Falls back to a stored seam.name if one was set.
  */
 export function seamLabel(
   pattern: Pattern,
@@ -488,12 +501,19 @@ export function seamLabel(
   if (seam.name && seam.name.trim()) return seam.name;
   const from = seam.fromPaths[0];
   const to = seam.toPaths[0];
-  if (!from || !to) return seam.id;
+  if (!from || !to) return 'Unassigned seam';
+  if (seam.fromPaths.length !== 1 || seam.toPaths.length !== 1) {
+    return `Seam (${seam.fromPaths.length} -> ${seam.toPaths.length})`;
+  }
+  const mirrored = from.mirrored || to.mirrored ? ' (mirrored)' : '';
   const reversed = from.reversed || to.reversed ? ' (reversed)' : '';
-  return `${seamRefLabel(pattern, from, owners)} -> ${seamRefLabel(pattern, to, owners)}${reversed}`;
+  return `${seamRefLabel(pattern, from, owners)} -> ${seamRefLabel(pattern, to, owners)}${mirrored}${reversed}`;
 }
 
 /** Resample a polyline to exactly `n` points evenly spaced by arc length. */
+export function resamplePolyline(poly: Vec2[], n: number): Vec2[] {
+  return resample(poly, n);
+}
 function resample(poly: Vec2[], n: number): Vec2[] {
   if (poly.length === 0) return [];
   if (poly.length === 1 || n <= 1) return new Array(n).fill(0).map(() => ({ ...poly[0] }));
@@ -531,6 +551,28 @@ export function seamColor(index: number): string {
 }
 
 /**
+ * Resolve a notch to its arc-length ratio along a piece edge. Anchored notches (referencePointId +
+ * distance, the original's "Distance from point") measure `distance` mm from the referenced
+ * endpoint; otherwise the parametric `position` (0..1) applies.
+ */
+export function notchRatio(
+  notch: { position?: number; referencePointId?: string; distance?: number },
+  pp: PiecePath,
+  paths: Map<string, ConstrainablePath>,
+  points: Map<string, ConstrainablePoint>
+): number {
+  if (notch.referencePointId && typeof notch.distance === 'number' && Number.isFinite(notch.distance)) {
+    const poly = piecePathPolyline(pp, paths, points, 2);
+    const len = polylineLength(poly);
+    if (len > 1e-6) {
+      const r = Math.max(0, Math.min(1, notch.distance / len));
+      return notch.referencePointId === pp.to ? 1 - r : r;
+    }
+  }
+  return typeof notch.position === 'number' ? notch.position : 0.5;
+}
+
+/**
  * Resolve a seam's two sides into placed (world) polylines and the connector
  * "rungs" the original app draws between them as red dashed lines — this is what
  * makes the 2D pieces read as *connected*.
@@ -551,7 +593,13 @@ export function seamGeometry(
       if (!owner) continue;
       pieceIds.add(owner.piece.id);
       const t = pieceTransform(owner.piece, points);
-      let poly = applyTransform(piecePathPolyline(owner.pp, paths, points, spacingMm), t);
+      let raw = piecePathPolyline(owner.pp, paths, points, spacingMm);
+      if (ref.mirrored) {
+        // a ref into the mirrored half: reflect across the piece's mirror axis (draft space)
+        const ax = pieceMirrorAxis(owner.piece, points);
+        if (ax) raw = raw.map((pt) => reflectAcrossLine(pt, ax.a, ax.b));
+      }
+      let poly = applyTransform(raw, t);
       if (ref.reversed) poly = poly.slice().reverse();
       if (segs.length && poly.length) segs.push(...poly.slice(1));
       else segs.push(...poly);
@@ -635,12 +683,25 @@ export function offsetPolygon(poly: Vec2[], dist: number, miterLimit = 4): Vec2[
 
 // --- Seam-allowance corner joins -------------------------------------------------------------
 // The seam-allowance cut line is the boundary outline offset by the allowance. Where two edges
-// meet, the corner can be finished three ways (faithful to the original ro.js seam-corner editor):
-//   intersection — extend both offset edges to their miter point (optionally capped to maxLength)
-//   radius       — round the corner with a fillet arc of the given radius
-//   byLength     — chamfer the corner square at a fixed distance from the corner
+// meet, the corner can be finished in the original's full vocabulary (Seamly/Valentina lineage):
+//   intersection        — extend both offset edges to their miter point (optionally capped)
+//   radius              — round the corner with a fillet arc of the given radius
+//   byLength            — chamfer the corner square at a fixed distance from the corner
+//   noJoin              — no corner material: allowance pinches back to the true corner point
+//   firstEdgeSymmetry   — cut along the FIRST original edge mirrored across the second offset edge
+//   secondEdgeSymmetry  — cut along the SECOND original edge mirrored across the first offset edge
+//   firstEdgeRightAngle — cut perpendicular to the first edge through the true corner
+//   secondEdgeRightAngle— cut perpendicular to the second edge through the true corner
 export interface CornerJoin {
-  type: 'intersection' | 'radius' | 'byLength';
+  type:
+    | 'intersection'
+    | 'radius'
+    | 'byLength'
+    | 'noJoin'
+    | 'firstEdgeSymmetry'
+    | 'secondEdgeSymmetry'
+    | 'firstEdgeRightAngle'
+    | 'secondEdgeRightAngle';
   radius?: number; // mm (radius)
   maxLength?: number; // mm cap from the true corner (intersection); 0 = uncapped
   length?: number; // mm chamfer back-off (byLength)
@@ -723,6 +784,60 @@ export function applyCornerJoins(
         out.push({ x: corner.x + (vx / d) * cap, y: corner.y + (vy / d) * cap });
         continue;
       }
+    }
+
+    // The remaining types cut the corner with a constructed line (Valentina's EkvPoint angle
+    // modes). p2 = true corner; bigLine1 = offset edge before it (prev→cur), bigLine2 = after
+    // (cur→next). A candidate point further than width×2.4 from p2 falls back to the miter.
+    if (join.type === 'noJoin' || join.type === 'firstEdgeSymmetry' || join.type === 'secondEdgeSymmetry' ||
+        join.type === 'firstEdgeRightAngle' || join.type === 'secondEdgeRightAngle') {
+      const p1o = outline[(i - 1 + n) % n];
+      const p2 = outline[i];
+      const p3o = outline[(i + 1) % n];
+      const d1 = unit(prev, cur); // along offset edge 1, toward the corner
+      const d2 = unit(cur, next); // along offset edge 2, away from the corner
+      const maxL = baseDist * 2.4;
+      const valid = (p: Vec2 | null): p is Vec2 => !!p && Math.hypot(p.x - p2.x, p.y - p2.y) <= maxL + baseDist;
+
+      if (join.type === 'noJoin') {
+        // pinch to the true corner: offset-edge-1 end -> corner -> offset-edge-2 start
+        const proj = (a: Vec2, d: Vec2): Vec2 => {
+          const t = (p2.x - a.x) * d.x + (p2.y - a.y) * d.y;
+          return { x: a.x + d.x * t, y: a.y + d.y * t };
+        };
+        out.push(proj(prev, d1), { ...p2 }, proj(cur, d2));
+        continue;
+      }
+
+      let cutP: Vec2 | null = null; // a point on the cut line
+      let cutD: Vec2 | null = null; // its direction
+      if (join.type === 'firstEdgeRightAngle' || join.type === 'secondEdgeRightAngle') {
+        const e = join.type === 'firstEdgeRightAngle' ? unit(p1o, p2) : unit(p2, p3o);
+        cutP = p2;
+        cutD = { x: -e.y, y: e.x };
+      } else {
+        // edge symmetry: mirror the original edge across the OPPOSITE offset edge's line
+        const [ea, eb, axisA, axisB] = join.type === 'firstEdgeSymmetry'
+          ? [p1o, p2, cur, next]
+          : [p2, p3o, prev, cur];
+        const fa = reflectAcrossLine(ea, axisA, axisB);
+        const fb = reflectAcrossLine(eb, axisA, axisB);
+        if (Math.hypot(fb.x - fa.x, fb.y - fa.y) > 1e-6) {
+          cutP = fa;
+          cutD = unit(fa, fb);
+        }
+      }
+      if (cutP && cutD) {
+        const px1 = intersectLines(cutP, cutD, prev, d1); // on offset edge 1
+        const px2 = intersectLines(cutP, cutD, cur, d2); // on offset edge 2
+        if (valid(px1) && valid(px2)) {
+          out.push(px1, px2);
+          continue;
+        }
+      }
+      // degenerate (parallel / too far): keep the miter vertex
+      out.push(cur);
+      continue;
     }
     out.push(cur);
   }

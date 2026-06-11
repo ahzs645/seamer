@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
+	import { get } from 'svelte/store';
+	import { selectedPointIds, selectedPathIds, selectedPieceIds, selectedSeamId } from '$lib/stores/pattern';
 	import type { Pattern, Seam } from '$lib/types/pattern';
 	import { indexPiecePathOwners, seamLabel as computeSeamLabel } from '$lib/utils/patternGeometry';
 	import {
@@ -89,6 +90,11 @@
 		selectedKey = id;
 	}
 	const selectOther = (id: string) => (selectedKey = id);
+	// Seam rows also drive the cross-view seam highlight (2D emphasis + 3D display-when-selected).
+	const selectSeamRow = (id: string) => {
+		selectedKey = id;
+		selectedSeamId.set(get(selectedSeamId) === id ? null : id);
+	};
 
 	// ---- Mutations (mirror the page's onchange contract) --------------------
 	const reorder = (group: GroupKey, fromId: string, toId: string) =>
@@ -325,8 +331,8 @@
 											<span class="material-symbols-rounded text-base-content/70 notranslate" title="Drag to reorder">drag_indicator</span>
 											<div class="flex flex-col w-full">
 												<div role="button" tabindex="0" class="flex items-center h-8 cursor-pointer select-none" title="Select"
-													onclick={() => selectOther(seam.id)}
-													onkeydown={(e) => e.key === 'Enter' && selectOther(seam.id)}>
+													onclick={() => selectSeamRow(seam.id)}
+													onkeydown={(e) => e.key === 'Enter' && selectSeamRow(seam.id)}>
 													<span class="text-sm">{seamLabel(seam)}</span>
 													<div class="ml-auto">
 														<button class="ml-1" title="Delete" onclick={(e) => { e.stopPropagation(); removeFrom('seams', seam.id); }}>

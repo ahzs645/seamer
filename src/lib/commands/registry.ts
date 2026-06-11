@@ -18,9 +18,10 @@ import { pieceAddPath } from './piece';
 import {
   pointCreate, pathCreateLine, pathCreateCurve, pathCreateEllipse, pathCreateCenterArc,
   pathCreateThreePointArc, pathUpdate, pieceCreateDynamic, pieceUpdate, pieceRotate,
-  piecePathUpdate, seamCreate, seamReverse, notchAdd, notchUpdate, notchDelete,
+  piecePathUpdate, piecePointAdd, piecePointUpdate, piecePointDelete,
+  seamCreate, seamReverse, notchAdd, notchUpdate, notchDelete,
   variableCreate, variableDelete, materialUpsert, materialDelete, layerCreate, layerDelete,
-  textCreate, slidingPointUpdate
+  textCreate, slidingPointUpdate, type SeamRefInput
 } from './create';
 import * as ops from '$lib/utils/pathPointOps';
 import { breakoutPiece, type BreakoutMode } from '$lib/utils/breakout';
@@ -29,6 +30,8 @@ const num = (v: unknown, d = 0): number => (typeof v === 'number' && Number.isFi
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : d);
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const strArr = (v: unknown): string[] => arr(v).filter((x): x is string => typeof x === 'string');
+const seamRefArr = (v: unknown): SeamRefInput[] =>
+  arr(v).filter((x): x is SeamRefInput => typeof x === 'string' || (!!x && typeof x === 'object' && typeof (x as { id?: unknown }).id === 'string'));
 
 const defs: CommandDef[] = [
   // --- selection (batch transforms) -----------------------------------------
@@ -281,9 +284,13 @@ const defs: CommandDef[] = [
   },
   {
     type: 'path.createEllipse', category: 'path', label: 'Create circle/ellipse',
-    summary: 'Create a circle from a center and a radius point (refs or coordinates).', inputs: ['center', 'radiusPoint', 'name?'],
-    example: { center: { x: 0, y: 0 }, radiusPoint: { x: 50, y: 0 } },
-    run: (p, a, c) => pathCreateEllipse(p, a.center, a.radiusPoint, a.name ? str(a.name) : undefined, c.uid)
+    summary: 'Create a circle or true ellipse from a center and radius point; radiusX/radiusY (mm) + rotation (deg) make it elliptical.', inputs: ['center', 'radiusPoint', 'radiusX?', 'radiusY?', 'rotation?', 'name?'],
+    example: { center: { x: 0, y: 0 }, radiusPoint: { x: 50, y: 0 }, radiusY: 30 },
+    run: (p, a, c) => pathCreateEllipse(p, a.center, a.radiusPoint, a.name ? str(a.name) : undefined, c.uid, {
+      rx: typeof a.radiusX === 'number' ? a.radiusX : undefined,
+      ry: typeof a.radiusY === 'number' ? a.radiusY : undefined,
+      rotationDeg: typeof a.rotation === 'number' ? a.rotation : undefined
+    })
   },
   {
     type: 'path.createCenterArc', category: 'path', label: 'Create center arc',
@@ -304,27 +311,50 @@ const defs: CommandDef[] = [
     run: (p, a, c) => pieceCreateDynamic(p, strArr(a.pathIds), strArr(a.internalPathIds), a.name ? str(a.name) : undefined, c.uid)
   },
   {
+    type: 'piecePoint.add', category: 'piece', label: 'Add piece point',
+    summary: 'Add a construction point to a dynamic piece (drafting mm, travels with the piece).', inputs: ['pieceId', 'x', 'y', 'name?'],
+    example: { pieceId: 'Piece_x', x: 120, y: 80 },
+    run: (p, a, c) => piecePointAdd(p, str(a.pieceId), num(a.x, NaN), num(a.y, NaN), a.name ? str(a.name) : undefined, c.uid)
+  },
+  {
+    type: 'piecePoint.update', category: 'piece', label: 'Update piece point',
+    summary: 'Rename or move a piece point.', inputs: ['piecePointId', 'name?', 'x?', 'y?'],
+    example: { piecePointId: 'PiecePoint_x', x: 100 },
+    run: (p, a) => piecePointUpdate(p, str(a.piecePointId), {
+      name: typeof a.name === 'string' ? a.name : undefined,
+      x: typeof a.x === 'number' ? a.x : undefined,
+      y: typeof a.y === 'number' ? a.y : undefined
+    })
+  },
+  {
+    type: 'piecePoint.delete', category: 'piece', label: 'Delete piece point',
+    summary: 'Remove a point from a dynamic piece.', inputs: ['piecePointId'],
+    example: { piecePointId: 'PiecePoint_x' },
+    run: (p, a) => piecePointDelete(p, str(a.piecePointId))
+  },
+  {
     type: 'seam.create', category: 'seam', label: 'Create seam',
-    summary: 'Create a seam between piece paths (PiecePath ids).', inputs: ['fromPiecePathIds[]', 'toPiecePathIds[]', 'name?'],
-    example: { fromPiecePathIds: ['PiecePath_a'], toPiecePathIds: ['PiecePath_b'] },
-    run: (p, a, c) => seamCreate(p, strArr(a.fromPiecePathIds), strArr(a.toPiecePathIds), a.name ? str(a.name) : undefined, c.uid)
+    summary: 'Create a seam between piece paths. Entries are PiecePath ids or {id, mirrored?, reversed?} refs.', inputs: ['fromPiecePathIds[]', 'toPiecePathIds[]', 'name?'],
+    example: { fromPiecePathIds: ['PiecePath_a'], toPiecePathIds: [{ id: 'PiecePath_b', reversed: true }] },
+    run: (p, a, c) => seamCreate(p, seamRefArr(a.fromPiecePathIds), seamRefArr(a.toPiecePathIds), a.name ? str(a.name) : undefined, c.uid)
   },
   {
     type: 'seam.reverse', category: 'seam', label: 'Reverse seam side',
-    summary: 'Toggle the reversed flag on one seam side entry.', inputs: ['seamId', 'side', 'index?'],
-    example: { seamId: 'Seam_x', side: 'to', index: 0 },
-    run: (p, a) => seamReverse(p, str(a.seamId), str(a.side, 'from') === 'to' ? 'to' : 'from', num(a.index, 0))
+    summary: 'Toggle the reversed flag on one seam side entry, or the whole side when index is omitted.', inputs: ['seamId', 'side', 'index?'],
+    example: { seamId: 'Seam_x', side: 'to' },
+    run: (p, a) => seamReverse(p, str(a.seamId), str(a.side, 'from') === 'to' ? 'to' : 'from', typeof a.index === 'number' && Number.isFinite(a.index) ? a.index : undefined)
   },
   {
     type: 'notch.add', category: 'notch', label: 'Add notch',
-    summary: 'Add a notch to a piece path at an arc-length position (0..1).', inputs: ['piecePathId', 'position', 'type?', 'size?'],
+    summary: 'Add a notch at an arc-length position (0..1), or anchored by distance (mm) from the edge\'s from/to point.', inputs: ['piecePathId', 'position?', 'type?', 'size?', 'referencePointId?', 'distance?'],
     example: { piecePathId: 'PiecePath_x', position: 0.5, type: 'single' },
-    run: (p, a, c) => notchAdd(p, str(a.piecePathId), num(a.position, NaN), a.type ? str(a.type) : undefined, typeof a.size === 'number' ? a.size : undefined, c.uid)
+    run: (p, a, c) => notchAdd(p, str(a.piecePathId), num(a.position, NaN), a.type ? str(a.type) : undefined, typeof a.size === 'number' ? a.size : undefined, c.uid,
+      a.referencePointId ? { referencePointId: str(a.referencePointId), distance: num(a.distance, 0) } : undefined)
   },
   {
     type: 'notch.update', category: 'notch', label: 'Update notch',
-    summary: 'Update notch position, type or size.', inputs: ['notchId', 'position?', 'type?', 'size?'],
-    run: (p, a) => notchUpdate(p, str(a.notchId), a as { position?: number; type?: string; size?: number })
+    summary: 'Update notch position/type/size, or its reference-point anchor (referencePointId: null releases it).', inputs: ['notchId', 'position?', 'type?', 'size?', 'referencePointId?', 'distance?'],
+    run: (p, a) => notchUpdate(p, str(a.notchId), a as { position?: number; type?: string; size?: number; referencePointId?: string | null; distance?: number })
   },
   {
     type: 'notch.delete', category: 'notch', label: 'Delete notch',

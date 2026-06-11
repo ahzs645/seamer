@@ -89,7 +89,8 @@ function quadCloth(pieceId: string, chainKey?: string): PieceCloth {
         [0, 3]
       ],
       boundary: [0, 1, 2, 3],
-      numBoundary: 4
+      numBoundary: 4,
+      internal: []
     },
     edgeParticles,
     particleDistanceMm: 10
@@ -164,6 +165,23 @@ describe('bend props buffer', () => {
     expect(props[1]).not.toBeCloseTo(props[0], 5); // the two slots must differ (bend != stretch alpha)
     expect(props[2]).toBeCloseTo(Math.hypot(10, 10) / 1000, 6); // rest length (m) between (10,0) and (0,10)
     expect(props[3]).toBe(0); // no fold line
+  });
+});
+
+describe('fold lines (foldAngle)', () => {
+  it('sets the dihedral target on bend constraints whose hinge lies along a foldAngle internal path', () => {
+    const piece = makePiece('P1', ['eA']);
+    piece.internalPaths = [{
+      id: 'fold1', name: '', path: 'p', from: 'a', to: 'b', reversed: false, notches: [],
+      libraryUpdatedAt: null, foldAngle: 90
+    } as unknown as Piece['internalPaths'][number]];
+    const cloth = quadCloth('P1');
+    cloth.edgeParticles.set('fold1', [0, 2]); // the quad's single bend hinge pair
+    const sim = buildSimData(patternWith([piece]), [arrangedQuad(cloth, QUAD_POS_A)]);
+
+    const bends = bendConstraints(sim);
+    expect(bends).toHaveLength(1);
+    expect(bends[0].props[3]).toBeCloseTo(Math.PI / 2, 6); // 90° -> rad in the targetAngle slot
   });
 });
 

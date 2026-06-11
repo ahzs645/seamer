@@ -4,10 +4,10 @@
 // replacing the whole JSON.
 
 import type {
-  Pattern, ConstrainablePath, PathPoint, BezierHandle, Piece, PiecePath, Seam, SeamRef, Notch,
+  Pattern, ConstrainablePath, PathPoint, BezierHandle, Piece, PiecePath, PiecePoint, Seam, SeamRef, Notch,
   NotchType, Variable, Material, TextureSlot, Layer, PatternText, ArcParams, SeamCornerJoinType
 } from '$lib/types/pattern';
-import { arcAnchors, centerArcAngles, threePointArcAngles, type ArcAnchor, type Vec2 } from '$lib/utils/arcGeometry';
+import { arcAnchors, ellipseAnchors, centerArcAngles, threePointArcAngles, type ArcAnchor, type Vec2 } from '$lib/utils/arcGeometry';
 
 type Uid = (prefix: string) => string;
 
@@ -106,17 +106,35 @@ function bakeArcPath(p: Pattern, anchors: ArcAnchor[], closed: boolean, arc: Arc
   return { ...p, points: [...p.points, ...newPoints], paths: [...p.paths, path], hasChanged: true };
 }
 
-export function pathCreateEllipse(p: Pattern, center: unknown, radiusPoint: unknown, name: string | undefined, uid: Uid): Pattern {
+export function pathCreateEllipse(
+  p: Pattern,
+  center: unknown,
+  radiusPoint: unknown,
+  name: string | undefined,
+  uid: Uid,
+  opts?: { rx?: number; ry?: number; rotationDeg?: number }
+): Pattern {
   const created: { id: string; name: string; x: number; y: number; layerId?: string }[] = [];
   const cId = resolveRef(p, center, uid, created);
   const rId = resolveRef(p, radiusPoint, uid, created);
   if (!cId || !rId || cId === rId) return p;
   const c = ptOf(p, created, cId)!;
   const rp = ptOf(p, created, rId)!;
-  const r = Math.hypot(rp.x - c.x, rp.y - c.y);
-  if (r <= 0) return p;
+  const rDist = Math.hypot(rp.x - c.x, rp.y - c.y);
+  // independent X/Y radii (true ellipse) when given; the radius point sets the default circle
+  const rx = Number.isFinite(opts?.rx) && (opts!.rx as number) > 0 ? (opts!.rx as number) : rDist;
+  const ry = Number.isFinite(opts?.ry) && (opts!.ry as number) > 0 ? (opts!.ry as number) : rx;
+  const rotation = Number.isFinite(opts?.rotationDeg) ? ((opts!.rotationDeg as number) * Math.PI) / 180 : 0;
+  if (rx <= 0 || ry <= 0) return p;
   const base = { ...p, points: [...p.points, ...created] };
-  return bakeArcPath(base, arcAnchors(c, r, 0, Math.PI * 2), true, { kind: 'circle', centerId: cId, cx: c.x, cy: c.y, r, a0: 0, a1: Math.PI * 2, closed: true }, name, uid);
+  return bakeArcPath(
+    base,
+    ellipseAnchors(c, rx, ry, rotation, 0, Math.PI * 2),
+    true,
+    { kind: 'circle', centerId: cId, cx: c.x, cy: c.y, r: rx, rx, ry, rotation, a0: 0, a1: Math.PI * 2, closed: true },
+    name,
+    uid
+  );
 }
 
 export function pathCreateCenterArc(p: Pattern, center: unknown, start: unknown, end: unknown, name: string | undefined, uid: Uid): Pattern {
@@ -227,11 +245,54 @@ export function piecePathUpdate(p: Pattern, piecePathId: string, patch: Record<s
   for (const [k, t] of Object.entries(PIECEPATH_KEYS)) {
     if (typeof patch[k] === t && (t !== 'number' || Number.isFinite(patch[k]))) upd[k] = patch[k];
   }
-  if (upd.seamCornerJoinType && !['intersection', 'radius', 'byLength'].includes(upd.seamCornerJoinType as string)) delete upd.seamCornerJoinType;
+  if (upd.seamCornerJoinType && !['intersection', 'radius', 'byLength', 'noJoin', 'firstEdgeSymmetry', 'secondEdgeSymmetry', 'firstEdgeRightAngle', 'secondEdgeRightAngle'].includes(upd.seamCornerJoinType as string)) delete upd.seamCornerJoinType;
   if (Object.keys(upd).length === 0) return p;
   let touched = false;
   const map = (pp: PiecePath) => (pp.id === piecePathId ? ((touched = true), { ...pp, ...upd } as PiecePath) : pp);
   const pieces = p.pieces.map((piece) => ({ ...piece, mainPaths: piece.mainPaths.map(map), internalPaths: piece.internalPaths.map(map) }));
+  return touched ? { ...p, pieces, hasChanged: true } : p;
+}
+
+// ---- piece points (piece-local construction points) -----------------------------------------------
+
+export function piecePointAdd(p: Pattern, pieceId: string, x: number, y: number, name: string | undefined, uid: Uid): Pattern {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return p;
+  const piece = p.pieces.find((pc) => pc.id === pieceId);
+  if (!piece) return p;
+  if (piece.type !== 'dynamic') return p; // "Only dynamic pieces support piece points"
+  const pts = piece.piecePoints ?? [];
+  const pointName = name && name.trim() ? name.trim() : `PP${pts.length + 1}`;
+  if (pts.some((pt) => pt.name === pointName)) return p; // "Piece point already exists"
+  const point: PiecePoint = { id: uid('PiecePoint'), name: pointName, x, y };
+  const pieces = p.pieces.map((pc) => (pc.id === pieceId ? { ...pc, piecePoints: [...pts, point] } : pc));
+  return { ...p, pieces, hasChanged: true };
+}
+
+export function piecePointUpdate(p: Pattern, piecePointId: string, patch: { name?: string; x?: number; y?: number }): Pattern {
+  let touched = false;
+  const pieces = p.pieces.map((pc) => {
+    if (!pc.piecePoints?.some((pt) => pt.id === piecePointId)) return pc;
+    touched = true;
+    return {
+      ...pc,
+      piecePoints: pc.piecePoints.map((pt) => (pt.id !== piecePointId ? pt : {
+        ...pt,
+        ...(typeof patch.name === 'string' && patch.name.trim() ? { name: patch.name.trim() } : {}),
+        ...(Number.isFinite(patch.x) ? { x: patch.x as number } : {}),
+        ...(Number.isFinite(patch.y) ? { y: patch.y as number } : {})
+      }))
+    };
+  });
+  return touched ? { ...p, pieces, hasChanged: true } : p;
+}
+
+export function piecePointDelete(p: Pattern, piecePointId: string): Pattern {
+  let touched = false;
+  const pieces = p.pieces.map((pc) => {
+    if (!pc.piecePoints?.some((pt) => pt.id === piecePointId)) return pc;
+    touched = true;
+    return { ...pc, piecePoints: pc.piecePoints.filter((pt) => pt.id !== piecePointId) };
+  });
   return touched ? { ...p, pieces, hasChanged: true } : p;
 }
 
@@ -243,22 +304,33 @@ const allPiecePathIds = (p: Pattern): Set<string> => {
   return s;
 };
 
-export function seamCreate(p: Pattern, fromIds: string[], toIds: string[], name: string | undefined, uid: Uid): Pattern {
-  if (!Array.isArray(fromIds) || !Array.isArray(toIds) || fromIds.length === 0 || toIds.length === 0) return p;
+/** Seam side entries accept plain piece-path ids or full refs with mirrored/reversed flags
+ *  (the original's seam.create payload entries are {piecePathId, mirrored, reversed}). */
+export type SeamRefInput = string | { id: string; mirrored?: boolean; reversed?: boolean };
+
+export function seamCreate(p: Pattern, from: SeamRefInput[], to: SeamRefInput[], name: string | undefined, uid: Uid): Pattern {
+  if (!Array.isArray(from) || !Array.isArray(to) || from.length === 0 || to.length === 0) return p;
   const known = allPiecePathIds(p);
-  if (![...fromIds, ...toIds].every((id) => typeof id === 'string' && known.has(id))) return p;
-  const ref = (id: string): SeamRef => ({ id, mirrored: false, reversed: false });
-  const seam: Seam = { id: uid('Seam'), name: name ?? '', fromPaths: fromIds.map(ref), toPaths: toIds.map(ref) };
+  const norm = (r: SeamRefInput): SeamRef | null => {
+    const id = typeof r === 'string' ? r : r?.id;
+    if (typeof id !== 'string' || !known.has(id)) return null;
+    return { id, mirrored: typeof r === 'object' && !!r.mirrored, reversed: typeof r === 'object' && !!r.reversed };
+  };
+  const fromRefs = from.map(norm), toRefs = to.map(norm);
+  if (fromRefs.some((r) => !r) || toRefs.some((r) => !r)) return p;
+  const seam: Seam = { id: uid('Seam'), name: name ?? '', fromPaths: fromRefs as SeamRef[], toPaths: toRefs as SeamRef[] };
   return { ...p, seams: [...p.seams, seam], hasChanged: true };
 }
 
-export function seamReverse(p: Pattern, seamId: string, side: 'from' | 'to', index: number): Pattern {
+/** Toggle seam-side orientation. Omitting `index` flips every ref of the side (the original
+ *  seam.reverse semantics — its Reverse source/target buttons act on the whole side). */
+export function seamReverse(p: Pattern, seamId: string, side: 'from' | 'to', index?: number): Pattern {
   const seam = p.seams.find((s) => s.id === seamId);
   if (!seam) return p;
   const key = side === 'to' ? 'toPaths' : 'fromPaths';
   const list = seam[key];
-  if (!list[index]) return p;
-  const next = list.map((r, i) => (i === index ? { ...r, reversed: !r.reversed } : r));
+  if (index !== undefined && !list[index]) return p;
+  const next = list.map((r, i) => (index === undefined || i === index ? { ...r, reversed: !r.reversed } : r));
   return { ...p, seams: p.seams.map((s) => (s.id === seamId ? { ...s, [key]: next } : s)), hasChanged: true };
 }
 
@@ -273,30 +345,63 @@ function withPiecePath(p: Pattern, piecePathId: string, fn: (pp: PiecePath) => P
   return touched ? { ...p, pieces, hasChanged: true } : p;
 }
 
-export function notchAdd(p: Pattern, piecePathId: string, position: number, type: string | undefined, size: number | undefined, uid: Uid): Pattern {
-  if (!Number.isFinite(position)) return p;
+export function notchAdd(
+  p: Pattern,
+  piecePathId: string,
+  position: number,
+  type: string | undefined,
+  size: number | undefined,
+  uid: Uid,
+  anchor?: { referencePointId?: string; distance?: number }
+): Pattern {
+  if (!Number.isFinite(position) && !(anchor?.referencePointId && Number.isFinite(anchor.distance))) return p;
   const notch: Notch = {
     id: uid('Notch'),
-    position: Math.max(0, Math.min(1, position)),
+    position: Number.isFinite(position) ? Math.max(0, Math.min(1, position)) : 0.5,
     type: NOTCH_TYPES.includes(type as NotchType) ? (type as NotchType) : undefined,
     size: Number.isFinite(size) ? size : undefined
   };
-  return withPiecePath(p, piecePathId, (pp) => ({ ...pp, notches: [...(pp.notches ?? []), notch] }));
+  return withPiecePath(p, piecePathId, (pp) => {
+    // "Reference point must belong to the main path": anchored placement only to this edge's ends
+    if (anchor?.referencePointId && (anchor.referencePointId === pp.from || anchor.referencePointId === pp.to)) {
+      notch.referencePointId = anchor.referencePointId;
+      notch.distance = Number.isFinite(anchor.distance) ? anchor.distance : 0;
+    }
+    return { ...pp, notches: [...(pp.notches ?? []), notch] };
+  });
 }
 
-export function notchUpdate(p: Pattern, notchId: string, patch: { position?: number; type?: string; size?: number }): Pattern {
+export function notchUpdate(
+  p: Pattern,
+  notchId: string,
+  patch: { position?: number; type?: string; size?: number; referencePointId?: string | null; distance?: number }
+): Pattern {
   let touched = false;
   const map = (pp: PiecePath): PiecePath => {
     if (!pp.notches?.some((n) => n.id === notchId)) return pp;
     touched = true;
     return {
       ...pp,
-      notches: pp.notches.map((n) => (n.id !== notchId ? n : {
-        ...n,
-        ...(Number.isFinite(patch.position) ? { position: Math.max(0, Math.min(1, patch.position!)) } : {}),
-        ...(NOTCH_TYPES.includes(patch.type as NotchType) ? { type: patch.type as NotchType } : {}),
-        ...(Number.isFinite(patch.size) ? { size: patch.size } : {})
-      }))
+      notches: pp.notches.map((n) => {
+        if (n.id !== notchId) return n;
+        const next: Notch = {
+          ...n,
+          ...(Number.isFinite(patch.position) ? { position: Math.max(0, Math.min(1, patch.position!)) } : {}),
+          ...(NOTCH_TYPES.includes(patch.type as NotchType) ? { type: patch.type as NotchType } : {}),
+          ...(Number.isFinite(patch.size) ? { size: patch.size } : {}),
+          ...(Number.isFinite(patch.distance) ? { distance: patch.distance } : {})
+        };
+        if (patch.referencePointId === null) {
+          // release the anchor -> back to parametric position
+          delete next.referencePointId;
+          delete next.distance;
+        } else if (typeof patch.referencePointId === 'string' &&
+                   (patch.referencePointId === pp.from || patch.referencePointId === pp.to)) {
+          next.referencePointId = patch.referencePointId;
+          if (next.distance === undefined) next.distance = 0;
+        }
+        return next;
+      })
     };
   };
   const pieces = p.pieces.map((piece) => ({ ...piece, mainPaths: piece.mainPaths.map(map), internalPaths: piece.internalPaths.map(map) }));

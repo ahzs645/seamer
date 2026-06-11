@@ -10,18 +10,30 @@ export interface ArcAnchor { pos: Vec2; v1: Vec2; v2: Vec2 }
  * a1 < a0 sweeps clockwise). One anchor every ≤90°, with standard 4/3·tan(Δ/4) tangent handles.
  */
 export function arcAnchors(c: Vec2, r: number, a0: number, a1: number): ArcAnchor[] {
+  return ellipseAnchors(c, r, r, 0, a0, a1);
+}
+
+/**
+ * Bézier anchors for a (rotated) ELLIPTICAL arc: parametric point c + R(rot)·(rx·cos t, ry·sin t)
+ * from t = a0 to a1. Handles follow the parametric derivative scaled by 4/3·tan(Δ/4) — the standard
+ * cubic approximation, exact for circles and excellent for ≤90° elliptical segments.
+ */
+export function ellipseAnchors(c: Vec2, rx: number, ry: number, rotation: number, a0: number, a1: number): ArcAnchor[] {
   const span = a1 - a0;
   const nSeg = Math.max(1, Math.ceil(Math.abs(span) / (Math.PI / 2)));
   const dA = span / nSeg;
-  const k = (4 / 3) * Math.tan(dA / 4) * r;
+  const k = (4 / 3) * Math.tan(dA / 4);
+  const cosR = Math.cos(rotation), sinR = Math.sin(rotation);
+  const rot = (x: number, y: number): Vec2 => ({ x: x * cosR - y * sinR, y: x * sinR + y * cosR });
   const out: ArcAnchor[] = [];
   for (let i = 0; i <= nSeg; i++) {
     const t = a0 + dA * i;
-    const tx = -Math.sin(t), ty = Math.cos(t);
+    const p = rot(rx * Math.cos(t), ry * Math.sin(t));
+    const d = rot(-rx * Math.sin(t), ry * Math.cos(t));
     out.push({
-      pos: { x: c.x + r * Math.cos(t), y: c.y + r * Math.sin(t) },
-      v1: { x: -tx * k, y: -ty * k },
-      v2: { x: tx * k, y: ty * k }
+      pos: { x: c.x + p.x, y: c.y + p.y },
+      v1: { x: -d.x * k, y: -d.y * k },
+      v2: { x: d.x * k, y: d.y * k }
     });
   }
   return out;

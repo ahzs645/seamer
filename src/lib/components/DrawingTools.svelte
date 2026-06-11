@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { selectedTool } from '$lib/stores/pattern';
+  import { get } from 'svelte/store';
+  import { selectedTool, selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
 
   // Right-hand drawing toolbar matching the original 2D editor. Some entries are
   // GROUPS that reveal sub-tools in a flyout (Arc/circle, Seam) — like the source.
@@ -30,6 +31,7 @@
     { id: 'point', label: 'New point', hotkey: 'N', icon: 'radio_button_checked' },
     { id: 'piece', label: 'Create pattern piece', hotkey: 'T', icon: 'extension', gap: true },
     { id: 'internal', label: 'Add internal path (dart / fold) to the selected piece', hotkey: 'D', icon: 'conversion_path' },
+    { id: 'piece-point', label: 'Add piece point (construction point on a dynamic piece)', icon: 'adjust' },
     { group: 'Seam tools', svg: SEAM_MULTI, gap: true, sub: [
       { id: 'seam-single', label: 'Create single seam', hotkey: 'S', svg: SEAM_SINGLE },
       { id: 'seam-multi', label: 'Create multi seam', hotkey: 'Shift+S', svg: SEAM_MULTI }
@@ -45,10 +47,15 @@
   function handleKeydown(ev: KeyboardEvent) {
     if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLTextAreaElement) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
-    const all: Item[] = [];
-    for (const e of entries) { if (e.id) all.push(e as Item); if (e.sub) all.push(...e.sub); }
     // Shift+S (multi seam) before plain S
     if (ev.shiftKey && ev.key.toLowerCase() === 's') { ev.preventDefault(); selectedTool.set('seam-multi'); return; }
+    // Other shifted keys belong to app-level bindings (Shift+V variables, Shift+M mirror-Y).
+    if (ev.shiftKey) return;
+    // M doubles as "mirror selection" (studio page handler) — an active selection wins over the tool.
+    if (ev.key.toLowerCase() === 'm' &&
+        (get(selectedPointIds).size || get(selectedPathIds).size || get(selectedPieceIds).size)) return;
+    const all: Item[] = [];
+    for (const e of entries) { if (e.id) all.push(e as Item); if (e.sub) all.push(...e.sub); }
     const t = all.find((x) => x.hotkey && !x.hotkey.includes('+') && x.hotkey.toLowerCase() === ev.key.toLowerCase());
     if (t) { ev.preventDefault(); selectedTool.set(t.id); }
   }

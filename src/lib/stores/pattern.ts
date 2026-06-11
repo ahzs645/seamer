@@ -3,6 +3,7 @@ import { browser } from '$app/environment';
 import type { Pattern, Piece, ConstrainablePoint } from '$lib/types/pattern';
 import { EMPTY_PATTERN } from '$lib/types/pattern';
 import { saveHistory, loadHistory, deleteHistory } from '$lib/stores/localDB';
+import { EMPTY_SEAM_TOOL, type SeamToolState } from '$lib/utils/seamTool';
 
 export const pattern = writable<Pattern>(structuredClone(EMPTY_PATTERN));
 
@@ -32,6 +33,18 @@ export type PendingPaste =
   | { kind: 'pieces'; items: Piece[] }
   | { kind: 'points'; items: ConstrainablePoint[] };
 export const pendingPaste = writable<PendingPaste | null>(null);
+
+/** One-shot request to open a PropertyPanel pattern section (e.g. Shift+V → 'sizes' for variables).
+ *  The panel consumes it and resets the store to null. */
+export const panelRequest = writable<{ section: string } | null>(null);
+
+/** The seam highlighted across views (SeamPanel/ObjectBrowser row → 2D emphasis + direction arrows,
+ *  3D display even when "Show seams" is off — the original's shouldDisplaySeams behavior). */
+export const selectedSeamId = writable<string | null>(null);
+
+/** In-progress seam tool selection, shared by the 2D canvas and the 3D viewport (both can pick
+ *  edges for the same seam, like the original's 2D/3D seam tools). */
+export const seamTool = writable<SeamToolState>(EMPTY_SEAM_TOOL);
 
 /** Writable store mirrored to localStorage (browser only) — shared persistence helper. */
 export function persisted<T>(key: string, initial: T) {

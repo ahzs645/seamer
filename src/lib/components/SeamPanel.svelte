@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { Pattern, Seam } from '$lib/types/pattern';
   import { indexPiecePathOwners, seamLabel } from '$lib/utils/patternGeometry';
+  import { seamReverse } from '$lib/commands/create';
+  import { selectedSeamId } from '$lib/stores/pattern';
 
   interface Props {
     currentPattern: Pattern;
@@ -13,7 +15,8 @@
   let fromMirror = $state(false);
   let toMirror = $state(false);
 
-  // Flattened list of every piece edge (PiecePath) with a readable label.
+  // Flattened list of every piece edge (PiecePath) with a readable label — internal paths
+  // included (the original supports sewing an edge to an internal line, e.g. pockets/yokes).
   interface EdgeOption { id: string; label: string }
   const edges = $derived.by<EdgeOption[]>(() => {
     const out: EdgeOption[] = [];
@@ -21,6 +24,9 @@
     for (const piece of currentPattern.pieces) {
       for (const pp of piece.mainPaths) {
         out.push({ id: pp.id, label: `${piece.name} · ${pp.name || pathName(pp.path)}` });
+      }
+      for (const pp of piece.internalPaths) {
+        out.push({ id: pp.id, label: `${piece.name} · ${pp.name || pathName(pp.path)} (internal)` });
       }
     }
     return out;
@@ -48,29 +54,44 @@
   }
 
   function removeSeam(id: string) {
+    if ($selectedSeamId === id) selectedSeamId.set(null);
     onchange({ ...currentPattern, seams: currentPattern.seams.filter((s) => s.id !== id), hasChanged: true });
   }
 
-  // Reverse a seam: swap which side is "from" and which is "to" (mirrors the original seam.reverse).
-  function reverseSeam(id: string) {
-    const seams = currentPattern.seams.map((s) => (s.id === id ? { ...s, fromPaths: s.toPaths, toPaths: s.fromPaths } : s));
-    onchange({ ...currentPattern, seams, hasChanged: true });
+  // Reverse one SIDE's sewing direction (the original's "Reverse source/target direction" — flips
+  // the reversed flag on every ref of that side, which changes how the sim pairs the particles).
+  function reverseSide(id: string, side: 'from' | 'to') {
+    onchange(seamReverse(currentPattern, id, side));
+  }
+
+  function selectSeam(id: string) {
+    selectedSeamId.set($selectedSeamId === id ? null : id);
   }
 </script>
 
 <div class="text-xs">
   <h3 class="font-bold mb-2">Seams</h3>
 
-  <div class="space-y-1 mb-2 max-h-44 overflow-y-auto">
+  <div class="space-y-1 mb-2 max-h-56 overflow-y-auto">
     {#each currentPattern.seams as seam (seam.id)}
-      <div class="flex items-center gap-1 p-1 rounded bg-base-200">
-        <span class="flex-1 truncate text-[11px]" title={seamLabel(currentPattern, seam, owners)}>
+      {@const isSel = $selectedSeamId === seam.id}
+      <div class="p-1 rounded bg-base-200" class:ring-1={isSel} class:ring-primary={isSel}>
+        <button class="w-full text-left truncate text-[11px]" title={seamLabel(currentPattern, seam, owners)} onclick={() => selectSeam(seam.id)}>
           {seamLabel(currentPattern, seam, owners)}
-        </span>
-        <button class="btn btn-xs btn-ghost px-0.5" title="Reverse seam direction" aria-label="Reverse seam" onclick={() => reverseSeam(seam.id)}>
-          <span class="material-symbols-rounded text-sm align-middle">swap_horiz</span>
         </button>
-        <button class="btn btn-xs btn-ghost px-0.5 text-error" onclick={() => removeSeam(seam.id)}>&times;</button>
+        {#if isSel}
+          <div class="flex flex-wrap gap-1 mt-1">
+            <button class="btn btn-xs btn-ghost flex-1" title="Reverse source direction" onclick={() => reverseSide(seam.id, 'from')}>
+              <span class="material-symbols-rounded text-sm align-middle">u_turn_left</span> Source
+            </button>
+            <button class="btn btn-xs btn-ghost flex-1" title="Reverse target direction" onclick={() => reverseSide(seam.id, 'to')}>
+              <span class="material-symbols-rounded text-sm align-middle">u_turn_right</span> Target
+            </button>
+            <button class="btn btn-xs btn-ghost text-error" title="Delete seam" onclick={() => removeSeam(seam.id)}>
+              <span class="material-symbols-rounded text-sm align-middle">delete</span>
+            </button>
+          </div>
+        {/if}
       </div>
     {/each}
     {#if currentPattern.seams.length === 0}

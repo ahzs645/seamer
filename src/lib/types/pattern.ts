@@ -101,13 +101,17 @@ export interface ConstrainablePath {
   arc?: ArcParams;
 }
 
-/** Parametric definition of a baked arc/circle path (angles in radians, CCW positive). */
+/** Parametric definition of a baked arc/circle/ellipse path (angles in radians, CCW positive).
+ *  True ellipses carry rx/ry (+ rotation); `r` remains for circles and as the legacy radius. */
 export interface ArcParams {
   kind: 'circle' | 'centerArc' | 'threePointArc';
   centerId?: string | null;
   cx: number;
   cy: number;
   r: number;
+  rx?: number; // ellipse: x radius (defaults to r)
+  ry?: number; // ellipse: y radius (defaults to r)
+  rotation?: number; // ellipse axis rotation, radians (default 0)
   a0: number;
   a1: number;
   closed: boolean;
@@ -119,17 +123,35 @@ export interface Notch {
   position?: number;
   size?: number;
   type?: NotchType; // 'double'/'tee' read as balance notches
+  // Anchored placement (the original's "Distance from point"): when set, the notch sits `distance`
+  // mm along the edge from the referenced endpoint (must be the edge's from/to point) and the
+  // parametric `position` is ignored.
+  referencePointId?: string;
+  distance?: number; // mm from the reference point along the edge
   [k: string]: unknown;
 }
 
 /**
  * How the seam-allowance corner at the *end* of a boundary edge is finished where it meets the
- * neighbouring edge (faithful to the original ro.js seam-corner editor):
+ * neighbouring edge (the original's full corner vocabulary, Seamly/Valentina lineage):
  *  - 'intersection' (default): extend both allowance offsets until they cross, capped at maxLength
  *  - 'radius': round the corner with the given radius
  *  - 'byLength': cut the corner square at a fixed distance from the seam line
+ *  - 'noJoin': no corner material — the allowance pinches back to the true corner point
+ *  - 'firstEdgeSymmetry' / 'secondEdgeSymmetry': cut along the first/second original edge
+ *    mirrored across the opposite offset edge (fold-back matching corners)
+ *  - 'firstEdgeRightAngle' / 'secondEdgeRightAngle': cut perpendicular to the first/second edge
+ *    through the true corner (square hem corners)
  */
-export type SeamCornerJoinType = 'intersection' | 'radius' | 'byLength';
+export type SeamCornerJoinType =
+  | 'intersection'
+  | 'radius'
+  | 'byLength'
+  | 'noJoin'
+  | 'firstEdgeSymmetry'
+  | 'secondEdgeSymmetry'
+  | 'firstEdgeRightAngle'
+  | 'secondEdgeRightAngle';
 
 /** A boundary edge of a piece: a span of a ConstrainablePath between two points. */
 export interface PiecePath {
@@ -193,6 +215,15 @@ export interface PieceMarker {
   y: number;
 }
 
+/** A construction point local to a dynamic piece (the original's "piece point"): drafting-space
+ *  coordinates that travel with the piece, usable as reference markers for internal drafting. */
+export interface PiecePoint {
+  id: string; // PiecePoint_xxx
+  name: string;
+  x: number; // drafting mm (transformed by the piece placement like the rest of its geometry)
+  y: number;
+}
+
 export interface Piece {
   id: string;
   name: string;
@@ -220,6 +251,7 @@ export interface Piece {
   mainPaths: PiecePath[]; // ordered boundary loop
   internalPaths: PiecePath[]; // darts / internal seams / fold lines
   markers?: PieceMarker[]; // drill holes / punch markers (piece-local mm)
+  piecePoints?: PiecePoint[]; // piece-local construction points (dynamic pieces only)
   settings3d: PieceSettings3D;
   hidden?: boolean; // object-browser visibility toggle (omitted = visible)
 }

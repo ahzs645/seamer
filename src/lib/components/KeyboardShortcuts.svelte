@@ -11,6 +11,11 @@
 				{ keys: ['Ctrl', 'S'], label: 'Save' },
 				{ keys: ['Ctrl', 'D'], label: 'Duplicate selected piece' },
 				{ keys: ['Delete'], label: 'Delete selection (cascades)' },
+				{ keys: ['Ctrl', '0'], label: 'Fit pieces to view' },
+				{ keys: ['Ctrl', '−'], label: 'Zoom out (Ctrl+= zooms in)' },
+				{ keys: ['Ctrl', 'B'], label: 'Toggle property panel' },
+				{ keys: ['Shift', 'V'], label: 'Open Sizes & Variables' },
+				{ keys: ['Ctrl', 'Shift', 'L'], label: 'Toggle layers panel' },
 				{ keys: ['?'], label: 'Toggle this help' }
 			]
 		},

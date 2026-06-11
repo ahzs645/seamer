@@ -1,7 +1,7 @@
 <script lang="ts">
   // Undo-history dropdown: the labeled edit stack (newest first) with click-to-jump. The history was
   // already labeled + persisted; this surfaces it visually (the original showed a history list).
-  import { historyLabels, redoLabel, undoLabel } from '$lib/stores/pattern';
+  import { historyLabels, redoLabel, undoLabel, resetHistory } from '$lib/stores/pattern';
 
   let { onundo, onredo }: { onundo: (steps: number) => void; onredo: () => void } = $props();
   let open = $state(false);
@@ -36,6 +36,10 @@
             {#if i === 0 && $undoLabel}<span class="badge badge-ghost badge-xs">latest</span>{/if}
           </button>
         {/each}
+        <div class="border-t border-base-200"></div>
+        <button class="w-full text-left px-3 py-1.5 hover:bg-base-200 flex items-center gap-2 text-error/80" onclick={() => { resetHistory(); open = false; }}>
+          <span class="material-symbols-rounded text-base">delete_history</span> Clear undo history
+        </button>
       {/if}
     </div>
   {/if}

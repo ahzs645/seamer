@@ -5,7 +5,10 @@
   import type { SimConfig } from '$lib/sim/config';
   import { isDarkTheme, toggleTheme, applyStoredTheme } from '$lib/utils/theme';
   import { pieceGeometrySignature, indexPoints, placedPoints } from '$lib/utils/patternGeometry';
-  import { show3dStats, simAnchors } from '$lib/stores/pattern';
+  import { show3dStats, simAnchors, selectedTool, seamTool, selectedSeamId } from '$lib/stores/pattern';
+  import { get } from 'svelte/store';
+  import { applySeamPick, type SeamPick } from '$lib/utils/seamTool';
+  import { toast } from '$lib/stores/toast';
 
   // lightweight FPS meter for the optional stats overlay (Settings → 3D stats)
   let fps = $state(0);
@@ -140,6 +143,25 @@
       // own echo so the drape watcher below doesn't rebuild what we just settled
       lastDrapeKey = drapeKey(currentPattern);
     };
+    // 3D seam tool: edge clicks on the draped garment route through the shared tool state
+    renderer.onSeamEdgePick = (pick: SeamPick) => {
+      const kind = get(selectedTool) === 'seam-multi' ? 'multi' : 'single';
+      const res = applySeamPick(kind, get(seamTool), pick);
+      if (res.commit) {
+        const seam = {
+          id: 'Seam_' + crypto.randomUUID().replace(/-/g, '').slice(0, 9),
+          name: '',
+          fromPaths: res.commit.from.map((r) => ({ ...r })),
+          toPaths: res.commit.to.map((r) => ({ ...r }))
+        };
+        onpatternupdate?.({ ...currentPattern, seams: [...currentPattern.seams, seam], hasChanged: true }, 'Add seam');
+        selectedSeamId.set(seam.id);
+        seamTool.set(res.state);
+        toast('Seam created', 'success');
+      } else {
+        seamTool.set(res.state);
+      }
+    };
     builtSigs = pieceSigs(currentPattern);
     lastKey = patternKey(currentPattern, builtSigs);
     lastDrapeKey = drapeKey(currentPattern);
@@ -191,6 +213,14 @@
 
   // "Anchor to saved drape" toggle (persisted): OFF = source-parity free-run (anchor scale 0)
   $effect(() => { renderer?.setAnchorsEnabled($simAnchors); });
+
+  // seam tool active? push the shared selection into the 3D overlay (tubes + direction cones)
+  $effect(() => {
+    const tool = $selectedTool;
+    const state = $seamTool;
+    const active = tool === 'seam' || tool === 'seam-single' || tool === 'seam-multi';
+    renderer?.setSeamToolState(active ? state : null, tool === 'seam-multi' ? 'multi' : 'single');
+  });
 
   let hoveredArrangementPoint = $state<string | null>(null);
 
