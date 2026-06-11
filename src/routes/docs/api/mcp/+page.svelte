@@ -86,7 +86,7 @@ curl -X DELETE http://localhost:5173/api/mcp-session/<id>
     <p class="mt-3">
       Command payloads use plain JSON fields (ids, names, numbers in mm/degrees). With the studio
       open, the same catalogue (with input schemas and examples) is available in the browser console
-      via <code>window.seamscape.commands()</code> — useful for building agent tool schemas.
+      via <code>window.seamer.commands()</code> — useful for building agent tool schemas.
     </p>
 
     <h2 class="text-2xl font-bold mt-6">Walkthrough</h2>

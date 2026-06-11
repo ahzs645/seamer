@@ -3,7 +3,7 @@
 // When enabled, the studio creates a server session (/api/mcp-session) and polls /sync every ~2s:
 // it pushes its current pattern snapshot (so external agents can read it) and applies any ops the
 // agent queued — full-pattern replacements through the studio's undo-aware update path, command ops
-// through the same command bus the palette / window.seamscape uses. Local-first, no auth: the
+// through the same command bus the palette / window.seamer uses. Local-first, no auth: the
 // session id is the capability. The studio page wires the host in onMount via configureMcpSession().
 
 import { writable, get } from 'svelte/store';
@@ -16,7 +16,7 @@ export interface McpSessionHost {
   getPattern: () => Pattern;
   /** Commit a full external pattern replacement (studio wires this to handlePatternUpdate). */
   applyPattern: (next: Pattern) => void;
-  /** Run a command through the studio's command bus (same surface as window.seamscape.execute). */
+  /** Run a command through the studio's command bus (same surface as window.seamer.execute). */
   executeCommand: (name: string, payload?: Record<string, unknown>) => void;
 }
 

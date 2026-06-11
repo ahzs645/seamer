@@ -184,7 +184,7 @@
 
   // Command-bus host: the unified command layer commits through the same undo-aware update path the
   // UI uses (handlePatternUpdate), reads the live selection, and is exposed to scripts/agents via
-  // window.seamscape. No login/network — every command runs in-page.
+  // window.seamer. No login/network — every command runs in-page.
   const commandHost: ExecuteHost = {
     getPattern: () => $state.snapshot(currentPattern) as Pattern,
     getSelection: () => ({
@@ -199,7 +199,7 @@
     const disposeCommandApi = installCommandApi(commandHost);
     // MCP pattern session: external agents read the snapshot we push on each /sync and queue ops —
     // full-pattern replacements land in the undo history as 'External edit', command ops run through
-    // the same command bus as the palette / window.seamscape.
+    // the same command bus as the palette / window.seamer.
     const disposeMcpSession = configureMcpSession({
       getPattern: commandHost.getPattern,
       applyPattern: (next) => handlePatternUpdate(next, 'External edit'),
@@ -483,14 +483,14 @@
       const hasSel = $selectedPointIds.size || $selectedPathIds.size || $selectedPieceIds.size;
       if (hasSel && !e.metaKey && !e.ctrlKey && !e.altKey) {
         const step = e.shiftKey ? 10 : 1;
-        const move = (dx: number, dy: number) => { e.preventDefault(); commandHost && (window.seamscape?.execute('selection.move', { dx, dy })); };
+        const move = (dx: number, dy: number) => { e.preventDefault(); commandHost && (window.seamer?.execute('selection.move', { dx, dy })); };
         if (e.key === 'ArrowLeft') move(-step, 0);
         else if (e.key === 'ArrowRight') move(step, 0);
         else if (e.key === 'ArrowUp') move(0, -step);
         else if (e.key === 'ArrowDown') move(0, step);
-        else if (e.key === '[') { e.preventDefault(); window.seamscape?.execute('selection.rotate', { degrees: -15 }); }
-        else if (e.key === ']') { e.preventDefault(); window.seamscape?.execute('selection.rotate', { degrees: 15 }); }
-        else if (e.key === 'm' || e.key === 'M') { e.preventDefault(); window.seamscape?.execute('selection.mirror', { axis: e.shiftKey ? 'y' : 'x' }); }
+        else if (e.key === '[') { e.preventDefault(); window.seamer?.execute('selection.rotate', { degrees: -15 }); }
+        else if (e.key === ']') { e.preventDefault(); window.seamer?.execute('selection.rotate', { degrees: 15 }); }
+        else if (e.key === 'm' || e.key === 'M') { e.preventDefault(); window.seamer?.execute('selection.mirror', { axis: e.shiftKey ? 'y' : 'x' }); }
       }
     }
     if (e.key === 'Delete' || e.key === 'Backspace') {

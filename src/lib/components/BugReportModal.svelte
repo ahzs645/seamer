@@ -5,7 +5,7 @@
   import type { Pattern } from '$lib/types/pattern';
   import { toastSuccess } from '$lib/stores/toast';
 
-  let { currentPattern, onclose, contactEmail = 'support@seamscape.com' }:
+  let { currentPattern, onclose, contactEmail = 'support@seamer.app' }:
     { currentPattern: Pattern; onclose: () => void; contactEmail?: string } = $props();
 
   let kind = $state<'bug' | 'feature'>('bug');

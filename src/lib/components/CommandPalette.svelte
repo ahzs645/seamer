@@ -1,6 +1,6 @@
 <script lang="ts">
   // Command palette — the human face of the unified command bus (Ctrl/Cmd+K). Lists every
-  // registered command (the same surface exposed to automation via window.seamscape), lets you
+  // registered command (the same surface exposed to automation via window.seamer), lets you
   // filter, fill parameters, and run. Selection-based commands act on the current editor selection.
   import { COMMAND_LIST } from '$lib/commands/registry';
   import { executeCommand, type ExecuteHost } from '$lib/commands/execute';
@@ -107,7 +107,7 @@
       {/if}
     </div>
     <div class="px-3 py-1.5 text-[11px] text-base-content/50 border-t border-base-300">
-      {COMMAND_LIST.length} commands · also available to scripts via <span class="font-mono">window.seamscape</span>
+      {COMMAND_LIST.length} commands · also available to scripts via <span class="font-mono">window.seamer</span>
     </div>
   </div>
 </div>

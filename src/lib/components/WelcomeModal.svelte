@@ -3,12 +3,18 @@
 
 	// Lightweight first-visit welcome (a one-time intro, not a full element-targeted tour).
 	// Persists a "seen" flag in localStorage so it only appears once.
-	const STORAGE_KEY = 'seamscape.welcomeSeen';
+	const STORAGE_KEY = 'seamer.welcomeSeen';
+	const LEGACY_KEY = 'seamscape.welcomeSeen'; // pre-rebrand key — migrated on first load
 	let { open = $bindable(false), onshowshortcuts = () => {}, onstarttour = () => {} }:
 		{ open?: boolean; onshowshortcuts?: () => void; onstarttour?: () => void } = $props();
 
 	onMount(() => {
 		try {
+			const legacy = localStorage.getItem(LEGACY_KEY);
+			if (legacy && !localStorage.getItem(STORAGE_KEY)) {
+				localStorage.setItem(STORAGE_KEY, legacy);
+				localStorage.removeItem(LEGACY_KEY);
+			}
 			if (!localStorage.getItem(STORAGE_KEY)) open = true;
 		} catch { /* storage unavailable — just don't auto-open */ }
 	});

@@ -55,7 +55,7 @@ curl -X POST http://localhost:5173/api/mcp-session/<id>/ops \\
       <li><code>GET /api/mcp-session/&lt;id&gt;</code> — session status + the latest pattern snapshot from the studio</li>
       <li><code>POST /api/mcp-session/&lt;id&gt;/ops</code> — queue operations: <code>{'{ kind: "pattern", pattern }'}</code> replaces
         the whole pattern; <code>{'{ kind: "command", name, payload }'}</code> runs a studio command
-        (the same registry as <code>window.seamscape.commands()</code>)</li>
+        (the same registry as <code>window.seamer.commands()</code>)</li>
       <li><code>DELETE /api/mcp-session/&lt;id&gt;</code> — end the session</li>
     </ul>
     <p>For example, read the open pattern and nudge the current selection 10&nbsp;mm right:</p>

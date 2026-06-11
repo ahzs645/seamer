@@ -3,7 +3,7 @@
 // executeCommand() runs a registered command against a supplied pattern and commits the result
 // through an `apply(next, label)` callback (the studio wires this to its undo-aware update path, so
 // the command bus never bypasses history or duplicates editor state). installCommandApi() exposes a
-// stable `window.seamscape` surface so external scripts / agents can drive the editor locally — no
+// stable `window.seamer` surface so external scripts / agents can drive the editor locally — no
 // login, no network: the whole command registry runs in-page.
 
 import type { Pattern } from '$lib/types/pattern';
@@ -50,7 +50,7 @@ export function commandSchema() {
 
 declare global {
   interface Window {
-    seamscape?: {
+    seamer?: {
       commands: () => ReturnType<typeof commandSchema>;
       execute: (type: string, params?: Record<string, unknown>) => CommandResult;
       getPattern: () => Pattern;
@@ -59,16 +59,16 @@ declare global {
   }
 }
 
-/** Install the `window.seamscape` automation API. Returns a disposer. Safe to call only in browser. */
+/** Install the `window.seamer` automation API. Returns a disposer. Safe to call only in browser. */
 export function installCommandApi(host: ExecuteHost): () => void {
   if (typeof window === 'undefined') return () => {};
-  window.seamscape = {
+  window.seamer = {
     commands: commandSchema,
     execute: (type, params) => executeCommand(host, type, params),
     getPattern: host.getPattern,
     getSelection: host.getSelection
   };
   return () => {
-    if (window.seamscape) delete window.seamscape;
+    if (window.seamer) delete window.seamer;
   };
 }

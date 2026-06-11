@@ -5,7 +5,7 @@ import { test, expect, type Page } from '@playwright/test';
 
 // Pre-dismiss the one-time welcome modal so its overlay never intercepts dropdown clicks.
 test.beforeEach(async ({ page }) => {
-	await page.addInitScript(() => localStorage.setItem('seamscape.welcomeSeen', '1'));
+	await page.addInitScript(() => localStorage.setItem('seamer.welcomeSeen', '1'));
 });
 
 async function openStudio(page: Page) {
