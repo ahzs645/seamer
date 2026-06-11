@@ -45,11 +45,11 @@ export interface PrepareInit {
 
 
 /** GPU-free: triangulate + arrange every dynamic piece, assemble sim data + body collision grid.
- *  `fromArrangement` forces the source's literal pipeline: ignore the cached drape blob, triangulate
- *  the piece fresh and seed from its cylinder arrangement, so the solver drapes it live (no anchor).
- *  `changedPieces` lists pieces whose 2D shape was just edited: those re-triangulate from the live
- *  mainPaths (so the edit shows) and reuse the cached drape only where the new mesh still overlaps it,
- *  while every unedited piece keeps building from its frozen savedPositions blob. */
+ *  Topology always comes from the live pattern (so explicit seams attach via edgeParticles) and a
+ *  cached drape only seeds particle positions, like the source. `fromArrangement` forces the
+ *  source's literal first-drape pipeline: ignore the cached drape and seed from the cylinder
+ *  arrangement, so the solver drapes live. `changedPieces` is kept for API compatibility (edits
+ *  now flow through the same reuse path as unedited pieces). */
 export function prepareCloth(
   init: PrepareInit,
   opts: { fromArrangement?: boolean; changedPieces?: Set<string> } = {}
@@ -58,35 +58,33 @@ export function prepareCloth(
   const arranged: ArrangedPiece[] = [];
   for (const piece of pattern.pieces) {
     if (piece.type !== 'dynamic' || piece.settings3d.enable3d === false) continue;
-    const edited = opts.changedPieces?.has(piece.id) ?? false;
 
-    // If a settled drape was cached, build the mesh DIRECTLY from those particles (their 2D for
-    // topology + UV, their 3D as the drape) — reproduces the original render with no mapping error.
-    // BUT if this piece's 2D shape was just edited, skip the frozen blob and re-triangulate from the
-    // live mainPaths below, so the new shape actually shows in 3D.
-    const savedCloth = (opts.fromArrangement || edited) ? null : buildSavedCloth(piece);
-    if (savedCloth) {
-      // also compute the flat-on-body placement for the same particles (used by "Arrange")
-      const arranged3d = arrangeParticles(savedCloth.cloth.mesh.points, piece.settings3d.arrangement, cylinders.get(piece.settings3d.arrangement.cylinderName) ?? null, {
-        flipNormals: piece.settings3d.flipNormals
-      });
-      arranged.push({ cloth: savedCloth.cloth, positions3d: savedCloth.positions3d, frozen: piece.settings3d.frozen, fromSaved: true, boundaryLocal: savedCloth.boundaryParticles, arranged3d });
+    // Production pipeline: topology ALWAYS comes from the live pattern (buildPieceCloth, whose
+    // per-PiecePath edgeParticles let explicit seams attach), and a cached drape only seeds particle
+    // POSITIONS via the source's 3-way reuse below. Building topology from the saved blob instead
+    // (buildSavedCloth) leaves edgeParticles empty — seams can't link such pieces, and a free-running
+    // garment falls apart (it only held together via the anchor hold + proximity sewing).
+    const cloth = buildPieceCloth(pattern, piece);
+    if (!cloth || cloth.mesh.points.length < 3) {
+      // Fallback for degenerate 2D path data: rebuild from the saved blob (no edgeParticles —
+      // the proximity-sewing pass covers these).
+      const savedCloth = opts.fromArrangement ? null : buildSavedCloth(piece);
+      if (savedCloth) {
+        const arranged3d = arrangeParticles(savedCloth.cloth.mesh.points, piece.settings3d.arrangement, cylinders.get(piece.settings3d.arrangement.cylinderName) ?? null, {
+          flipNormals: piece.settings3d.flipNormals
+        });
+        arranged.push({ cloth: savedCloth.cloth, positions3d: savedCloth.positions3d, frozen: piece.settings3d.frozen, fromSaved: true, boundaryLocal: savedCloth.boundaryParticles, arranged3d });
+      }
       continue;
     }
-
-    // Triangulate the piece boundary from its live mainPaths and arrange it on its body cylinder.
-    const cloth = buildPieceCloth(pattern, piece);
-    if (!cloth || cloth.mesh.points.length < 3) continue;
     const arranged3d = arrangeParticles(cloth.mesh.points, piece.settings3d.arrangement, cylinders.get(piece.settings3d.arrangement.cylinderName) ?? null, {
       flipNormals: piece.settings3d.flipNormals
     });
 
-    // An edited piece that previously had a drape: reuse that drape via the source's 3-way seed —
-    // exact-reuse where the shape is unchanged, KNN-from-drape for added area (so it follows the drape,
-    // not flat-on-body), and a null return (handled below) when too much of the shape is new. The
-    // reconstructed drape is coherent, so gently anchor (fromSaved) to hold it; boundaryLocal lets it
-    // proximity-sew onto neighbouring saved-drape pieces (which carry no explicit edgeParticles).
-    const reuse = edited ? reuseSavedDrape(cloth.mesh.points, piece.settings3d.savedPositions, cloth.particleDistanceMm) : null;
+    // A piece with a cached drape: reuse it via the source's 3-way seed — exact-reuse where the
+    // shape is unchanged, KNN-from-drape for added area (so it follows the drape, not flat-on-body),
+    // and a null return (handled below) when too much of the shape is new.
+    const reuse = opts.fromArrangement ? null : reuseSavedDrape(cloth.mesh.points, piece.settings3d.savedPositions, cloth.particleDistanceMm);
     if (reuse) {
       arranged.push({
         cloth,
@@ -104,7 +102,12 @@ export function prepareCloth(
     arranged.push({ cloth, positions3d: arranged3d, frozen: piece.settings3d.frozen, fromSaved: false });
   }
   if (arranged.length === 0) return null;
-  const simData = buildSimData(pattern, arranged);
+  // Saved-drape cloths carry no edgeParticles (boundary.ts builds them with an empty map), so
+  // explicit seam links can't attach to them — proximity sewing is what keeps those garments
+  // connected. Enable it exactly in that case; fresh arrangements keep explicit-seams-only
+  // (source parity).
+  const proximitySeams = arranged.some((a) => a.cloth.edgeParticles.size === 0);
+  const simData = buildSimData(pattern, arranged, { proximitySeams });
   const body = packBodyMesh(init.avatarVertices, init.avatarIndices);
   return { simData, body };
 }

@@ -448,6 +448,10 @@
   }
 
   function handlePieceSelect(id: string | null) {
+    // no-op when the selection is already exactly this piece: writing fresh Sets always
+    // notifies subscribers, which can re-trigger the 3D highlight effect in a cycle
+    const cur = get(selectedPieceIds);
+    if ((id ? cur.size === 1 && cur.has(id) : cur.size === 0) && get(selectedPointIds).size === 0 && get(selectedPathIds).size === 0) return;
     selectedPieceIds.set(id ? new Set([id]) : new Set());
     selectedPointIds.set(new Set());
     selectedPathIds.set(new Set());

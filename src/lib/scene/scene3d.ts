@@ -93,10 +93,11 @@ export class PatternRenderer {
   // even had the LOWEST over-stretch (1.58 vs 0.25's 1.69). So we relax to 0.08 — ~3x more give /
   // closer to the source's free feel, while staying comfortably on the held side of the cliff.
   private static readonly LIVE_ANCHOR = 0.08;
-  private liveAnchorScale = PatternRenderer.LIVE_ANCHOR; // restored after an interactive grab
-  // "Anchor to saved drape" toggle: ON (default) = the gentle LIVE_ANCHOR hold above; OFF =
-  // source-parity free-run (anchor scale 0, the solver settles unaided like the original).
-  private anchorsEnabled = true;
+  private liveAnchorScale = 0; // restored after an interactive grab
+  // "Anchor to saved drape" toggle: OFF (default) = source-parity free-run — the garment hangs by
+  // its seams/stretch alone like the original, so a drag pulls the whole connected garment; ON =
+  // the gentle LIVE_ANCHOR hold above for extra cached-drape stability.
+  private anchorsEnabled = false;
 
   /** The live hold strength honouring the "Anchor to saved drape" toggle. */
   private holdAnchor(): number {
@@ -169,7 +170,9 @@ export class PatternRenderer {
     }
     if (this.mode === 'arrange') {
       const idx = this.arrangeEntries.findIndex((e) => e.pieceId === id);
-      this.selectArrange(idx);
+      // applying an EXTERNAL selection: don't echo onSelectPiece back out, or the
+      // 2D-store -> effect -> setHighlightedPiece -> onSelectPiece cycle never terminates
+      this.selectArrange(idx, false);
     } else {
       for (const e of this.arrangeEntries) {
         const m = e.mesh.material as THREE.MeshPhysicalMaterial;
@@ -364,15 +367,18 @@ export class PatternRenderer {
       if (!hit || !face) return; // not on cloth -> let OrbitControls orbit
       const entry = this.clothMeshes.find((e) => e.mesh === hit.object);
       if (!entry) return;
-      // selecting/highlighting the picked piece so the 2D editor stays in sync
-      this.setHighlightedPiece(entry.pieceId);
-      this.onSelectPiece(entry.pieceId);
+      // selecting/highlighting the picked piece so the 2D editor stays in sync — but only while
+      // IDLE: with the sim running the source grabs without selecting (no highlight mid-sim)
+      if (!this.userSimulating) {
+        this.setHighlightedPiece(entry.pieceId);
+        this.onSelectPiece(entry.pieceId);
+      }
 
-      if (!ev.shiftKey) {
-        // DEFAULT: clicking a piece enters in-place "Move pieces" mode and selects it, showing the
-        // transform gizmo — i.e. arrange/drag, NOT a simulation. Works even while a sim is playing
-        // (enterManipulateMode stops it first), so a click never unexpectedly grabs/pulls the fabric.
-        // Matches the source: click a piece → move handles. (Hold Shift to grab-and-pull instead.)
+      if (!ev.shiftKey && !this.userSimulating) {
+        // Clicking a piece while IDLE enters in-place "Move pieces" mode and selects it, showing the
+        // transform gizmo — i.e. arrange/drag, NOT a simulation.
+        // While the simulation is RUNNING, a plain drag falls through to the grab below instead —
+        // matching the source, where dragging live fabric pulls it (no modifier needed).
         this.enterManipulateMode();
         const idx = this.arrangeEntries.findIndex((e) => e.pieceId === entry.pieceId);
         if (idx >= 0) this.selectArrange(idx);
@@ -429,12 +435,20 @@ export class PatternRenderer {
   private async beginGrab(point: THREE.Vector3) {
     const sim = await this.ensureSim();
     if (!sim || !this.grabbing) return;
-    // Free the WHOLE garment during a drag so it moves as one connected piece (panels held together
-    // by their seams) and follows the cursor — not pinned, so seams don't pull open. Self-collision
-    // off during the drag: it's what curls a free garment, and the trousers don't self-intersect in
-    // normal dragging; seams + near-damping keep it coherent.
-    sim.setAnchorScale(0);
-    sim.setSelfCollision(false);
+    if (this.userSimulating) {
+      // LIVE sim drag (source behavior): just grab — the integrate shader already releases the
+      // anchor hold within the grab influence, so the fabric near the cursor follows while the
+      // rest of the garment keeps simulating with self-collision on.
+      sim.setSelfCollision(true);
+    } else {
+      // Idle drag (repo repositioning gesture): free the WHOLE garment so it moves as one
+      // connected piece (panels held together by their seams) and follows the cursor — not
+      // pinned, so seams don't pull open. Self-collision off during the drag: it's what curls a
+      // free garment, and the trousers don't self-intersect in normal dragging; seams +
+      // near-damping keep it coherent.
+      sim.setAnchorScale(0);
+      sim.setSelfCollision(false);
+    }
     sim.setGrab(true, this.grabIndex, [point.x, point.y, point.z]);
     if (!this.simulating) {
       this.simulating = true;
@@ -1060,7 +1074,7 @@ export class PatternRenderer {
   }
 
   /** Select an arrange piece by index (-1 clears). Highlights it and attaches the gizmo. */
-  private selectArrange(idx: number): void {
+  private selectArrange(idx: number, emit = true): void {
     if (this.selectedArrange >= 0 && this.selectedArrange < this.arrangeEntries.length) {
       const prev = this.arrangeEntries[this.selectedArrange].mesh.material as THREE.MeshPhysicalMaterial;
       prev.emissive.setHex(0x000000);
@@ -1074,7 +1088,7 @@ export class PatternRenderer {
       this.transform?.attach(e.group);
       this.highlightId = e.pieceId;
       this.emitModeChange(e.pieceId);
-      this.onSelectPiece(e.pieceId);
+      if (emit) this.onSelectPiece(e.pieceId);
     } else {
       this.transform?.detach();
       this.emitModeChange(null);

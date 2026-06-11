@@ -21,6 +21,12 @@
       let seen: string | null = null;
       try { seen = localStorage.getItem(VERSION_KEY); } catch { /* storage unavailable */ }
       if (seen === latest) return;
+      if (!seen) {
+        // first visit: nothing is "new" yet (and the welcome modal is already up) —
+        // record the current version silently and only splash on future releases
+        try { localStorage.setItem(VERSION_KEY, latest); } catch { /* ignore */ }
+        return;
+      }
       const rn = await fetch('/api/release-notes');
       if (!rn.ok) return;
       const all: ReleaseNote[] = await rn.json();
