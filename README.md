@@ -77,10 +77,10 @@ The model assets live in `static/models/` (`base_model.json`, `female_model.json
 - **Both genders** are supported (`female_coefficients.bin` + `male_coefficients.bin` are bundled).
   The avatar must match the body the garment's `savedPositions` were settled on, or the cloth will
   clip (e.g. a male-drafted pattern needs the male body).
-- **Self‑collision** is not yet implemented (the original has it behind a toggle); cloth can
-  self‑interpenetrate in deep folds. Body collision and seams are implemented.
-- The **2D constraint/formula solver** is not rebuilt — the 2D canvas renders from already‑resolved
-  point coordinates (sufficient to display and drape the shipped templates). Live 2D re‑drafting and
-  geometry creation tools are out of scope.
+- **Self‑collision** is implemented (GPU triangle‑hash with edge/face contact, behind the
+  `handleSelfCollisions` toggle, like the original), alongside body collision and seams.
+- The **2D constraint/formula solver** is rebuilt (`src/lib/solver/`): formula‑constrained points
+  re‑solve live on every edit (including mid‑drag), and the 2D canvas has the full set of geometry
+  creation tools (pen, arcs, points, pieces, seams).
 - Mirror/seam correspondence uses 3D proximity matching, which is robust but can leave a small
   asymmetry on complex multi‑instance garments.

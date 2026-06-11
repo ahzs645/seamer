@@ -306,6 +306,8 @@
   // multi-point drag: original drafting-space positions + the primary point's transform
   let dragDraftStart: Vec2 | null = null;
   let multiDrag: { id: string; x: number; y: number }[] | null = null;
+  // dragged point's drafting-space position at drag start — Shift angle snapping pivots on it
+  let dragOrigDraft: Vec2 | null = null;
   // arc/circle tools: accumulated world-space clicks
   let arcClicks = $state<Vec2[]>([]);
   // pen drag-for-curve
@@ -1732,7 +1734,11 @@
     let pid = hitTestPoint(pos.x, pos.y);
     // close the loop (create-piece) when clicking the first point again
     if ($selectedTool === 'piece' && pid && penDraft.length >= 2 && pid === penDraft[0]) { finishDraft(); return; }
-    if (!pid) { const r = withNewPoint(p, world); p = r.p; pid = r.id; }
+    if (!pid) {
+      // snap onto a nearby path (or between two) so traced points land exactly on existing geometry
+      const proj = projectPlacement(world, draftPathId);
+      const r = withNewPoint(p, proj?.pos ?? world); p = r.p; pid = r.id;
+    }
     const draft = [...penDraft, pid];
     penDraft = draft;
     if ($selectedTool === 'pen' || $selectedTool === 'internal') {
@@ -2078,6 +2084,47 @@
     let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2;
     t = Math.max(0, Math.min(1, t));
     return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+  }
+
+  /** Closest projection of a drafting-space position onto any path within `tol` (the original's
+   *  closeToPath + getClosestProjectedPoint). `exclude` skips paths (e.g. the point's own). */
+  function nearestPathProjection(world: Vec2, tol: number, exclude?: (path: import('$lib/types/pattern').ConstrainablePath) => boolean):
+    { pathId: string; fraction: number; pos: Vec2; dist: number } | null {
+    const points = indexPoints(currentPattern);
+    let best: { pathId: string; fraction: number; pos: Vec2; dist: number } | null = null;
+    let bestD = tol;
+    for (const path of currentPattern.paths) {
+      if (exclude?.(path)) continue;
+      const poly = pathPolyline(path, points, 4);
+      const cum = [0];
+      for (let i = 1; i < poly.length; i++) cum.push(cum[i - 1] + Math.hypot(poly[i].x - poly[i - 1].x, poly[i].y - poly[i - 1].y));
+      const total = cum[cum.length - 1] || 1;
+      for (let i = 1; i < poly.length; i++) {
+        const d = distToSeg(world, poly[i - 1], poly[i]);
+        if (d < bestD) {
+          bestD = d;
+          const f = projOnSeg(world, poly[i - 1], poly[i]);
+          best = {
+            pathId: path.id,
+            fraction: (cum[i - 1] + (cum[i] - cum[i - 1]) * f) / total,
+            pos: { x: poly[i - 1].x + (poly[i].x - poly[i - 1].x) * f, y: poly[i - 1].y + (poly[i].y - poly[i - 1].y) * f },
+            dist: d
+          };
+        }
+      }
+    }
+    return best;
+  }
+
+  /** Where a new point should land near existing geometry (the original's getPickedPoint): on the
+   *  closest path, or midway between two overlapping paths (then it belongs to neither — no slide). */
+  function projectPlacement(world: Vec2, excludePathId?: string | null): { pos: Vec2; slide: { pathId: string; fraction: number } | null } | null {
+    const tol = 6 / baseScale();
+    const a = nearestPathProjection(world, tol, (path) => path.id === excludePathId);
+    if (!a) return null;
+    const b = nearestPathProjection(world, tol, (path) => path.id === excludePathId || path.id === a.pathId);
+    if (b) return { pos: { x: (a.pos.x + b.pos.x) / 2, y: (a.pos.y + b.pos.y) / 2 }, slide: null };
+    return { pos: a.pos, slide: { pathId: a.pathId, fraction: Math.round(a.fraction * 1000) / 1000 } };
   }
 
   /** Resolve a click into a seam pick: edge id + orientation inferred from the click position
@@ -2687,9 +2734,10 @@
   // alignment-guide matches from the last snapDraft (drawn as dashed guide lines while dragging)
   let guideMatch: { xPointId: string | null; yPointId: string | null } = { xPointId: null, yPointId: null };
 
-  function snapDraft(d: Vec2, excludeId?: string): Vec2 {
+  function snapDraft(d: Vec2, excludeId?: string, bypass = false): Vec2 {
     let x = d.x, y = d.y;
     guideMatch = { xPointId: null, yPointId: null };
+    if (bypass) return { x, y }; // Alt/Ctrl/Cmd held: raw position (the original's modifier bypass)
     if (currentPattern.snapToGrid) {
       x = Math.round(x / GRID_MM) * GRID_MM;
       y = Math.round(y / GRID_MM) * GRID_MM;
@@ -2703,6 +2751,32 @@
       }
     }
     return { x, y };
+  }
+
+  /** Shift snapping for point drags (the original's getSnappedAngle): snap the drag direction to
+   *  90° steps — absolute, or relative to the direction of a straight path through the point —
+   *  when the cursor's angle falls in the same 10° bucket. Returns the snapped draft position. */
+  function snapAngleDraft(cur: Vec2, origin: Vec2, pointId: string): Vec2 | null {
+    const len = Math.hypot(cur.x - origin.x, cur.y - origin.y);
+    if (len < 1e-6) return null;
+    const h = (Math.atan2(cur.y - origin.y, cur.x - origin.x) * 180) / Math.PI;
+    const u = 10; // tolerance bucket (degrees)
+    const at = (deg: number): Vec2 => ({ x: origin.x + Math.cos((deg * Math.PI) / 180) * len, y: origin.y + Math.sin((deg * Math.PI) / 180) * len });
+    const f = 90 * Math.round(h / 90);
+    if (Math.round(f / u) === Math.round(h / u)) return at(f);
+    // relative to the first connected straight path's direction
+    for (const pa of currentPattern.paths) {
+      if (pa.pathType !== 'line') continue;
+      const idx = pa.pathPoints.findIndex((pp) => pp.id === pointId);
+      if (idx < 0) continue;
+      const adjId = pa.pathPoints[idx + 1]?.id ?? pa.pathPoints[idx - 1]?.id;
+      const adj = adjId ? currentPattern.points.find((q) => q.id === adjId) : undefined;
+      if (!adj) continue;
+      const s = (Math.atan2(adj.y - origin.y, adj.x - origin.x) * 180) / Math.PI;
+      const g = 90 * Math.round((h - s) / 90) + s;
+      return Math.round(g / u) === Math.round(h / u) ? at(g) : null;
+    }
+    return null;
   }
 
   /** Dashed alignment guide lines through the snapped-to points (the original's guideLines). */
@@ -2763,7 +2837,20 @@
     const tool = $selectedTool;
     if (tool === 'pan' || e.button === 1 || e.metaKey || e.ctrlKey || e.altKey) { isPanning = true; return; }
     if (tool === 'measure') { measureClick(pos); return; }
-    if (tool === 'point') { const r = withNewPoint($state.snapshot(currentPattern) as Pattern, toPattern(pos.x, pos.y)); onchange({ ...r.p, hasChanged: true }); return; }
+    if (tool === 'point') {
+      // place on a nearby path (or midway between two), like the original's getPickedPoint;
+      // a point landing on a single path becomes a sliding point so it follows the path
+      const world = toPattern(pos.x, pos.y);
+      const proj = projectPlacement(world);
+      const r = withNewPoint($state.snapshot(currentPattern) as Pattern, proj?.pos ?? world);
+      if (proj?.slide) {
+        const slide = proj.slide;
+        r.p = { ...r.p, points: r.p.points.map((q) => (q.id === r.id ? { ...q, constraint: { type: 'sliding' as const, path: slide.pathId, fraction: slide.fraction } } : q)) };
+        toast('Point placed on the path — it slides along it', 'success');
+      }
+      onchange({ ...r.p, hasChanged: true });
+      return;
+    }
     if (tool === 'pen' || tool === 'piece' || tool === 'internal') {
       penOrPieceClick(pos);
       // arm drag-for-curve on the just-placed point (pen + internal draw lines/curves)
@@ -2811,6 +2898,8 @@
       dragInvert = hit.invert;
       dragStartWorld = { ...hit.world };
       dragDraftStart = hit.invert(toPattern(pos.x, pos.y));
+      const origPt = currentPattern.points.find((q) => q.id === hit.pointId);
+      dragOrigDraft = origPt ? { x: origPt.x, y: origPt.y } : null;
       const sel = $selectedPointIds;
       multiDrag = sel.size > 1
         ? currentPattern.points.filter((p) => sel.has(p.id)).map((p) => ({ id: p.id, x: p.x, y: p.y }))
@@ -2902,7 +2991,11 @@
     if (isDragging && dragPointId) {
       // map the cursor (world) back into the dragged point's drafting space
       const world = toPattern(pos.x, pos.y);
-      const draft = snapDraft(dragInvert ? dragInvert(world) : world, dragPointId);
+      const raw = dragInvert ? dragInvert(world) : world;
+      // Shift constrains the drag direction (single-point drags); Alt/Ctrl/Cmd bypasses guide+grid snapping
+      const angled = e.shiftKey && !multiDrag && dragOrigDraft ? snapAngleDraft(raw, dragOrigDraft, dragPointId) : null;
+      if (angled) guideMatch = { xPointId: null, yPointId: null };
+      const draft = angled ?? snapDraft(raw, dragPointId, e.altKey || e.ctrlKey || e.metaKey);
       if (multiDrag && dragDraftStart) {
         // move the whole selected set by the same drafting-space delta
         const dx = draft.x - dragDraftStart.x, dy = draft.y - dragDraftStart.y;
@@ -2937,30 +3030,13 @@
       const isCorner = currentPattern.pieces.some((pc) =>
         [...pc.mainPaths, ...pc.internalPaths].some((pp) => pp.from === dragPointId || pp.to === dragPointId));
       if (dropped && !dropped.constraint && !isCorner) {
-        const points = indexPoints(currentPattern);
         const world = toPattern(cursorPos.x, cursorPos.y);
-        const tol = 6 / baseScale();
-        let best: { pathId: string; fraction: number } | null = null;
-        let bestD = tol;
-        for (const path of currentPattern.paths) {
-          if (path.pathPoints.some((pp) => pp.id === dragPointId)) continue; // its own path
-          const poly = pathPolyline(path, points, 4);
-          const cum = [0];
-          for (let i = 1; i < poly.length; i++) cum.push(cum[i - 1] + Math.hypot(poly[i].x - poly[i - 1].x, poly[i].y - poly[i - 1].y));
-          const total = cum[cum.length - 1] || 1;
-          for (let i = 1; i < poly.length; i++) {
-            const d = distToSeg(world, poly[i - 1], poly[i]);
-            if (d < bestD) {
-              bestD = d;
-              const f = projOnSeg(world, poly[i - 1], poly[i]);
-              best = { pathId: path.id, fraction: (cum[i - 1] + (cum[i] - cum[i - 1]) * f) / total };
-            }
-          }
-        }
+        const best = nearestPathProjection(world, 6 / baseScale(),
+          (path) => path.pathPoints.some((pp) => pp.id === dragPointId)); // skip its own path
         if (best) {
           const p = $state.snapshot(currentPattern) as Pattern;
           const pts = p.points.map((q) => (q.id === dragPointId
-            ? { ...q, constraint: { type: 'sliding' as const, path: best!.pathId, fraction: Math.round(best!.fraction * 1000) / 1000 } }
+            ? { ...q, constraint: { type: 'sliding' as const, path: best.pathId, fraction: Math.round(best.fraction * 1000) / 1000 } }
             : q));
           onchange({ ...p, points: pts, hasChanged: true }, 'Add sliding point');
           toast('Converted to a sliding point — it now follows the path', 'success');
@@ -2988,6 +3064,7 @@
     dragInvert = null;
     dragStartWorld = null;
     dragDraftStart = null;
+    dragOrigDraft = null;
     multiDrag = null;
     penDragging = false;
     penDragPointId = null;
