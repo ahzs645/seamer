@@ -58,9 +58,25 @@
 
   let rebuildTimer: ReturnType<typeof setTimeout> | undefined;
   let lastKey = '';
+  // Signature of the cached drapes (savedPositions) at the last accepted state. Watched separately
+  // from the geometry key so EXTERNAL drape changes (version restore, undo, MCP pattern push) refresh
+  // the 3D view — while the view's own drape-settle write is accepted without a rebuild (no loop).
+  let lastDrapeKey = '';
   // Per-piece resolved-geometry signature at the last ACTUAL rebuild. Diffing the live pattern against
   // this tells us which pieces' shapes were edited, so only those re-triangulate from live geometry.
   let builtSigs = new Map<string, string>();
+
+  /** Cheap signature of every piece's savedPositions: length + strided checksum (arrays are large). */
+  function drapeKey(p: Pattern): string {
+    const parts: (string | number)[] = [];
+    for (const pc of p.pieces) {
+      const sp = pc.settings3d.savedPositions;
+      let sum = 0;
+      for (let i = 0; i < sp.length; i += 7) sum += sp[i];
+      parts.push(pc.id, sp.length, Math.round(sum * 1e3));
+    }
+    return parts.join(',');
+  }
 
   function pieceSigs(p: Pattern): Map<string, string> {
     const m = new Map<string, string>();
@@ -78,7 +94,18 @@
       body: p.body,
       pieces: p.pieces.map((pc) => ({ id: pc.id, g: sigs.get(pc.id), a: pc.settings3d.arrangement, f: pc.settings3d.frozen, h: pc.hidden, fn: pc.settings3d.flipNormals, cl: pc.settings3d.collisionLayer, fc: pc.settings3d.filterExternalCollisionsByClothNormal })),
       seams: p.seams.length,
-      mats: p.materials.map((m) => ({ id: m.id, c: m.frontTexture?.color, sw: m.stretchWarpValue, wf: m.stretchWeftValue, b: m.bendValue, w: m.weight }))
+      // texture-map urls can be multi-MB data URLs — sign with length + tail instead of the full string
+      mats: p.materials.map((m) => {
+        const slotSig = (t: typeof m.frontTexture) => t && {
+          c: t.color, s: t.scale, u: t.url.length, ut: t.url.slice(-24),
+          n: t.normalUrl.length, ns: t.normalMapScale, o: t.opacityUrl.length, os: t.opacityMapScale
+        };
+        return {
+          id: m.id, ft: slotSig(m.frontTexture), bt: m.useSeparateBackSide ? slotSig(m.backTexture) : null, sb: m.useSeparateBackSide,
+          sw: m.stretchWarpValue, wf: m.stretchWeftValue, b: m.bendValue, w: m.weight, th: m.thickness,
+          r: m.roughness, mt: m.metalness, sp: m.specularIntensity, op: m.opacity, nsc: m.normalScale, ac: m.alphaCutoff
+        };
+      })
     });
   }
 
@@ -90,9 +117,15 @@
     renderer.onStatus = (s, msg) => { status = s; statusMessage = msg ?? ''; };
     renderer.onModeChange = (m, piece, kind) => { sceneMode = m; selectedPiece = piece; arrangeKind = kind ?? null; };
     renderer.onSelectPiece = (id) => { onpieceselect?.(id); };
-    renderer.onDrapeSettled = (savedByPiece) => { ondrapesettled?.(savedByPiece); };
+    renderer.onDrapeSettled = (savedByPiece) => {
+      ondrapesettled?.(savedByPiece);
+      // the parent has now written savedPositions back into the pattern (synchronously); accept our
+      // own echo so the drape watcher below doesn't rebuild what we just settled
+      lastDrapeKey = drapeKey(currentPattern);
+    };
     builtSigs = pieceSigs(currentPattern);
     lastKey = patternKey(currentPattern, builtSigs);
+    lastDrapeKey = drapeKey(currentPattern);
     lightingMode = currentPattern.settings3d.lightingMode || 'flat';
     renderer.setPattern(currentPattern).then(() => {
       poses = renderer?.poseNames() ?? [];
@@ -110,8 +143,10 @@
 
   $effect(() => {
     const key = patternKey(currentPattern);
-    if (key === lastKey || !renderer) return;
+    const dKey = drapeKey(currentPattern);
+    if ((key === lastKey && dKey === lastDrapeKey) || !renderer) return;
     lastKey = key;
+    lastDrapeKey = dKey;
     clearTimeout(rebuildTimer);
     const snapshot = currentPattern;
     rebuildTimer = setTimeout(() => {
