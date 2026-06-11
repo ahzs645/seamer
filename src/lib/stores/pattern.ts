@@ -1,6 +1,6 @@
 import { writable, derived } from 'svelte/store';
 import { browser } from '$app/environment';
-import type { Pattern, Piece, ConstrainablePoint } from '$lib/types/pattern';
+import type { Pattern, Piece, ConstrainablePoint, ConstrainablePath } from '$lib/types/pattern';
 import { EMPTY_PATTERN } from '$lib/types/pattern';
 import { saveHistory, loadHistory, deleteHistory } from '$lib/stores/localDB';
 import { EMPTY_SEAM_TOOL, type SeamToolState } from '$lib/utils/seamTool';
@@ -28,10 +28,13 @@ export const snapToGrid = writable<boolean>(false);
 export const cursorMm = writable<{ x: number; y: number } | null>(null);
 
 /** Clipboard payload awaiting click-placement on the 2D canvas (the source's PasteTool flow). A
- *  Ctrl+V arms this; the canvas ghosts the content under the cursor and commits on click. */
+ *  Ctrl+V arms this; the canvas ghosts the content under the cursor and commits on click.
+ *  Paths paste with their points: plain paste REUSES existing anchor points where they still
+ *  exist (a referencing copy); `asCopy` (Ctrl+Shift+V, "Paste as copy") duplicates everything. */
 export type PendingPaste =
   | { kind: 'pieces'; items: Piece[] }
-  | { kind: 'points'; items: ConstrainablePoint[] };
+  | { kind: 'points'; items: ConstrainablePoint[] }
+  | { kind: 'paths'; items: { path: ConstrainablePath; points: ConstrainablePoint[] }[]; asCopy?: boolean };
 export const pendingPaste = writable<PendingPaste | null>(null);
 
 /** One-shot request to open a PropertyPanel pattern section (e.g. Shift+V → 'sizes' for variables).
@@ -45,6 +48,13 @@ export const selectedSeamId = writable<string | null>(null);
 /** In-progress seam tool selection, shared by the 2D canvas and the 3D viewport (both can pick
  *  edges for the same seam, like the original's 2D/3D seam tools). */
 export const seamTool = writable<SeamToolState>(EMPTY_SEAM_TOOL);
+
+/** One-shot request to fly the 3D camera to a body measurement (BodyPanel → PatternScene3D). */
+export const bodyZoomRequest = writable<string | null>(null);
+
+/** Modal "click a path on the canvas" request (the original's SelectPathTool): the 2D canvas
+ *  resolves the next path click into onPick and clears the request; Esc cancels. */
+export const pathPickRequest = writable<{ label: string; onPick: (pathId: string) => void } | null>(null);
 
 /** Writable store mirrored to localStorage (browser only) — shared persistence helper. */
 export function persisted<T>(key: string, initial: T) {
@@ -156,8 +166,25 @@ export async function clearPersistedHistory(patternId: string): Promise<void> {
 /**
  * Record the pre-edit pattern under a command label. `label` describes the action that is about
  * to change the pattern (e.g. "Add seam"), so undoing back past this entry is shown as that name.
+ *
+ * Gesture coalescing (the original's dragTransaction): a rapid stream of pushes with the SAME
+ * label (a drag emits one per mousemove) keeps only the first — one undo entry per gesture,
+ * holding the pre-gesture pattern.
  */
+const COALESCE_MS = 800;
+let lastPushLabel = '';
+let lastPushAt = 0;
+
 export function pushUndo(p: Pattern, label = 'Edit') {
+  const now = Date.now();
+  const coalesce = label === lastPushLabel && now - lastPushAt < COALESCE_MS && undoStack.length > 0;
+  lastPushLabel = label;
+  lastPushAt = now;
+  if (coalesce) {
+    // same gesture continuing: the existing entry already holds the pre-gesture pattern
+    if (redoStack.length) { redoStack = []; refresh(); }
+    return;
+  }
   undoStack.push({ pattern: p, label });
   redoStack = [];
   if (undoStack.length > HISTORY_LIMIT) undoStack.shift();

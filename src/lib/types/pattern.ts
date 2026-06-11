@@ -128,6 +128,7 @@ export interface Notch {
   // parametric `position` is ignored.
   referencePointId?: string;
   distance?: number; // mm from the reference point along the edge
+  distanceFormula?: PropertyFormula; // formula-driven distance (the original's notchLengthFormula)
   [k: string]: unknown;
 }
 
@@ -153,6 +154,13 @@ export type SeamCornerJoinType =
   | 'firstEdgeRightAngle'
   | 'secondEdgeRightAngle';
 
+/** A formula-driven numeric property (the original's *Formula fields): empty formula = inactive,
+ *  the plain numeric field applies. Lengths evaluate in `unit` (default mm); angles in degrees. */
+export interface PropertyFormula {
+  formula: string;
+  unit?: 'mm' | 'cm' | 'inch' | 'degrees' | 'none' | string;
+}
+
 /** A boundary edge of a piece: a span of a ConstrainablePath between two points. */
 export interface PiecePath {
   id: string; // PiecePath_xxx — distinct id used by seams
@@ -165,6 +173,8 @@ export interface PiecePath {
   notches: Notch[];
   // internal paths only: dart/fold dihedral angle in degrees (0 = flat seam line, no fold)
   foldAngle?: number;
+  // internal paths only: bake this style line into the 3D fabric texture (default true)
+  showIn3d?: boolean;
   // per-edge seam-allowance width override in mm (undefined => use the piece/pattern allowance)
   seamAllowance?: number;
   // seam-allowance corner finishing (all optional; undefined => 'intersection' with no cap):
@@ -172,6 +182,11 @@ export interface PiecePath {
   cornerRadius?: number; // mm — used when join type is 'radius'
   seamCornerMaxLength?: number; // mm — cap for the 'intersection' miter
   seamCornerLength?: number; // mm — fixed corner length for 'byLength'
+  // formula-driven twins (evaluated on every redraft; empty formula = the number above applies):
+  seamAllowanceFormula?: PropertyFormula;
+  cornerRadiusFormula?: PropertyFormula;
+  seamCornerLengthFormula?: PropertyFormula;
+  seamCornerMaxLengthFormula?: PropertyFormula;
   // Whether the seam allowance wraps/covers the corner at the edge's start/end point. Default true
   // (covered = the allowance extends to meet the neighbour). When false, the allowance is cut back
   // flush at that endpoint (a clean square end). Faithful to the source's per-edge "Cover seam
@@ -235,6 +250,11 @@ export interface Piece {
   position: { x: number; y: number }; // piece placement on the 2D canvas (mm)
   rotation: number; // degrees
   grainVector: NamedVector; // fabric grain direction (default {x:0,y:1})
+  // formula-driven twins (evaluated on every redraft): rotation/grain in degrees; condition
+  // evaluating to 0 hides the piece (the original's conditionFormula)
+  rotationFormula?: PropertyFormula;
+  grainFormula?: PropertyFormula;
+  conditionFormula?: PropertyFormula;
   text: string | null;
   rightPieces: number;
   leftPieces: number;
@@ -280,6 +300,9 @@ export interface Material {
   stretchWeftValue: number;
   bendValue: number;
   thickness: number; // mm
+  // 3D-only visual shell thickness (mm): >0 extrudes front/back faces apart and closes the edge
+  // with a darkened side strip (the original's visualizationThickness). 0/undefined = single sheet.
+  visualizationThickness?: number;
   weight: number; // g/m²
   // shrinkage compensation: fabric shrinks by this % after washing/pressing, so pieces cut from
   // it are scaled UP by this amount (about the piece origin) when the piece opts in via
@@ -364,6 +387,10 @@ export interface PatternSettings3D {
   forceLowEndHardware: boolean;
   handleSelfCollisions: boolean;
   debugFocusPoint: boolean;
+  // mesh density override for EVERY piece (mm between particles; 0/undefined = per-piece settings)
+  globalParticleDistanceOverride?: number;
+  // debug: pin the topmost particles of each piece in place while simulating
+  fixTop?: boolean;
   /**
    * Experimental: also drape a mirrored 3D instance of each piece cut as a left/right pair
    * (`leftPieces > 0`). Off by default — when off the 3D drape is unchanged (one instance per piece).
@@ -418,6 +445,17 @@ export interface GradingProfile {
   mainDriverVariableId?: string | null; // default driver for new tracks / anchor capture
   categoryVariableIds?: string[]; // enum variables used as grading axes
   previewAlterationTrackId?: string | null; // transient: when set, only this track applies (UI preview)
+  // persistent imported RUL grade-rule table (serializable; the original's GradingProfile)
+  rulTable?: {
+    name: string;
+    isNumeric: boolean;
+    units: string;
+    sizes: string[];
+    sampleSize: string;
+    rules: Record<string, { dx: number; dy: number }[]>;
+  } | null;
+  // per-point grade-rule bindings (the original's grade anchors): point follows its rule per size
+  rulAnchors?: { pointId: string; ruleNumber: number }[];
 }
 
 export interface PatternImage {
@@ -491,6 +529,8 @@ export interface Pattern {
   snapToGrid: boolean;
   snapToGuides: boolean;
   showPieceNames: boolean;
+  // Show fabric texture fills on the 2D pieces (default on). The original's show2dTextures.
+  show2dTextures?: boolean;
   // Show the saved Measure-tool annotations on the 2D canvas (default on).
   showMeasurements?: boolean;
   // Show construction geometry (points/paths not used by any piece). When false the 2D canvas hides
@@ -499,6 +539,8 @@ export interface Pattern {
   viewMode: '2d' | '3d' | 'both';
   interactionMode: 'fast' | 'accurate' | string;
   settings3d: PatternSettings3D;
+  // small JPEG data URL of the 2D layout, refreshed on save, shown on the pattern list
+  thumbnailUrl?: string | null;
   hasChanged: boolean;
 }
 

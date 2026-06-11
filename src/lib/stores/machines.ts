@@ -18,6 +18,10 @@ export interface CuttingMachine {
   marginMm: number;
   /** cutting speed hint (cm/s) — emitted as an HPGL VS command when set */
   speed?: number;
+  /** pull slit notches this far inward along the edge (mm) so the knife doesn't nick the corner */
+  slitNotchOffsetMm?: number;
+  /** raster export resolution for camera/projection workflows (px per mm) */
+  finalPixelsPerMm?: number;
   notes?: string;
 }
 

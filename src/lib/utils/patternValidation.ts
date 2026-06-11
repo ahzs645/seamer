@@ -3,6 +3,8 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import { indexPoints, indexPaths, pieceOutline } from '$lib/utils/patternGeometry';
+import { resolveVariables } from '$lib/solver/solve';
+import { evalExpr } from '$lib/solver/formula';
 
 export interface Issue {
   severity: 'error' | 'warning';
@@ -70,5 +72,57 @@ export function validatePattern(pattern: Pattern): Issue[] {
     }
   }
 
+  issues.push(...diagnoseConstraints(pattern));
+  return issues;
+}
+
+/**
+ * Categorized constraint diagnostics (the original's "Constraint issue" reporting: point-formula,
+ * length-formula, angle-formula, sliding-path/position, missing-driver…). Each issue names the
+ * offending point and the category so unsatisfiable constructions are findable.
+ */
+export function diagnoseConstraints(pattern: Pattern): Issue[] {
+  const issues: Issue[] = [];
+  if (!pattern.points.some((p) => p.constraint)) return issues;
+  const scope = resolveVariables(pattern);
+  const pointIds = new Set(pattern.points.map((p) => p.id));
+  const pathIds = new Set(pattern.paths.map((p) => p.id));
+  const bad = (category: string, pointName: string, detail: string, targetId: string) =>
+    issues.push({ severity: 'error', message: `Constraint issue (${category}) on "${pointName}": ${detail}`, targetId });
+  const checkFormula = (category: string, pointName: string, expr: string | undefined, targetId: string) => {
+    if (expr?.trim() && evalExpr(expr, scope) === null) bad(category, pointName, `formula "${expr}" does not evaluate`, targetId);
+  };
+  const checkDriver = (pointName: string, id: string | undefined, targetId: string) => {
+    if (id && !pointIds.has(id)) bad('missing-driver', pointName, 'references a deleted point', targetId);
+  };
+  for (const p of pattern.points) {
+    const c = p.constraint;
+    if (!c) continue;
+    const nm = p.name || p.id;
+    if (c.type === 'offset') {
+      checkDriver(nm, c.from, p.id);
+      checkFormula('point-formula', nm, c.dxFormula, p.id);
+      checkFormula('point-formula', nm, c.dyFormula, p.id);
+    } else if (c.type === 'lengthAngle') {
+      checkDriver(nm, c.from, p.id);
+      checkFormula('length-formula', nm, c.lengthFormula, p.id);
+      checkFormula('angle-formula', nm, c.angleFormula, p.id);
+    } else if (c.type === 'sliding') {
+      if (!pathIds.has(c.path)) bad('sliding-path', nm, 'slides on a deleted path', p.id);
+      checkDriver(nm, c.from, p.id);
+      checkFormula('sliding-position', nm, c.positionFormula, p.id);
+      if (c.fraction !== undefined && (c.fraction < 0 || c.fraction > 1)) {
+        issues.push({ severity: 'warning', message: `Constraint issue (sliding-order) on "${nm}": fraction ${c.fraction} is outside 0..1`, targetId: p.id });
+      }
+    } else if (c.type === 'mirror') {
+      checkDriver(nm, c.source, p.id);
+      if (!pathIds.has(c.axisPath)) bad('sliding-path', nm, 'mirrors across a deleted path', p.id);
+    } else if (c.type === 'intersection') {
+      checkDriver(nm, c.a, p.id);
+      checkDriver(nm, c.b, p.id);
+      checkFormula('angle-formula', nm, c.aAngleFormula, p.id);
+      checkFormula('angle-formula', nm, c.bAngleFormula, p.id);
+    }
+  }
   return issues;
 }

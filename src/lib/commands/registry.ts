@@ -18,7 +18,7 @@ import { pieceAddPath } from './piece';
 import {
   pointCreate, pathCreateLine, pathCreateCurve, pathCreateEllipse, pathCreateCenterArc,
   pathCreateThreePointArc, pathUpdate, pieceCreateDynamic, pieceUpdate, pieceRotate,
-  piecePathUpdate, piecePointAdd, piecePointUpdate, piecePointDelete,
+  piecePathUpdate, piecePointAdd, piecePointUpdate, piecePointDelete, formulaSet,
   seamCreate, seamReverse, notchAdd, notchUpdate, notchDelete,
   variableCreate, variableDelete, materialUpsert, materialDelete, layerCreate, layerDelete,
   textCreate, slidingPointUpdate, type SeamRefInput
@@ -309,6 +309,13 @@ const defs: CommandDef[] = [
     summary: 'Create a dynamic pattern piece from existing draft paths (ordered boundary loop).', inputs: ['pathIds[]', 'internalPathIds[]?', 'name?'],
     example: { pathIds: ['Path_a', 'Path_b', 'Path_c'] },
     run: (p, a, c) => pieceCreateDynamic(p, strArr(a.pathIds), strArr(a.internalPathIds), a.name ? str(a.name) : undefined, c.uid)
+  },
+  {
+    type: 'formula.set', category: 'pattern', label: 'Set property formula',
+    summary: 'Attach or clear (empty formula) a formula on a property: piecePath.seamAllowance/cornerRadius/seamCornerLength/seamCornerMaxLength, piece.rotation/grain/condition (degrees; condition 0 hides), notch.distance.',
+    inputs: ['target', 'targetId', 'field', 'formula', 'unit?'],
+    example: { target: 'piecePath', targetId: 'PiecePath_x', field: 'seamAllowance', formula: 'hem * 2', unit: 'mm' },
+    run: (p, a) => formulaSet(p, str(a.target), str(a.targetId), str(a.field), str(a.formula), a.unit ? str(a.unit) : undefined)
   },
   {
     type: 'piecePoint.add', category: 'piece', label: 'Add piece point',

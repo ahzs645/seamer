@@ -6,7 +6,7 @@
   import DrawingTools from '$lib/components/DrawingTools.svelte';
   import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
   import { toast } from '$lib/stores/toast';
-  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, selectedSeamId, seamTool, cursorMm, interactionMode, frozenSnapshotOpacity, pendingPaste, type PendingPaste } from '$lib/stores/pattern';
+  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, selectedSeamId, seamTool, pathPickRequest, cursorMm, interactionMode, frozenSnapshotOpacity, pendingPaste, type PendingPaste } from '$lib/stores/pattern';
   import { EMPTY_SEAM_TOOL, applySeamPick, advanceSeamToolPhase, samePick, type SeamPick } from '$lib/utils/seamTool';
   import {
     indexPoints,
@@ -39,6 +39,7 @@
   import { traceFromHPGL, traceImageRegion } from '$lib/utils/autoTrace';
   import { pieceAddPath } from '$lib/commands/piece';
   import { piecePointAdd, piecePointUpdate } from '$lib/commands/create';
+  import { layerDashPattern, layerStrokeColor, type LayerStyle } from '$lib/commands/structural';
   import { draggablePanel } from '$lib/utils/draggablePanel';
   import { rebakeArc, arcPathsCenteredOn, detachArcsTouchingAnchor } from '$lib/utils/arcParametric';
   import { buildWarp, drawWarpedImage } from '$lib/utils/thinPlateSpline';
@@ -356,17 +357,37 @@
   const layerVisible = (layerId?: string) => layerOf(layerId)?.visible ?? true;
   const layerLocked = (layerId?: string) => layerOf(layerId)?.locked ?? false;
 
-  /** A fabric-tiled CanvasPattern (aligned to world mm) or a flat color fallback. */
-  function pieceFill(c: CanvasRenderingContext2D, material: ReturnType<typeof materialOf>): string | CanvasPattern {
+  /** A fabric-tiled CanvasPattern — anchored at the PIECE ORIGIN and rotated so the print follows
+   *  the piece's grain (the original's fillWithMaterial DOMMatrix) — or a flat color fallback. */
+  function pieceFill(
+    c: CanvasRenderingContext2D,
+    material: ReturnType<typeof materialOf>,
+    piece?: Piece,
+    points?: Map<string, import('$lib/types/pattern').ConstrainablePoint>
+  ): string | CanvasPattern {
     const tex = material?.frontTexture;
+    if (currentPattern.show2dTextures === false) return tex?.color || 'rgba(148,163,184,0.16)';
     const img = tex ? textureFor(tex.url) : null;
     if (img && tex) {
       const pat = c.createPattern(img, 'repeat');
       if (pat) {
         const mm = tex.scale && tex.scale > 0 ? tex.scale : 100;
         const f = (mm * baseScale()) / img.naturalWidth;
-        const o = toCanvas({ x: 0, y: 0 });
-        pat.setTransform(new DOMMatrix([f, 0, 0, f, o.x, o.y]));
+        if (piece && points) {
+          const tfp = pieceTransform(piece, points, pieceShrinkageScale(currentPattern, piece));
+          const op = points.get(piece.originPoint);
+          const o0 = { x: op?.x ?? 0, y: op?.y ?? 0 };
+          const oc = toCanvas(tfp(o0));
+          // world grain direction mapped through the piece transform, measured in canvas space
+          const g = piece.grainVector;
+          const gc = toCanvas(tfp({ x: o0.x + g.x, y: o0.y + g.y }));
+          const ang = (Math.atan2(gc.y - oc.y, gc.x - oc.x) * 180) / Math.PI;
+          // the image's vertical (canvas -y, angle -90°) follows the grain: rotate by ang + 90
+          pat.setTransform(new DOMMatrix().translateSelf(oc.x, oc.y).rotateSelf(ang + 90).scaleSelf(f));
+        } else {
+          const o = toCanvas({ x: 0, y: 0 });
+          pat.setTransform(new DOMMatrix([f, 0, 0, f, o.x, o.y]));
+        }
         return pat;
       }
     }
@@ -551,6 +572,7 @@
         if (penDraft.length > 0) { e.preventDefault(); finishDraft(); }
         else if ($selectedTool === 'seam-multi' && (seamFromPicks.length || seamToPicks.length)) { e.preventDefault(); advanceSeamPhase(); }
       } else if (e.key === 'Escape') {
+        if ($pathPickRequest) { e.preventDefault(); pathPickRequest.set(null); render(); return; }
         if (calibrating) { e.preventDefault(); calibrating = null; render(); return; }
         if ($pendingPaste) { e.preventDefault(); pendingPaste.set(null); render(); return; }
         if (penDraft.length || seamFromPicks.length || seamToPicks.length || measureFrom || measureChain.length || drawing) { e.preventDefault(); cancelOperation(); }
@@ -816,7 +838,7 @@
       } else {
         // unselected -> fabric-textured fill + dark boundary
         tracePoly(c, outline, true);
-        c.fillStyle = pieceFill(c, materialOf(piece.materialId));
+        c.fillStyle = pieceFill(c, materialOf(piece.materialId), piece, points);
         c.fill();
         c.strokeStyle = 'rgba(30,41,59,0.85)';
         c.lineWidth = 1.5;
@@ -1044,10 +1066,15 @@
       for (const path of currentPattern.paths) {
         if (usedPaths.has(path.id) || !layerVisible(path.layerId)) continue;
         const isSelected = $selectedPathIds.has(path.id);
-        c.strokeStyle = isSelected ? '#f97316' : '#cbd5e1';
-        c.lineWidth = isSelected ? 2.5 : 1;
+        const st = (layerOf(path.layerId)?.style ?? null) as LayerStyle | null;
+        c.save();
+        c.globalAlpha = st?.opacity ?? 1;
+        c.strokeStyle = isSelected ? '#f97316' : (layerStrokeColor(st, isDark) ?? '#cbd5e1');
+        c.lineWidth = isSelected ? 2.5 : (st?.lineWidth ?? 1);
+        c.setLineDash(isSelected ? [] : layerDashPattern(st));
         tracePoly(c, pathPolyline(path, points, 4), false);
         c.stroke();
+        c.restore();
       }
     }
 
@@ -1090,6 +1117,7 @@
     drawMeasurements(c, points);
     drawSelectionGizmo(c);
     drawPasteGhost(c);
+    drawGuideLines(c);
 
     // live drag readout (dX / dY / dL), like the source
     if (isDragging && dragStartWorld) {
@@ -1871,6 +1899,7 @@
 
   /** Bottom status-bar instruction for the active tool/operation (null = no bar). */
   const toolStatus = $derived.by(() => {
+    if ($pathPickRequest) return `${$pathPickRequest.label} · Esc to cancel`;
     if (calibrating) return calibrating.src ? 'Calibrate: click the TRUE drafting position for the marked image feature · Esc to cancel' : 'Calibrate: click a known feature on the scanned image · Esc to cancel';
     if ($pendingPaste) return `Select where you want to place the ${$pendingPaste.items.length === 1 ? 'copy' : 'copies'} · Esc to cancel`;
     switch ($selectedTool) {
@@ -1932,6 +1961,29 @@
       reader.readAsDataURL(file);
     };
     input.click();
+  }
+
+  /** Hit-test ANY ConstrainablePath: placed piece edges first (their base path), then loose
+   *  construction paths in draft space. For the modal path picker and drag-onto-path conversion. */
+  function hitTestAnyPath(pos: Vec2): string | null {
+    const edge = hitTestSeamEdge(pos);
+    if (edge) {
+      const owner = pieceOwnerOf(edge.id);
+      if (owner) return owner.pp.path;
+    }
+    const points = indexPoints(currentPattern);
+    const world = toPattern(pos.x, pos.y);
+    const tol = 10 / baseScale();
+    let best: string | null = null, bestD = tol;
+    for (const path of currentPattern.paths) {
+      if (!layerVisible(path.layerId)) continue;
+      const poly = pathPolyline(path, points, 4);
+      for (let i = 1; i < poly.length; i++) {
+        const d = distToSeg(world, poly[i - 1], poly[i]);
+        if (d < bestD) { bestD = d; best = path.id; }
+      }
+    }
+    return best;
   }
 
   // ---- Piece points (piece-local construction points, the original's AddPiecePointTool) ----------
@@ -2510,7 +2562,10 @@
 
   // ---- Paste with click placement (the source's PasteTool) ----------------------------------------
   function pasteAnchor(pp: PendingPaste): Vec2 {
-    const pts = pp.kind === 'pieces' ? pp.items.map((i) => i.position) : pp.items.map((i) => ({ x: i.x, y: i.y }));
+    const pts = pp.kind === 'pieces' ? pp.items.map((i) => i.position)
+      : pp.kind === 'paths' ? pp.items.flatMap((i) => i.points.map((q) => ({ x: q.x, y: q.y })))
+      : pp.items.map((i) => ({ x: i.x, y: i.y }));
+    if (pts.length === 0) return { x: 0, y: 0 };
     return { x: pts.reduce((s, q) => s + q.x, 0) / pts.length, y: pts.reduce((s, q) => s + q.y, 0) / pts.length };
   }
 
@@ -2532,6 +2587,28 @@
       });
       onchange({ ...p, pieces: [...p.pieces, ...clones], hasChanged: true }, 'Paste');
       selectedPieceIds.set(new Set(clones.map((c) => c.id)));
+    } else if (pp.kind === 'paths') {
+      // Plain paste REUSES surviving anchor points (a referencing copy that follows them);
+      // "Paste as copy" duplicates the points so the new path is fully independent.
+      const existing = new Set(p.points.map((q) => q.id));
+      const newPoints: typeof p.points = [];
+      const newPaths: typeof p.paths = [];
+      for (const item of pp.items) {
+        const idMap = new Map<string, string>();
+        for (const src of item.points) {
+          if (!pp.asCopy && existing.has(src.id)) { idMap.set(src.id, src.id); continue; }
+          const id = uid('ConstrainablePoint');
+          idMap.set(src.id, id);
+          newPoints.push({ ...structuredClone(src), id, name: `${src.name}'`, x: src.x + dx, y: src.y + dy, constraint: undefined });
+        }
+        const path = structuredClone(item.path);
+        path.id = uid('ConstrainablePath');
+        path.name = `Copy of ${item.path.name || 'path'}`;
+        path.pathPoints = path.pathPoints.map((q) => ({ ...q, id: idMap.get(q.id) ?? q.id }));
+        newPaths.push(path);
+      }
+      onchange({ ...p, points: [...p.points, ...newPoints], paths: [...p.paths, ...newPaths], hasChanged: true }, 'Paste');
+      selectedPathIds.set(new Set(newPaths.map((q) => q.id)));
     } else {
       const prefix = p.pointPrefix || 'A';
       let n = p.points.length;
@@ -2566,6 +2643,20 @@
         const outline = pieceWorldOutline(currentPattern, ghost, paths, points, 4);
         if (outline.length >= 2) { tracePoly(c, outline, true); c.stroke(); }
       }
+    } else if (pp.kind === 'paths') {
+      for (const item of pp.items) {
+        const byId = new Map(item.points.map((q) => [q.id, q]));
+        const poly = item.path.pathPoints
+          .map((q) => byId.get(q.id))
+          .filter((q): q is NonNullable<typeof q> => !!q)
+          .map((q) => toCanvas({ x: q.x + dx, y: q.y + dy }));
+        if (poly.length >= 2) {
+          c.beginPath();
+          c.moveTo(poly[0].x, poly[0].y);
+          for (let i = 1; i < poly.length; i++) c.lineTo(poly[i].x, poly[i].y);
+          c.stroke();
+        }
+      }
     } else {
       c.setLineDash([]);
       c.fillStyle = '#2563eb';
@@ -2593,8 +2684,12 @@
   }
 
   /** Snap a drafting-space coordinate to the grid and/or other points' guides. */
+  // alignment-guide matches from the last snapDraft (drawn as dashed guide lines while dragging)
+  let guideMatch: { xPointId: string | null; yPointId: string | null } = { xPointId: null, yPointId: null };
+
   function snapDraft(d: Vec2, excludeId?: string): Vec2 {
     let x = d.x, y = d.y;
+    guideMatch = { xPointId: null, yPointId: null };
     if (currentPattern.snapToGrid) {
       x = Math.round(x / GRID_MM) * GRID_MM;
       y = Math.round(y / GRID_MM) * GRID_MM;
@@ -2603,16 +2698,49 @@
       const tol = 8 / baseScale();
       for (const p of currentPattern.points) {
         if (p.id === excludeId) continue;
-        if (Math.abs(p.x - x) < tol) x = p.x;
-        if (Math.abs(p.y - y) < tol) y = p.y;
+        if (Math.abs(p.x - x) < tol) { x = p.x; guideMatch.xPointId = p.id; }
+        if (Math.abs(p.y - y) < tol) { y = p.y; guideMatch.yPointId = p.id; }
       }
     }
     return { x, y };
   }
 
+  /** Dashed alignment guide lines through the snapped-to points (the original's guideLines). */
+  function drawGuideLines(c: CanvasRenderingContext2D) {
+    if (!isDragging || (!guideMatch.xPointId && !guideMatch.yPointId)) return;
+    const placed = placedPoints(currentPattern);
+    const find = (id: string | null) => (id ? placed.find((pp) => pp.pointId === id) : undefined);
+    c.save();
+    c.strokeStyle = 'rgba(14,165,233,0.7)';
+    c.lineWidth = 1;
+    c.setLineDash([6, 6]);
+    const xm = find(guideMatch.xPointId);
+    if (xm) {
+      const cp = toCanvas(xm.world);
+      c.beginPath(); c.moveTo(cp.x, 0); c.lineTo(cp.x, canvasH); c.stroke();
+    }
+    const ym = find(guideMatch.yPointId);
+    if (ym) {
+      const cp = toCanvas(ym.world);
+      c.beginPath(); c.moveTo(0, cp.y); c.lineTo(canvasW, cp.y); c.stroke();
+    }
+    c.restore();
+  }
+
   function handleMouseDown(e: MouseEvent) {
     const pos = getPos(e);
     dragStartX = pos.x; dragStartY = pos.y;
+    if ($pathPickRequest && e.button === 0) {
+      // modal path picking (the original's SelectPathTool): resolve the click into the request
+      const hit = hitTestAnyPath(pos);
+      if (hit) {
+        const req = $pathPickRequest;
+        pathPickRequest.set(null);
+        req.onPick(hit);
+        render();
+      }
+      return;
+    }
     if ($pendingPaste && e.button === 0) { commitPaste(toPattern(pos.x, pos.y)); return; }
     if (calibrating && bgImage && e.button === 0) {
       const world = toPattern(pos.x, pos.y);
@@ -2801,6 +2929,44 @@
   }
 
   function handleMouseUp() {
+    // Drag-onto-path: dropping an unconstrained loose point onto a path converts it to a sliding
+    // point on that path (the original's "Maybe add sliding point"). Structural piece corners are
+    // exempt — sliding a boundary endpoint would tear the piece.
+    if (isDragging && dragPointId) {
+      const dropped = currentPattern.points.find((q) => q.id === dragPointId);
+      const isCorner = currentPattern.pieces.some((pc) =>
+        [...pc.mainPaths, ...pc.internalPaths].some((pp) => pp.from === dragPointId || pp.to === dragPointId));
+      if (dropped && !dropped.constraint && !isCorner) {
+        const points = indexPoints(currentPattern);
+        const world = toPattern(cursorPos.x, cursorPos.y);
+        const tol = 6 / baseScale();
+        let best: { pathId: string; fraction: number } | null = null;
+        let bestD = tol;
+        for (const path of currentPattern.paths) {
+          if (path.pathPoints.some((pp) => pp.id === dragPointId)) continue; // its own path
+          const poly = pathPolyline(path, points, 4);
+          const cum = [0];
+          for (let i = 1; i < poly.length; i++) cum.push(cum[i - 1] + Math.hypot(poly[i].x - poly[i - 1].x, poly[i].y - poly[i - 1].y));
+          const total = cum[cum.length - 1] || 1;
+          for (let i = 1; i < poly.length; i++) {
+            const d = distToSeg(world, poly[i - 1], poly[i]);
+            if (d < bestD) {
+              bestD = d;
+              const f = projOnSeg(world, poly[i - 1], poly[i]);
+              best = { pathId: path.id, fraction: (cum[i - 1] + (cum[i] - cum[i - 1]) * f) / total };
+            }
+          }
+        }
+        if (best) {
+          const p = $state.snapshot(currentPattern) as Pattern;
+          const pts = p.points.map((q) => (q.id === dragPointId
+            ? { ...q, constraint: { type: 'sliding' as const, path: best!.pathId, fraction: Math.round(best!.fraction * 1000) / 1000 } }
+            : q));
+          onchange({ ...p, points: pts, hasChanged: true }, 'Add sliding point');
+          toast('Converted to a sliding point — it now follows the path', 'success');
+        }
+      }
+    }
     if (isMarquee) {
       const x0 = Math.min(marqueeStart.x, marqueeCur.x), x1 = Math.max(marqueeStart.x, marqueeCur.x);
       const y0 = Math.min(marqueeStart.y, marqueeCur.y), y1 = Math.max(marqueeStart.y, marqueeCur.y);
@@ -2827,6 +2993,7 @@
     penDragPointId = null;
     isPanning = false;
     gizmoDrag = null;
+    guideMatch = { xPointId: null, yPointId: null };
     stopAutoScroll();
     render();
   }

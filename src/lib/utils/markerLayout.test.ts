@@ -53,3 +53,30 @@ describe('placeBottomLeft', () => {
     expect(usedLength).toBeGreaterThan(100);
   });
 });
+
+describe('matchLayoutToRepeat (plaid/print matching)', () => {
+  it('snaps placements onto the repeat grid without overlaps', async () => {
+    const { matchLayoutToRepeat } = await import('./markerLayout');
+    const sq = (x: number, y: number) => [
+      { x, y }, { x: x + 80, y }, { x: x + 80, y: y + 80 }, { x, y: y + 80 }
+    ];
+    const layout = {
+      fabricWidthMm: 1000, usedLengthMm: 200, gapMm: 5,
+      placements: [
+        { pieceId: 'a', name: 'A', poly: sq(13, 7), outline: sq(13, 7), bbox: { w: 80, h: 80 } },
+        { pieceId: 'b', name: 'B', poly: sq(137, 11), outline: sq(137, 11), bbox: { w: 80, h: 80 } }
+      ]
+    };
+    const m = matchLayoutToRepeat(layout, { cellWidthMm: 50, cellHeightMm: 50 }, 5);
+    for (const pl of m.placements) {
+      const minX = Math.min(...pl.poly.map((p) => p.x));
+      const minY = Math.min(...pl.poly.map((p) => p.y));
+      expect(Math.abs(minX % 50)).toBeLessThan(1e-6); // on the repeat grid
+      expect(Math.abs(minY % 50)).toBeLessThan(1e-6);
+    }
+    // the two squares must not overlap after snapping
+    const [a, b] = m.placements.map((pl) => pl.poly);
+    const ax = Math.min(...a.map((p) => p.x)), bx = Math.min(...b.map((p) => p.x));
+    expect(Math.abs(ax - bx)).toBeGreaterThanOrEqual(80 - 1e-6);
+  });
+});

@@ -13,7 +13,8 @@
   import ObjectBrowser from '$lib/components/ObjectBrowser.svelte';
   import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel, restoreHistory, pendingPaste, panelRequest } from '$lib/stores/pattern';
   import { loadPattern, savePattern as saveToDB } from '$lib/stores/localDB';
-  import { EMPTY_PATTERN, type Pattern, type Piece, type ConstrainablePoint } from '$lib/types/pattern';
+  import { EMPTY_PATTERN, type Pattern, type Piece, type ConstrainablePoint, type ConstrainablePath } from '$lib/types/pattern';
+  import type { PendingPaste } from '$lib/stores/pattern';
   import { isSimpleFormat, convertSimplePattern } from '$lib/utils/importSimplePattern';
   import { deletePoint, deletePath, deletePiece } from '$lib/utils/patternMutations';
   import Toaster from '$lib/components/Toaster.svelte';
@@ -21,7 +22,8 @@
   import GradingOverlay from '$lib/components/GradingOverlay.svelte';
   import { toast, toastSuccess, toastError } from '$lib/stores/toast';
   import { confirm } from '$lib/stores/confirm';
-  import { patternToSVG, patternToSVG2, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printMarkerTiled, patternToHPGL } from '$lib/utils/exporters';
+  import { patternToSVG, patternToSVG2, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printMarkerTiled, patternToHPGL, patternToSSP, sspToPattern } from '$lib/utils/exporters';
+  import { patternThumbnail } from '$lib/utils/thumbnail';
   import { nestPieces, markerToSVG, type CutOffType } from '$lib/utils/markerLayout';
   import { dxfToPattern, svgToPattern, type DxfImportOptions } from '$lib/utils/patternImport';
   import { parseRul, applyRulToPattern, type RulTable } from '$lib/utils/rulImport';
@@ -288,7 +290,9 @@
   }
 
   async function handleSave() {
-    currentPattern = { ...currentPattern, name: patternName };
+    // refresh the list thumbnail from the live 2D geometry (best effort — null keeps the old one)
+    const thumb = patternThumbnail($state.snapshot(currentPattern) as Pattern);
+    currentPattern = { ...currentPattern, name: patternName, thumbnailUrl: thumb ?? currentPattern.thumbnailUrl ?? null };
     await saveToDB(currentPattern); saved = true; saveCount += 1;
     // keep the pattern id in the URL so a reload reopens this pattern
     if ($page.params.slug?.split('/')[0] !== currentPattern.id) replaceState(`/studio/${currentPattern.id}`, {});
@@ -371,11 +375,12 @@
   }
 
   function handleImport() {
-    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.dxf,.svg,.cut,.val,.sm2d,.xml,.rul';
+    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.ssp,.dxf,.svg,.cut,.val,.sm2d,.xml,.rul';
     input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0]; if (!file) return;
       const ext = file.name.split('.').pop()?.toLowerCase();
       try {
+        if (ext === 'ssp') { applyImported(await sspToPattern(file)); return; } // gzip-compressed project
         const text = await file.text();
         const name = file.name.replace(/\.(dxf|svg|cut|val|sm2d|xml|json|rul|seamer\.json)$/i, '');
         if (ext === 'dxf') { dxfPending = { text, name }; return; } // import options dialog first
@@ -384,6 +389,12 @@
       } catch (err) { toastError((err as Error)?.message || 'Could not import file'); }
     };
     input.click();
+  }
+
+  async function exportSSP() {
+    const blob = await patternToSSP($state.snapshot(currentPattern) as Pattern);
+    downloadBlob(`${patternName.replace(/\s+/g, '_') || 'pattern'}.ssp`, blob);
+    toastSuccess('Exported compressed project (.ssp)');
   }
 
   function importDxfWithOptions(options: DxfImportOptions) {
@@ -486,7 +497,7 @@
     if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); handleSave(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelectedPiece(); }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); handleCopy(); }
-    if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); handlePaste(); }
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); handlePaste(e.shiftKey); } // Shift = "Paste as copy"
     if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); showCommandPalette = !showCommandPalette; }
     if ((e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); showRightPanel = !showRightPanel; }
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'l' || e.key === 'L')) {
@@ -532,7 +543,7 @@
   }
 
   const uidFor = (pre: string) => `${pre}_${crypto.randomUUID().replace(/-/g, '').slice(0, 9)}`;
-  let clipboard: { kind: 'pieces'; items: Piece[] } | { kind: 'points'; items: ConstrainablePoint[] } | null = null;
+  let clipboard: PendingPaste | null = null;
   const plural = (n: number) => `${n} item${n === 1 ? '' : 's'}`;
 
   function handleCopy() {
@@ -540,6 +551,19 @@
     if ($selectedPieceIds.size > 0) {
       const items = p.pieces.filter(pc => $selectedPieceIds.has(pc.id)).map(pc => structuredClone($state.snapshot(pc)) as Piece);
       clipboard = { kind: 'pieces', items };
+      toastSuccess(`${plural(items.length)} copied to clipboard`);
+    } else if ($selectedPathIds.size > 0) {
+      // paths copy with their anchor points (paste decides whether to reuse or duplicate them)
+      const items = p.paths
+        .filter(pa => $selectedPathIds.has(pa.id))
+        .map(pa => ({
+          path: structuredClone($state.snapshot(pa)) as ConstrainablePath,
+          points: pa.pathPoints
+            .map(pp => p.points.find(q => q.id === pp.id))
+            .filter((q): q is ConstrainablePoint => !!q)
+            .map(q => structuredClone($state.snapshot(q)) as ConstrainablePoint)
+        }));
+      clipboard = { kind: 'paths', items };
       toastSuccess(`${plural(items.length)} copied to clipboard`);
     } else if ($selectedPointIds.size > 0) {
       const items = p.points.filter(pt => $selectedPointIds.has(pt.id)).map(pt => structuredClone($state.snapshot(pt)) as ConstrainablePoint);
@@ -549,10 +573,13 @@
   }
 
   // Paste arms click-placement on the 2D canvas (the source's PasteTool): a ghost of the clipboard
-  // follows the cursor and a click commits the copies there. Esc cancels.
-  function handlePaste() {
+  // follows the cursor and a click commits the copies there. Esc cancels. `asCopy` (Ctrl+Shift+V,
+  // "Paste as copy") duplicates a path's anchor points instead of reusing them.
+  function handlePaste(asCopy = false) {
     if (!clipboard) return;
-    pendingPaste.set(structuredClone(clipboard));
+    const payload = structuredClone(clipboard);
+    if (payload.kind === 'paths') payload.asCopy = asCopy;
+    pendingPaste.set(payload);
     toast('Select where you want to place the ' + (clipboard.items.length === 1 ? 'copy' : 'copies'));
   }
 
@@ -615,6 +642,7 @@
         <div role="button" tabindex="0" class="btn btn-ghost btn-xs">Export</div>
         <ul class="dropdown-content menu bg-base-200 rounded-box z-50 w-44 p-2 shadow text-sm">
           <li><button onclick={handleExport}>JSON (.seamer.json)</button></li>
+          <li><button onclick={exportSSP}>Compressed project (.ssp)</button></li>
           <li><button onclick={() => exportAs('svg')}>SVG</button></li>
           <li><button onclick={() => exportAs('svg2')}>Export SVG 2 (Beta)</button></li>
           <li><button onclick={() => exportAs('dxf')}>DXF</button></li>

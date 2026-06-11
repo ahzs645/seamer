@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { selectedTool, zoom } from '$lib/stores/pattern';
+  import { get } from 'svelte/store';
+  import { selectedTool, zoom, selectedPointIds, selectedPathIds, selectedPieceIds } from '$lib/stores/pattern';
   import type { Pattern } from '$lib/types/pattern';
 
   interface Props {
@@ -17,11 +18,16 @@
 
   function toggleGrid() { onchange({ ...currentPattern, showGrid: !currentPattern.showGrid }); }
   function togglePieceNames() { onchange({ ...currentPattern, showPieceNames: !currentPattern.showPieceNames }); }
+  function toggleTextures() { onchange({ ...currentPattern, show2dTextures: !(currentPattern.show2dTextures ?? true) }); }
   function zoomIn() { zoom.update((v) => Math.min(20, v * 1.25)); }
   function zoomOut() { zoom.update((v) => Math.max(0.02, v * 0.8)); }
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return; // plain keys only (Cmd+V etc. are app-level)
+    // M doubles as "mirror selection" — an active selection wins over the measure tool
+    if (e.key.toLowerCase() === 'm' &&
+        (get(selectedPointIds).size || get(selectedPathIds).size || get(selectedPieceIds).size)) return;
     const tool = tools.find((t) => t.hotkey?.toLowerCase() === e.key.toLowerCase());
     if (tool) selectedTool.set(tool.id);
   }
@@ -51,6 +57,7 @@
   <div class="flex items-center gap-0.5">
     <button class="btn btn-xs" class:btn-active={currentPattern.showGrid} onclick={toggleGrid} title="Toggle grid">Grid</button>
     <button class="btn btn-xs" class:btn-active={currentPattern.showPieceNames} onclick={togglePieceNames} title="Toggle piece names">Names</button>
+    <button class="btn btn-xs" class:btn-active={currentPattern.show2dTextures ?? true} onclick={toggleTextures} title="Toggle fabric texture fills in the 2D view">Fabric</button>
   </div>
 
   <div class="divider divider-horizontal mx-1"></div>

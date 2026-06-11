@@ -6,6 +6,7 @@
     pathPolyline, type Vec2
   } from '$lib/utils/patternGeometry';
   import { hasConstraints, solveForSize } from '$lib/solver/solve';
+  import { applyRulOffsetsToPattern } from '$lib/utils/rulImport';
 
   let { currentPattern, onclose }: { currentPattern: Pattern; onclose: () => void } = $props();
 
@@ -61,12 +62,13 @@
     const sizeOverrides = (sz: { scale: number; values?: Record<string, number> }): Record<string, number> =>
       sz.values ?? Object.fromEntries(currentPattern.variables.filter((v) => v.isEditable).map((v) => [v.id, (v.value ?? 0) * sz.scale]));
 
-    // shapes for each size layer
-    const layerShapes = sizeLayers.map((sz) =>
-      solverMode
-        ? buildShapes(sz.id === 'base' ? currentPattern : solveForSize(currentPattern, sizeOverrides(sz)), 1)
-        : buildShapes(currentPattern, sz.scale)
-    );
+    // shapes for each size layer; per-point RUL grade anchors apply live on top of either mode
+    const layerShapes = sizeLayers.map((sz) => {
+      const ruled = sz.id === 'base' ? currentPattern : applyRulOffsetsToPattern(currentPattern, sz.name);
+      return solverMode
+        ? buildShapes(sz.id === 'base' ? currentPattern : applyRulOffsetsToPattern(solveForSize(currentPattern, sizeOverrides(sz)), sz.name), 1)
+        : buildShapes(ruled, sz.scale);
+    });
     const draftPolys = showDraft ? currentPattern.paths.map((p) => pathPolyline(p, indexPoints(currentPattern), 3)) : [];
 
     // fit everything to the canvas

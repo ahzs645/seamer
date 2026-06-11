@@ -4,7 +4,7 @@
 // replacing the whole JSON.
 
 import type {
-  Pattern, ConstrainablePath, PathPoint, BezierHandle, Piece, PiecePath, PiecePoint, Seam, SeamRef, Notch,
+  Pattern, ConstrainablePath, PathPoint, BezierHandle, Piece, PiecePath, PiecePoint, PropertyFormula, Seam, SeamRef, Notch,
   NotchType, Variable, Material, TextureSlot, Layer, PatternText, ArcParams, SeamCornerJoinType
 } from '$lib/types/pattern';
 import { arcAnchors, ellipseAnchors, centerArcAngles, threePointArcAngles, type ArcAnchor, type Vec2 } from '$lib/utils/arcGeometry';
@@ -237,7 +237,7 @@ export function pieceRotate(p: Pattern, pieceId: string, degrees: number): Patte
 
 const PIECEPATH_KEYS: Record<string, 'string' | 'number' | 'boolean'> = {
   name: 'string', foldAngle: 'number', seamAllowance: 'number', isMirrorLine: 'boolean',
-  reversed: 'boolean', coverSeamAllowanceStart: 'boolean', coverSeamAllowanceEnd: 'boolean',
+  reversed: 'boolean', showIn3d: 'boolean', coverSeamAllowanceStart: 'boolean', coverSeamAllowanceEnd: 'boolean',
   seamCornerJoinType: 'string', cornerRadius: 'number', seamCornerMaxLength: 'number', seamCornerLength: 'number'
 };
 export function piecePathUpdate(p: Pattern, piecePathId: string, patch: Record<string, unknown>): Pattern {
@@ -251,6 +251,66 @@ export function piecePathUpdate(p: Pattern, piecePathId: string, patch: Record<s
   const map = (pp: PiecePath) => (pp.id === piecePathId ? ((touched = true), { ...pp, ...upd } as PiecePath) : pp);
   const pieces = p.pieces.map((piece) => ({ ...piece, mainPaths: piece.mainPaths.map(map), internalPaths: piece.internalPaths.map(map) }));
   return touched ? { ...p, pieces, hasChanged: true } : p;
+}
+
+// ---- formula.set (formula-driven properties) ------------------------------------------------------
+
+const PIECEPATH_FORMULA_FIELDS = ['seamAllowance', 'cornerRadius', 'seamCornerLength', 'seamCornerMaxLength'] as const;
+const PIECE_FORMULA_FIELDS = ['rotation', 'grain', 'condition'] as const;
+
+/**
+ * Attach/clear a formula on a formula-driven property (the original's generic formula.set).
+ * Targets: piecePath (seamAllowance/cornerRadius/seamCornerLength/seamCornerMaxLength),
+ * piece (rotation/grain/condition), notch (distance). Empty formula clears.
+ */
+export function formulaSet(
+  p: Pattern,
+  target: string,
+  targetId: string,
+  field: string,
+  formula: string,
+  unit?: string
+): Pattern {
+  const value: PropertyFormula | undefined = formula.trim() ? { formula: formula.trim(), ...(unit ? { unit } : {}) } : undefined;
+  if (target === 'piecePath' && (PIECEPATH_FORMULA_FIELDS as readonly string[]).includes(field)) {
+    const key = `${field}Formula` as 'seamAllowanceFormula';
+    return withPiecePath(p, targetId, (pp) => {
+      const next = { ...pp };
+      if (value) next[key] = value; else delete next[key];
+      return next;
+    });
+  }
+  if (target === 'piece' && (PIECE_FORMULA_FIELDS as readonly string[]).includes(field)) {
+    const key = `${field}Formula` as 'rotationFormula';
+    let touched = false;
+    const pieces = p.pieces.map((pc) => {
+      if (pc.id !== targetId) return pc;
+      touched = true;
+      const next = { ...pc };
+      if (value) next[key] = value; else delete next[key];
+      return next;
+    });
+    return touched ? { ...p, pieces, hasChanged: true } : p;
+  }
+  if (target === 'notch' && field === 'distance') {
+    let touched = false;
+    const map = (pp: PiecePath): PiecePath => {
+      if (!pp.notches?.some((n) => n.id === targetId)) return pp;
+      touched = true;
+      return {
+        ...pp,
+        notches: pp.notches.map((n) => {
+          if (n.id !== targetId) return n;
+          const next = { ...n };
+          if (value) next.distanceFormula = value; else delete next.distanceFormula;
+          return next;
+        })
+      };
+    };
+    const pieces = p.pieces.map((piece) => ({ ...piece, mainPaths: piece.mainPaths.map(map), internalPaths: piece.internalPaths.map(map) }));
+    return touched ? { ...p, pieces, hasChanged: true } : p;
+  }
+  return p;
 }
 
 // ---- piece points (piece-local construction points) -----------------------------------------------

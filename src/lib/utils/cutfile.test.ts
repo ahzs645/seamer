@@ -98,3 +98,28 @@ describe('markerToCutFile — bed validation and splitting', () => {
     expect(res.files[0].text).toContain('</svg>');
   });
 });
+
+describe('toHPGL extras (pens, line types, labels, drill crosses)', () => {
+  it('emits SP pens, LT line types, LB labels with DI rotation, and cross strokes', async () => {
+    const { toHPGL } = await import('./hpgl');
+    const out = toHPGL(
+      [
+        { pts: [{ x: 0, y: 0 }, { x: 100, y: 0 }], pen: 2 },
+        { pts: [{ x: 0, y: 10 }, { x: 100, y: 10 }], pen: 3, lineType: 2 }
+      ],
+      {
+        texts: [{ text: 'Front', x: 50, y: 5, sizeMm: 8, rotationDeg: 90 }],
+        crosses: [{ x: 20, y: 20 }]
+      }
+    );
+    expect(out).toContain('SP2;');
+    expect(out).toContain('SP3;');
+    expect(out).toContain('LT2;');
+    expect(out).toContain('LT;'); // reset to solid before extras
+    expect(out).toContain('LBFront\x03;');
+    expect(out).toContain('DI0.0000,1.0000;'); // 90° label direction
+    // cross = two strokes through (20,20): 17mm→680u .. 23mm→920u
+    expect(out).toContain('PU680,800;');
+    expect(out).toContain('PD920,800;');
+  });
+});

@@ -35,17 +35,32 @@ export class AvatarController {
     return this.skinned?.poseNames() ?? [];
   }
 
-  /** Recompute the avatar from body measurements + gender. */
+  /** Recompute the avatar from body measurements + gender. 'neutral' (the original's third option)
+   *  blends the male and female statistical models 50/50: both share the base topology, so the
+   *  per-gender reconstructions average vertex-for-vertex. */
   async setBody(body: Body): Promise<void> {
-    this.gender = body.gender === 'male' ? 'male' : 'female';
-    const genderAssets = await loadGenderAssets(this.gender);
-    const { coeff } = solveBodyCoefficients(genderAssets.model, body);
-    const verts = reconstructVertices(
-      this.assets.baseModel,
-      genderAssets.coefficients,
-      coeff,
-      this.assets.numVertices
-    );
+    this.gender = body.gender === 'male' ? 'male' : body.gender === 'neutral' ? 'neutral' : 'female';
+    let verts: Float32Array;
+    if (this.gender === 'neutral') {
+      const [fem, mal] = await Promise.all([loadGenderAssets('female'), loadGenderAssets('male')]);
+      const reconstruct = (g: typeof fem) => {
+        const { coeff } = solveBodyCoefficients(g.model, body);
+        return reconstructVertices(this.assets.baseModel, g.coefficients, coeff, this.assets.numVertices);
+      };
+      const vf = reconstruct(fem);
+      const vm = reconstruct(mal);
+      verts = vf;
+      for (let i = 0; i < verts.length; i++) verts[i] = (vf[i] + vm[i]) / 2;
+    } else {
+      const genderAssets = await loadGenderAssets(this.gender);
+      const { coeff } = solveBodyCoefficients(genderAssets.model, body);
+      verts = reconstructVertices(
+        this.assets.baseModel,
+        genderAssets.coefficients,
+        coeff,
+        this.assets.numVertices
+      );
+    }
     if (!this.skinned) {
       this.skinned = new SkinnedAvatar(
         this.assets.baseModel,
@@ -88,6 +103,23 @@ export class AvatarController {
 
   bonePosition(name: string, out: THREE.Vector3): THREE.Vector3 | null {
     return this.skinned?.boneWorldPosition(name, out) ?? null;
+  }
+
+  /** Raw measurement definitions from the base model (anchors, types, planes) for on-mesh segments. */
+  get measurementSegmentDefs(): import('./bodyMeasurements3d').MeasureSegmentDef[] {
+    return this.assets.baseModel.measurements as import('./bodyMeasurements3d').MeasureSegmentDef[];
+  }
+
+  /** Per-measurement camera framing from the base model (drives the zoom-to-measurement fly-to). */
+  measurementCamera(name: string): { position: [number, number, number]; target: [number, number, number]; fov: number } | null {
+    const defs = this.assets.baseModel.measurements as { name?: string; cameraSettings?: { position?: number[]; target?: number[]; fov?: number } }[];
+    const cs = defs.find((m) => m?.name === name)?.cameraSettings;
+    if (!cs?.position || !cs.target || cs.position.length < 3 || cs.target.length < 3) return null;
+    return {
+      position: [cs.position[0], cs.position[1], cs.position[2]],
+      target: [cs.target[0], cs.target[1], cs.target[2]],
+      fov: cs.fov ?? 54
+    };
   }
 
   setMaterial(material: THREE.Material): void {

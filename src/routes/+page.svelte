@@ -14,7 +14,7 @@
         name: p.name,
         description: p.description,
         is3d: p.enable3d,
-        thumbnailUrl: null,
+        thumbnailUrl: p.thumbnailUrl ?? null,
         updatedAt: new Date().toISOString(),
         ownerUserId: 'local',
         organizationId: null,
@@ -60,6 +60,11 @@
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
       {#each patterns as p}
         <div class="card bg-base-200 shadow-sm hover:shadow-md transition-shadow">
+          {#if p.thumbnailUrl}
+            <figure class="bg-base-100 max-h-40 overflow-hidden">
+              <img src={p.thumbnailUrl} alt="Preview of {p.name}" class="w-full object-cover" />
+            </figure>
+          {/if}
           <div class="card-body">
             <h3 class="card-title text-lg">{p.name}</h3>
             <p class="text-sm opacity-70">{p.description || 'No description'}</p>

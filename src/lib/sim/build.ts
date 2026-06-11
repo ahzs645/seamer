@@ -58,6 +58,8 @@ export interface SimData {
   // Ordered global particle runs per piece edge, keyed `${pieceId}::${piecePathId}` (mirror copies
   // suffix the edge with `#M`). Used by the 3D seam tool to pick edges on the draped garment.
   edgeRuns: Map<string, number[]>;
+  // Per-seam particle pairs (flat [a0,b0,a1,b1,...]) for per-seam colored 3D seam display.
+  seamPairsBySeam: { seamId: string; index: number; pairs: number[] }[];
 }
 
 export interface ArrangedPiece {
@@ -420,6 +422,7 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
   // so as a FALLBACK we auto-detect direction: in the cached drape sewn edges are coincident, so
   // the correct alignment (forward vs reversed) is the one with the smaller total paired distance.
   const sampleIdx = (len: number, n: number, k: number) => (len <= 1 ? 0 : Math.round((k * (len - 1)) / (n - 1)));
+  const seamPairsBySeam: { seamId: string; index: number; pairs: number[] }[] = [];
   for (const seam of pattern.seams) {
     const fromChain = chain(seam.fromPaths, seam.id);
     const toChain = chain(seam.toPaths, seam.id);
@@ -454,11 +457,14 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
       return c;
     };
     const rev = hasExplicitOrientation ? false : alignCost(true) < alignCost(false);
+    const pairList: number[] = [];
     for (let k = 0; k < n; k++) {
       const a = fromChain[sampleIdx(fromChain.length, n, k)];
       const b = toChain[sampleIdx(toChain.length, n, rev ? n - 1 - k : k)];
       addSeamLink(a, b); addSeamLink(b, a);
+      pairList.push(a, b);
     }
+    seamPairsBySeam.push({ seamId: seam.id, index: pattern.seams.indexOf(seam), pairs: pairList });
   }
 
   // Repo extension (default OFF — the original has no proximity-based sewing; see BuildSimOptions):
@@ -572,6 +578,7 @@ export function buildSimData(pattern: Pattern, arranged: ArrangedPiece[], option
     stretchColors, bendColors, seams, pieces: simPieces,
     triangles, triangleCount: triCount, particleLayers, neighborIndices,
     incidentTriangles, maxIncidentTrianglesPerParticle: MAX_INCIDENT,
-    edgeRuns: edgeParticlesGlobal
+    edgeRuns: edgeParticlesGlobal,
+    seamPairsBySeam
   };
 }

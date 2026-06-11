@@ -50,6 +50,8 @@ export interface CoreLayout {
 
 export type NestStrategy = 'corners' | 'nfp';
 
+export type NestGravity = 'bottom' | 'left' | 'right' | 'top';
+
 export interface CoreOptions {
   fabricWidthMm: number;
   gapMm: number;
@@ -63,6 +65,8 @@ export interface CoreOptions {
   simplifyTolMm?: number;
   /** maximum marker length per fabric sheet (mm); overflow opens a new bin. 0/undefined = unlimited */
   maxLengthMm?: number | null;
+  /** which fabric edge pieces snug toward (the original's gravityDirection). Default 'bottom'. */
+  gravity?: NestGravity;
 }
 
 export interface CoreProgress {
@@ -206,27 +210,51 @@ function searchPolyOf(cut: Vec2[], tol: number): Vec2[] {
   return out;
 }
 
-interface RotVariant { full: Vec2[]; outline: Vec2[]; search: Vec2[]; w: number; h: number }
+interface RotVariant { full: Vec2[]; outline: Vec2[]; search: Vec2[]; inflated: Vec2[]; test: Vec2[]; w: number; h: number }
 interface PreparedItem extends CoreItem {
   /** per-allowed-rotation pre-rotated + normalised polygons (search copy is simplified) */
   variants: Record<number, RotVariant>;
 }
 
-function prepareItems(items: CoreItem[], tol: number, rotations: number[]): PreparedItem[] {
+// Variant/NFP-geometry cache, persistent across nesting runs (the original's nfpCache): the rotated,
+// simplified and gap-inflated polygons depend only on the cut shape + tolerance + rotation + gap, so
+// re-nesting after unrelated edits reuses them. Bounded FIFO.
+const variantCache = new Map<string, Record<number, RotVariant>>();
+const VARIANT_CACHE_MAX = 200;
+
+function variantKey(it: CoreItem, tol: number, rotations: number[], gapMm: number): string {
+  const r = (n: number) => Math.round(n * 10);
+  return `${rotations.join(',')}|${tol}|${gapMm}|${it.cut.map((p) => `${r(p.x)},${r(p.y)}`).join(';')}`;
+}
+
+function prepareItems(items: CoreItem[], tol: number, rotations: number[], gapMm: number): PreparedItem[] {
   return items.map((it) => {
+    const key = variantKey(it, tol, rotations, gapMm);
+    const cached = variantCache.get(key);
+    if (cached) return { ...it, variants: cached };
     const searchCut = searchPolyOf(it.cut, tol);
     const variants: Record<number, RotVariant> = {};
     for (const deg of rotations) {
       const rotFull = rotatePoly(it.cut, deg);
       const b = polyBounds(rotFull);
+      const search = normalizeBy(rotatePoly(searchCut, deg), b);
       variants[deg] = {
         full: normalizeBy(rotFull, b),
         outline: normalizeBy(rotatePoly(it.outline, deg), b),
-        search: normalizeBy(rotatePoly(searchCut, deg), b),
+        search,
+        // gap-inflated/test copies precomputed at the origin: a translation of the piece is a
+        // translation of its offset, so placements only shift these instead of re-offsetting
+        inflated: gapMm > 0 ? offsetPoly(search, gapMm) : search,
+        test: gapMm > 0 ? offsetPoly(search, gapMm * 0.98) : search,
         w: b.maxX - b.minX,
         h: b.maxY - b.minY
       };
     }
+    if (variantCache.size >= VARIANT_CACHE_MAX) {
+      const oldest = variantCache.keys().next().value;
+      if (oldest !== undefined) variantCache.delete(oldest);
+    }
+    variantCache.set(key, variants);
     return { ...it, variants };
   });
 }
@@ -243,13 +271,20 @@ function placeOrdered(
   fabricWidthMm: number,
   gapMm: number,
   strategy: NestStrategy,
-  maxLengthMm?: number | null
+  maxLengthMm?: number | null,
+  gravity: NestGravity = 'bottom'
 ): { placements: CorePlacement[]; binLengths: number[] } {
   interface Placed { search: Vec2[]; inflated: Vec2[]; test: Vec2[]; bounds: ReturnType<typeof polyBounds> }
   interface Bin { placed: Placed[]; usedLength: number }
   const maxLen = maxLengthMm && maxLengthMm > 0 ? maxLengthMm : Infinity;
   const bins: Bin[] = [{ placed: [], usedLength: gapMm }];
   const placements: CorePlacement[] = [];
+  // candidate preference order = which fabric edge pieces snug toward
+  const gravityCmp: (a: Vec2, c: Vec2) => number =
+    gravity === 'left' ? (a, c) => a.x - c.x || a.y - c.y
+    : gravity === 'right' ? (a, c) => c.x - a.x || a.y - c.y
+    : gravity === 'top' ? (a, c) => a.y - c.y || c.x - a.x
+    : (a, c) => a.y - c.y || a.x - c.x;
 
   for (let k = 0; k < order.length; k++) {
     const it = order[k];
@@ -263,6 +298,7 @@ function placeOrdered(
       const placed = bin.placed;
       if (strategy === 'nfp') {
         const candidates: Vec2[] = [{ x: gapMm, y: gapMm }];
+        if (gravity === 'right' && maxX > gapMm) candidates.push({ x: maxX, y: gapMm });
         for (const pl of placed) {
           for (const q of pl.inflated) {
             for (const p of search) {
@@ -273,7 +309,7 @@ function placeOrdered(
           // bbox corner anchors keep row/shelf structure available too
           candidates.push({ x: pl.bounds.maxX + gapMm, y: gapMm }, { x: gapMm, y: pl.bounds.maxY + gapMm });
         }
-        candidates.sort((a, c) => a.y - c.y || a.x - c.x);
+        candidates.sort(gravityCmp);
         let lastX = NaN, lastY = NaN;
         for (const cnd of candidates) {
           if (cnd.x < gapMm - 1e-9 || cnd.x > maxX + 1e-9 || cnd.y < gapMm - 1e-9 || cnd.y > yCap + 1e-9) continue;
@@ -333,11 +369,12 @@ function placeOrdered(
     const tr = (poly: Vec2[]) => poly.map((p) => ({ x: p.x + pos!.x, y: p.y + pos!.y }));
     const searchT = tr(search);
     // overlap tests run against a slightly under-inflated copy so exact vertex contacts
-    // (candidates sit ON the inflated boundary) aren't rejected by numeric noise.
+    // (candidates sit ON the inflated boundary) aren't rejected by numeric noise. Both copies are
+    // precomputed per variant (a translation of the offset = the offset of the translation).
     bin.placed.push({
       search: searchT,
-      inflated: gapMm > 0 ? offsetPoly(searchT, gapMm) : searchT,
-      test: gapMm > 0 ? offsetPoly(searchT, gapMm * 0.98) : searchT,
+      inflated: tr(it.variants[deg].inflated),
+      test: tr(it.variants[deg].test),
       bounds: polyBounds(searchT)
     });
     placements.push({ pieceId: it.pieceId, name: it.name, poly: tr(full), outline: tr(outline), bbox: { w, h }, rotationDeg: deg, instanceId: it.instanceId, bin: binIdx });
@@ -367,13 +404,13 @@ export function nestCore(rawItems: CoreItem[], opts: CoreOptions, onProgress?: (
   const generations = Math.max(0, opts.generations);
   const population = Math.max(4, opts.population);
   const rand = rng(opts.seed ?? Math.floor(Math.random() * 0xffffffff));
-  const items = prepareItems(rawItems, opts.simplifyTolMm ?? 1, rotations);
+  const items = prepareItems(rawItems, opts.simplifyTolMm ?? 1, rotations, gapMm);
   if (items.length === 0) return { fabricWidthMm, usedLengthMm: gapMm, gapMm, placements: [], efficiency: 0 };
 
   const totalArea = items.reduce((s, it) => s + it.area, 0);
   const efficiencyOf = (len: number) => Math.min(1, totalArea / Math.max(1, fabricWidthMm * (len - gapMm)));
   const evaluate = (order: PreparedItem[], rotIdx: number[]) =>
-    placeOrdered(order, rotIdx, rotations, fabricWidthMm, gapMm, strategy, opts.maxLengthMm);
+    placeOrdered(order, rotIdx, rotations, fabricWidthMm, gapMm, strategy, opts.maxLengthMm, opts.gravity);
   // fitness: fewer bins first, then total fabric used (single-bin = plain length, as before)
   const fitnessOf = (r: ReturnType<typeof placeOrdered>) =>
     (r.binLengths.length - 1) * 1e6 + r.binLengths.reduce((s, l) => s + l, 0);

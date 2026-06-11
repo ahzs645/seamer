@@ -3,7 +3,7 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import {
-  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, pieceTransform, pieceShrinkageScale, type Vec2
+  indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, pieceTransform, pieceShrinkageScale, polygonCentroid, type Vec2
 } from './patternGeometry';
 import { tilePageCount } from './pdf';
 
@@ -225,22 +225,72 @@ export async function markerToPDF(
 // --- HPGL (plotter) ----------------------------------------------------------
 const HPGL_PEN: Record<Layer, number> = { 'pattern': 1, 'seam-allowance': 2, 'internal': 3, 'marker': 4 };
 
-/** Pattern → HPGL plotter program (pen 1 stitch line, 2 cut line, 3 internal, 4 markers). */
+/** Pattern → HPGL plotter program (pen 1 stitch line, 2 cut line, 3 internal dashed, 4 markers),
+ *  with drill-hole crosses and piece-name labels written into the file (pens 5). */
 export async function patternToHPGL(pattern: Pattern): Promise<string> {
   const { toHPGL } = await import('./hpgl');
-  return toHPGL(collectPolylines(pattern).map((p) => ({ pts: p.pts, closed: p.closed, pen: HPGL_PEN[p.layer] })));
+  const polys = collectPolylines(pattern).map((p) => ({
+    pts: p.pts, closed: p.closed, pen: HPGL_PEN[p.layer],
+    lineType: p.layer === 'internal' ? 2 : undefined
+  }));
+  const points = indexPoints(pattern);
+  const crosses: { x: number; y: number }[] = [];
+  const texts: { text: string; x: number; y: number; sizeMm: number; rotationDeg?: number }[] = [];
+  const paths = indexPaths(pattern);
+  for (const piece of pattern.pieces) {
+    if (piece.hidden) continue;
+    const tf = pieceTransform(piece, points, pieceShrinkageScale(pattern, piece));
+    for (const m of piece.markers ?? []) crosses.push(tf({ x: m.x, y: m.y }));
+    const outline = pieceWorldOutline(pattern, piece, paths, points, 6);
+    if (outline.length >= 3) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of outline) { minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y); }
+      const c = polygonCentroid(outline);
+      texts.push({
+        text: piece.name, x: c.x, y: c.y,
+        sizeMm: Math.max(4, Math.min(12, Math.min(maxX - minX, maxY - minY) * 0.08)),
+        rotationDeg: maxY - minY > maxX - minX ? 90 : 0 // tall piece → rotate the label upright
+      });
+    }
+  }
+  return toHPGL(polys, { crosses, texts });
 }
 
-/** Nested marker → HPGL (cut polygons on pen 2, stitch outlines on pen 1). */
-export async function markerToHPGL(layout: { placements: { poly: Vec2[]; outline: Vec2[] }[]; usedLengthMm: number }): Promise<string> {
+/** Nested marker → HPGL (cut polygons on pen 2, stitch outlines on pen 1, labels on pen 5). */
+export async function markerToHPGL(layout: { placements: { name?: string; poly: Vec2[]; outline: Vec2[] }[]; usedLengthMm: number }): Promise<string> {
   const { toHPGL } = await import('./hpgl');
   const flip = (p: Vec2): Vec2 => ({ x: p.x, y: layout.usedLengthMm - p.y });
   const polys: { pts: Vec2[]; closed: boolean; pen: number }[] = [];
+  const texts: { text: string; x: number; y: number; sizeMm: number; rotationDeg?: number }[] = [];
   for (const pl of layout.placements) {
     polys.push({ pts: pl.poly.map(flip), closed: true, pen: 2 });
     polys.push({ pts: pl.outline.map(flip), closed: true, pen: 1 });
+    if (pl.name) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of pl.poly) { minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y); }
+      const c = flip({ x: (minX + maxX) / 2, y: (minY + maxY) / 2 });
+      texts.push({
+        text: pl.name, x: c.x, y: c.y,
+        sizeMm: Math.max(4, Math.min(12, Math.min(maxX - minX, maxY - minY) * 0.08)),
+        rotationDeg: maxY - minY > maxX - minX ? 90 : 0
+      });
+    }
   }
-  return toHPGL(polys);
+  return toHPGL(polys, { texts });
+}
+
+// --- .ssp compressed project (the original's toCompressed) --------------------
+
+/** Whole pattern → gzip-compressed JSON blob (.ssp). */
+export async function patternToSSP(pattern: Pattern): Promise<Blob> {
+  const stream = new Blob([JSON.stringify(pattern)]).stream().pipeThrough(new CompressionStream('gzip'));
+  return await new Response(stream).blob();
+}
+
+/** .ssp blob → Pattern (gzip-decompressed JSON). */
+export async function sspToPattern(blob: Blob): Promise<Pattern> {
+  const text = await new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).text();
+  return JSON.parse(text) as Pattern;
 }
 
 export function patternToCSV(pattern: Pattern): string {

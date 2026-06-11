@@ -355,3 +355,177 @@ export function markerToSVG(layout: MarkerLayout, cutOff: CutOffType = 'none', c
 ${binsSVG}${cutSVG}${body}
 </svg>`;
 }
+
+// ---- nest-onto-paper (the original's print-dialog re-nest) -----------------------------------------
+
+import { nestCore, polygonArea as corePolygonArea, type CoreItem } from './nestCore';
+
+/**
+ * Re-position the pattern's pieces onto a strip as wide as the printable paper area, so tiled
+ * printing uses the fewest pages (the original nests with rotations [0,90,180,270] before printing).
+ * Returns a COPY of the pattern with piece position/rotation rewritten; the drafting geometry is
+ * untouched. Falls back to the original pattern when there's nothing to nest.
+ */
+export function nestPatternForPaper(pattern: Pattern, usableWidthMm: number): Pattern {
+  if (usableWidthMm < 50) return pattern;
+  const paths = indexPaths(pattern);
+  const points = indexPoints(pattern);
+  const items: CoreItem[] = [];
+  for (const piece of pattern.pieces) {
+    if (piece.hidden) continue;
+    const outline = pieceWorldOutline(pattern, piece, paths, points, 4);
+    if (outline.length < 3) continue;
+    items.push({ pieceId: piece.id, instanceId: piece.id, name: piece.name, cut: outline, outline, area: corePolygonArea(outline) });
+  }
+  if (items.length < 2) return pattern;
+  const layout = nestCore(items, {
+    fabricWidthMm: usableWidthMm,
+    gapMm: 8,
+    rotations: [0, 90, 180, 270],
+    generations: 6,
+    population: 12,
+    strategy: 'nfp',
+    seed: 42 // deterministic: the preview page count matches the printed result
+  });
+  const byPiece = new Map(layout.placements.map((pl) => [pl.pieceId, pl]));
+  const itemByPiece = new Map(items.map((it) => [it.pieceId, it]));
+  const pieces = pattern.pieces.map((piece) => {
+    const pl = byPiece.get(piece.id);
+    const it = itemByPiece.get(piece.id);
+    if (!pl || !it) return piece;
+    // rigid transform old-world → placement: rotation Δ, then translation derived from the first
+    // vertex (vertex order survives rotate/normalize/translate in the nester)
+    const deg = pl.rotationDeg ?? 0;
+    const rad = (deg * Math.PI) / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    const o0 = it.cut[0];
+    const t = { x: pl.poly[0].x - (o0.x * cos - o0.y * sin), y: pl.poly[0].y - (o0.x * sin + o0.y * cos) };
+    return {
+      ...piece,
+      rotation: piece.rotation + deg,
+      position: {
+        x: piece.position.x * cos - piece.position.y * sin + t.x,
+        y: piece.position.x * sin + piece.position.y * cos + t.y
+      }
+    };
+  });
+  return { ...pattern, pieces };
+}
+
+// ---- fabric-distortion warp (the original's ThinPlateSpline warpToMesh) ----------------------------
+
+import { buildWarp, type MatchPair } from './thinPlateSpline';
+
+export interface FabricDistortion {
+  /** lateral mid-length bow of the fabric (mm; weft arcs sideways on the table) */
+  bowMm: number;
+  /** skew of the far end relative to the near end (mm; weft runs off-square) */
+  skewMm: number;
+}
+
+/**
+ * Warp a nested layout onto the REAL (distorted) fabric so cuts land on-grain: a thin-plate spline
+ * is fitted from the ideal marker rectangle onto the measured bow/skew shape, and every placement
+ * polygon is mapped through it. Identity when both adjustments are 0.
+ */
+export function warpLayoutToFabric(layout: MarkerLayout, distortion: FabricDistortion): MarkerLayout {
+  const { bowMm, skewMm } = distortion;
+  if (!bowMm && !skewMm) return layout;
+  const w = layout.fabricWidthMm;
+  const len = Math.max(1, layout.usedLengthMm);
+  // 3×3 control grid over the marker: bow arcs sideways (max at mid-length, zero at the ends),
+  // skew shifts proportionally along the length
+  const pairs: MatchPair[] = [];
+  for (const v of [0, 0.5, 1]) {
+    for (const u of [0, 0.5, 1]) {
+      const src = { x: u * w, y: v * len };
+      const dx = bowMm * Math.sin(Math.PI * v) + skewMm * v;
+      pairs.push({ src, dst: { x: src.x + dx, y: src.y } });
+    }
+  }
+  const warp = buildWarp(pairs);
+  return {
+    ...layout,
+    placements: layout.placements.map((pl) => ({
+      ...pl,
+      poly: pl.poly.map(warp),
+      outline: pl.outline.map(warp)
+    }))
+  };
+}
+
+// ---- print/plaid pattern matching (the original's matching nest options) ---------------------------
+
+import { polyBounds as nestPolyBounds, polysOverlap as nestPolysOverlap, offsetPoly as nestOffsetPoly } from './nestCore';
+
+export interface PatternMatching {
+  /** horizontal repeat of the print (mm) */
+  cellWidthMm: number;
+  /** vertical repeat of the print (mm) */
+  cellHeightMm: number;
+}
+
+/**
+ * Align a nested layout to the fabric's print repeat: every placement snaps to the nearest
+ * repeat-grid position (searching outward when the snap would overlap a neighbour or leave the
+ * fabric), so checks/stripes land identically on every piece — the grid-snap core of the
+ * original's plaid/print matching. Re-measures the used length afterwards.
+ */
+export function matchLayoutToRepeat(layout: MarkerLayout, match: PatternMatching, gapMm = 0): MarkerLayout {
+  const cw = Math.max(1, match.cellWidthMm);
+  const ch = Math.max(1, match.cellHeightMm);
+  const placed: { test: Vec2[]; bounds: ReturnType<typeof nestPolyBounds> }[] = [];
+  let usedLength = gapMm;
+  const order = [...layout.placements].sort((a, b) => {
+    const ba = nestPolyBounds(a.poly), bb = nestPolyBounds(b.poly);
+    return ba.minY - bb.minY || ba.minX - bb.minX;
+  });
+  const out = new Map<typeof order[number], { dx: number; dy: number }>();
+  for (const pl of order) {
+    const b = nestPolyBounds(pl.poly);
+    // candidate grid shifts, nearest first (rings around the snapped origin)
+    const snapX = Math.round(b.minX / cw) * cw - b.minX;
+    const snapY = Math.round(b.minY / ch) * ch - b.minY;
+    let chosen: { dx: number; dy: number } | null = null;
+    outer: for (let ring = 0; ring <= 6 && !chosen; ring++) {
+      for (let ky = -ring; ky <= ring; ky++) {
+        for (let kx = -ring; kx <= ring; kx++) {
+          if (Math.max(Math.abs(kx), Math.abs(ky)) !== ring) continue; // ring shell only
+          const dx = snapX + kx * cw;
+          const dy = snapY + ky * ch;
+          if (b.minX + dx < 0 || b.maxX + dx > layout.fabricWidthMm || b.minY + dy < 0) continue;
+          const cand = pl.poly.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+          const candTest = gapMm > 0 ? nestOffsetPoly(cand, gapMm * 0.49) : cand;
+          const cb = nestPolyBounds(candTest);
+          let ok = true;
+          for (const q of placed) {
+            if (cb.maxX < q.bounds.minX || q.bounds.maxX < cb.minX || cb.maxY < q.bounds.minY || q.bounds.maxY < cb.minY) continue;
+            if (nestPolysOverlap(candTest, q.test)) { ok = false; break; }
+          }
+          if (ok) { chosen = { dx, dy }; placed.push({ test: candTest, bounds: cb }); continue outer; }
+        }
+      }
+    }
+    const shift = chosen ?? { dx: 0, dy: 0 };
+    if (!chosen) {
+      // keep the unmatched original placement occupied so later pieces avoid it
+      const test = gapMm > 0 ? nestOffsetPoly(pl.poly, gapMm * 0.49) : pl.poly;
+      placed.push({ test, bounds: nestPolyBounds(test) });
+    }
+    out.set(pl, shift);
+    usedLength = Math.max(usedLength, b.maxY + shift.dy + gapMm);
+  }
+  return {
+    ...layout,
+    usedLengthMm: usedLength,
+    placements: layout.placements.map((pl) => {
+      const s = out.get(pl) ?? { dx: 0, dy: 0 };
+      if (!s.dx && !s.dy) return pl;
+      return {
+        ...pl,
+        poly: pl.poly.map((p) => ({ x: p.x + s.dx, y: p.y + s.dy })),
+        outline: pl.outline.map((p) => ({ x: p.x + s.dx, y: p.y + s.dy }))
+      };
+    })
+  };
+}

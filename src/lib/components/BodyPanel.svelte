@@ -4,6 +4,7 @@
   import { loadGenderModel } from '$lib/model/assets';
   import { toMetricKnown, completeMeasurements } from '$lib/model/measurements';
   import { bodyProfiles, saveBodyProfile, updateBodyProfile, removeBodyProfile } from '$lib/stores/bodyProfiles';
+  import { bodyZoomRequest } from '$lib/stores/pattern';
   import { bodyToJson, bodyToCsv, bodyToObj, bodyToStl } from '$lib/utils/bodyExport';
   import { bodyToSeamlyMe } from '$lib/utils/seamlyExport';
   import { downloadText, downloadBlob } from '$lib/utils/exporters';
@@ -59,7 +60,7 @@
     return imperial ? 0.5 : 1;
   }
 
-  function setGender(gender: 'male' | 'female') {
+  function setGender(gender: 'male' | 'female' | 'neutral') {
     onchange({ ...currentPattern, body: { ...currentPattern.body, gender }, hasChanged: true });
   }
   function setUnit(unitType: 'imperial' | 'metric') {
@@ -164,6 +165,7 @@
     <div class="join join-horizontal w-full mt-0.5">
       <button class="join-item btn btn-xs flex-1" class:btn-active={currentPattern.body.gender === 'female'} onclick={() => setGender('female')}>Female</button>
       <button class="join-item btn btn-xs flex-1" class:btn-active={currentPattern.body.gender === 'male'} onclick={() => setGender('male')}>Male</button>
+      <button class="join-item btn btn-xs flex-1" class:btn-active={currentPattern.body.gender === 'neutral'} onclick={() => setGender('neutral')}>Neutral</button>
     </div>
   </div>
 
@@ -186,7 +188,7 @@
       {#each visibleFields as f (f.name)}
         {@const isEstimate = currentPattern.body.fields[f.name] == null}
         <div class="flex items-center gap-1">
-          <span class="truncate flex-1" title={f.label}>{f.label}</span>
+          <button class="truncate flex-1 text-left hover:text-accent" title="{f.label} — click to frame in 3D" onclick={() => bodyZoomRequest.set(f.name)}>{f.label}</button>
           <div class="join">
             <button class="join-item btn btn-xs px-1.5" aria-label="decrease" onclick={() => bump(f, -1)}>−</button>
             <input

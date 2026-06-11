@@ -3,7 +3,7 @@
 
 import type { Pattern } from '$lib/types/pattern';
 import { buildNestItems, type MarkerLayout, type NestOptions } from './markerLayout';
-import type { CoreItem, CoreLayout, CoreOptions, CoreProgress, NestStrategy } from './nestCore';
+import type { CoreItem, CoreLayout, CoreOptions, CoreProgress, NestStrategy, NestGravity } from './nestCore';
 
 export type { CoreProgress as NestProgress } from './nestCore';
 
@@ -15,6 +15,10 @@ export interface NestJob {
 export interface WorkerNestOptions extends NestOptions {
   /** 'nfp' (default): no-fit-polygon vertex-contact placement; 'corners': bbox shelf candidates. */
   strategy?: NestStrategy;
+  /** which fabric edge pieces snug toward (the original's gravityDirection). Default 'bottom'. */
+  gravity?: NestGravity;
+  /** Douglas-Peucker tolerance (mm) for cut-polygon simplification (the original's curveTolerance). */
+  curveToleranceMm?: number;
 }
 
 /** Nest off the main thread. Resolves with the layout; rejects with Error('cancelled') on cancel. */
@@ -39,7 +43,9 @@ export function nestItemsInWorker(
     generations: opts.generations ?? 12,
     population: Math.max(4, opts.population ?? 16),
     strategy: opts.strategy ?? 'nfp',
-    maxLengthMm: opts.maxLengthMm && opts.maxLengthMm > 0 ? opts.maxLengthMm : null
+    maxLengthMm: opts.maxLengthMm && opts.maxLengthMm > 0 ? opts.maxLengthMm : null,
+    gravity: opts.gravity ?? 'bottom',
+    simplifyTolMm: opts.curveToleranceMm && opts.curveToleranceMm > 0 ? opts.curveToleranceMm : 1
   };
 
   const worker = new Worker(new URL('../workers/nesting.worker.ts', import.meta.url), { type: 'module' });

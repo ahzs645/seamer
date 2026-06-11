@@ -135,9 +135,13 @@
         {@const st = styleOf(layer)}
         <div class="ml-6 mb-1 p-2 rounded bg-base-200 space-y-1">
           <div class="flex items-center gap-2">
-            <span class="w-16">Color</span>
+            <span class="w-16">Light color</span>
             <input type="color" class="h-5 w-8 p-0 border-0 bg-transparent" value={st.color ?? '#000000'} onchange={(e) => setStyle(layer.id, { color: (e.currentTarget as HTMLInputElement).value })} />
             <button class="btn btn-ghost btn-xs ml-auto" onclick={() => clearStyle(layer.id)}>Clear</button>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="w-16">Dark color</span>
+            <input type="color" class="h-5 w-8 p-0 border-0 bg-transparent" value={st.colorDark ?? st.color ?? '#e2e8f0'} onchange={(e) => setStyle(layer.id, { colorDark: (e.currentTarget as HTMLInputElement).value })} />
           </div>
           <label class="flex items-center gap-2">
             <span class="w-16">Width</span>
@@ -150,8 +154,15 @@
             <span class="w-6 text-right">{st.opacity ?? 1}</span>
           </label>
           <label class="flex items-center gap-2">
-            <input type="checkbox" class="checkbox checkbox-xs" checked={st.dashed ?? false} onchange={(e) => setStyle(layer.id, { dashed: (e.currentTarget as HTMLInputElement).checked })} />
-            <span>Dashed</span>
+            <span class="w-16">Line style</span>
+            <select class="select select-bordered select-xs flex-1" value={st.lineStyle ?? (st.dashed ? 'dashed' : 'solid')}
+              onchange={(e) => setStyle(layer.id, { lineStyle: (e.currentTarget as HTMLSelectElement).value as LayerStyle['lineStyle'] })}>
+              <option value="solid">Solid</option>
+              <option value="dashed">Dashed</option>
+              <option value="dotted">Dotted</option>
+              <option value="dash-dot">Dash-dot</option>
+              <option value="dash-dot-dot">Dash-dot-dot</option>
+            </select>
           </label>
         </div>
       {/if}

@@ -12,6 +12,7 @@
   import { toast, toastSuccess, toastError } from '$lib/stores/toast';
   import { machines, selectedMachineId, addMachine, updateMachine, removeMachine, type CuttingMachine } from '$lib/stores/machines';
   import { markerToCutFile, machineUsableWidthMm, printPieceLabels } from '$lib/utils/cutfile';
+  import { warpLayoutToFabric, matchLayoutToRepeat } from '$lib/utils/markerLayout';
 
   let { currentPattern, onchange, onclose }:
     { currentPattern: Pattern; onchange: (p: Pattern, label?: string) => void; onclose: () => void } = $props();
@@ -25,6 +26,8 @@
     cutOff: CutOffType;
     cutIds: string[];
     maxLengthMm?: number;
+    gravity?: 'bottom' | 'left' | 'right' | 'top';
+    curveToleranceMm?: number;
   }
   // svelte-ignore state_referenced_locally -- intentional one-time read of persisted settings on open
   const saved = (currentPattern.markerSettings ?? null) as Partial<MarkerSettings> | null;
@@ -35,6 +38,15 @@
   let maxLengthMm = $state(saved?.maxLengthMm ?? 0); // 0 = unlimited (single sheet)
   let rotationMode = $state(rotationsToMode(saved?.allowedRotations));
   let generations = $state(saved?.generations ?? 12);
+  let gravity = $state<'bottom' | 'left' | 'right' | 'top'>(saved?.gravity ?? 'bottom');
+  let curveToleranceMm = $state(saved?.curveToleranceMm ?? 1);
+  // fabric distortion compensation (the original's TPS warpToMesh), applied to machine cut files
+  let fabricBowMm = $state(0);
+  let fabricSkewMm = $state(0);
+  // print/plaid matching: snap placements onto the fabric's repeat grid after nesting
+  let matchEnabled = $state(false);
+  let matchCellWmm = $state(50);
+  let matchCellHmm = $state(50);
   let cutOff = $state<CutOffType>(saved?.cutOff ?? 'none');
   let cutIds = $state<Set<string>>(new Set(saved?.cutIds ?? []));
 
@@ -59,7 +71,7 @@
   }
 
   function persist() {
-    const settings: MarkerSettings = { algorithm, fabricWidthMm, gapMm, maxLengthMm, allowedRotations: modeToRotations(), generations, cutOff, cutIds: [...cutIds] };
+    const settings: MarkerSettings = { algorithm, fabricWidthMm, gapMm, maxLengthMm, allowedRotations: modeToRotations(), generations, cutOff, cutIds: [...cutIds], gravity, curveToleranceMm };
     onchange({ ...currentPattern, markerSettings: settings, hasChanged: true }, 'Cutting room settings');
   }
 
@@ -74,7 +86,7 @@
         job?.cancel();
         job = nestInWorker(
           currentPattern,
-          { fabricWidthMm, gapMm, maxLengthMm, allowedRotations: modeToRotations(), generations, strategy: 'nfp' },
+          { fabricWidthMm, gapMm, maxLengthMm, allowedRotations: modeToRotations(), generations, strategy: 'nfp', gravity, curveToleranceMm },
           (p) => (progress = p)
         );
         layout = await job.promise;
@@ -83,6 +95,10 @@
         layout = algorithm === 'fast'
           ? nestPieces(currentPattern, fabricWidthMm, gapMm)
           : nestPiecesTrueShape(currentPattern, { fabricWidthMm, gapMm, allowedRotations: modeToRotations(), generations });
+      }
+      if (layout.placements.length && matchEnabled) {
+        // plaid/print matching: align every piece to the repeat grid so the print lands identically
+        layout = matchLayoutToRepeat(layout, { cellWidthMm: matchCellWmm, cellHeightMm: matchCellHmm }, gapMm);
       }
       if (!layout.placements.length) toastError('No pieces to nest');
       else persist();
@@ -170,7 +186,9 @@
     if (!layout || !layout.placements.length) { toastError('No pieces to nest'); return; }
     try {
       toast(`Sending to ${machine.name}…`);
-      const res = markerToCutFile(layout, machine);
+      // fabric bow/skew compensation: TPS-warp the placements onto the measured fabric shape
+      const warped = warpLayoutToFabric(layout, { bowMm: fabricBowMm, skewMm: fabricSkewMm });
+      const res = markerToCutFile(warped, machine);
       for (const warning of res.warnings) toast(warning, 'info', 5000);
       const base = (currentPattern.name || 'pattern').replace(/\s+/g, '_');
       const slug = machine.name.replace(/\s+/g, '_');
@@ -234,6 +252,29 @@
           </label>
           <label class="flex flex-col gap-1">Search effort (generations): {generations}
             <input type="range" min="0" max="40" step="1" class="range range-xs" bind:value={generations} /></label>
+        {/if}
+        <label class="flex items-center gap-2 text-sm" title="Snap pieces onto the print's repeat grid so checks/stripes land identically on every piece">
+          <input type="checkbox" class="checkbox checkbox-sm" bind:checked={matchEnabled} /> Pattern matching
+        </label>
+        {#if matchEnabled}
+          <div class="grid grid-cols-2 gap-1">
+            <label class="flex flex-col gap-1 text-xs">Repeat W (mm)
+              <input type="number" min="1" step="1" class="input input-bordered input-xs" bind:value={matchCellWmm} /></label>
+            <label class="flex flex-col gap-1 text-xs">Repeat H (mm)
+              <input type="number" min="1" step="1" class="input input-bordered input-xs" bind:value={matchCellHmm} /></label>
+          </div>
+        {/if}
+        {#if algorithm === 'nfp'}
+          <label class="flex flex-col gap-1" title="Which fabric edge pieces snug toward">Gravity
+            <select class="select select-bordered select-sm" bind:value={gravity}>
+              <option value="bottom">Bottom</option>
+              <option value="top">Top</option>
+              <option value="left">Left</option>
+              <option value="right">Right</option>
+            </select>
+          </label>
+          <label class="flex flex-col gap-1" title="Simplification tolerance for curved cut outlines — coarser = faster nesting">Curve tolerance (mm)
+            <input type="number" min="0.2" max="5" step="0.2" class="input input-bordered input-sm" bind:value={curveToleranceMm} /></label>
         {/if}
         <label class="flex flex-col gap-1">Cut-off boundary
           <select class="select select-bordered select-sm" bind:value={cutOff}>
@@ -300,12 +341,25 @@
                   <label class="flex flex-col gap-1 text-xs">Speed (cm/s)
                     <input type="number" min="0" step="1" class="input input-bordered input-xs" value={machine.speed ?? ''}
                       onchange={(e) => patchMachine(machine.id, { speed: Number(e.currentTarget.value) || undefined })} /></label>
+                  <label class="flex flex-col gap-1 text-xs" title="Pull slit notches inward along the edge so the knife doesn't nick the corner">Slit offset (mm)
+                    <input type="number" min="0" step="0.5" class="input input-bordered input-xs" value={machine.slitNotchOffsetMm ?? 0}
+                      onchange={(e) => patchMachine(machine.id, { slitNotchOffsetMm: Math.max(0, Number(e.currentTarget.value) || 0) })} /></label>
+                  <label class="flex flex-col gap-1 text-xs" title="Raster export resolution for camera/projection workflows">Final px/mm
+                    <input type="number" min="0" step="0.5" class="input input-bordered input-xs" value={machine.finalPixelsPerMm ?? 0}
+                      onchange={(e) => patchMachine(machine.id, { finalPixelsPerMm: Math.max(0, Number(e.currentTarget.value) || 0) })} /></label>
                 </div>
                 <button class="btn btn-ghost btn-xs w-full text-error" onclick={() => deleteMachine(machine.id)}>Remove machine</button>
               </div>
             {/if}
             <button class="btn btn-ghost btn-xs w-full" onclick={addNewMachine}>+ Add machine</button>
           {/if}
+          <!-- fabric distortion compensation: cut files are TPS-warped onto the measured bow/skew -->
+          <div class="grid grid-cols-2 gap-1">
+            <label class="flex flex-col gap-1 text-xs" title="Lateral mid-length bow of the fabric on the table (mm)">Fabric bow (mm)
+              <input type="number" step="1" class="input input-bordered input-xs" bind:value={fabricBowMm} /></label>
+            <label class="flex flex-col gap-1 text-xs" title="Sideways drift of the far end relative to the near end (mm)">Fabric skew (mm)
+              <input type="number" step="1" class="input input-bordered input-xs" bind:value={fabricSkewMm} /></label>
+          </div>
           <button class="btn btn-secondary btn-sm w-full" onclick={sendToCuttingRoom} disabled={busy || !machine}>
             <span class="material-symbols-rounded text-base">send</span> Send to cutting room
           </button>

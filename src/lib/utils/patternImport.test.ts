@@ -109,3 +109,64 @@ describe('dxfToPattern line classification', () => {
     expect(p.paths.length).toBe(4); // only the piece's 4 edges — the open line was dropped
   });
 });
+
+describe('dxfToPattern extended entities (ARC/CIRCLE/SPLINE/TEXT/INSERT)', () => {
+  const arc = (layer: string) => dxf(0, 'ARC', 8, layer, 10, 0, 20, 0, 40, 50, 50, 0, 51, 90);
+  const circle = (layer: string) => dxf(0, 'CIRCLE', 8, layer, 10, 0, 20, 0, 40, 30);
+  const splineCtrl = dxf(
+    0, 'SPLINE', 8, '0', 70, 0, 71, 3, 73, 4,
+    10, 0, 20, 0, 10, 30, 20, 60, 10, 70, 20, 60, 10, 100, 20, 0
+  );
+  const text = dxf(0, 'TEXT', 8, '0', 10, 12, 20, 34, 40, 8, 50, 45, 1, 'Front panel');
+
+  it('ARC samples an open path from start to end angle', () => {
+    const p = dxfToPattern(entities(arc('0')));
+    expect(p.paths.length).toBe(1);
+    const xs = p.points.map((q) => q.x);
+    const ys = p.points.map((q) => q.y);
+    expect(Math.max(...xs)).toBeCloseTo(50, 0); // starts at (50,0)
+    expect(Math.max(...ys)).toBeCloseTo(50, 0); // ends at (0,50)
+  });
+
+  it('CIRCLE imports as a closed loop (a piece)', () => {
+    const p = dxfToPattern(entities(circle('0')));
+    expect(p.pieces.length).toBe(1);
+  });
+
+  it('SPLINE samples a smooth open path through its control hull', () => {
+    const p = dxfToPattern(entities(splineCtrl));
+    expect(p.paths.length).toBe(1);
+    expect(p.points.length).toBeGreaterThan(4); // sampled, not just control points
+    const ys = p.points.map((q) => q.y);
+    expect(Math.max(...ys)).toBeLessThanOrEqual(60); // stays inside the hull
+    expect(Math.max(...ys)).toBeGreaterThan(20); // but bends toward it
+  });
+
+  it('TEXT imports as a text annotation', () => {
+    const p = dxfToPattern(entities(text));
+    expect(p.texts.length).toBe(1);
+    expect(p.texts[0].value).toBe('Front panel');
+    expect(p.texts[0].x).toBe(12);
+    expect(p.texts[0].fontSize).toBe(8);
+    expect(p.texts[0].rotation).toBe(45);
+  });
+
+  it('INSERT expands a BLOCK transformed by position/scale/rotation; bare definitions don\'t import', () => {
+    const blocks = dxf(
+      0, 'SECTION', 2, 'BLOCKS',
+      0, 'BLOCK', 2, 'SQ',
+      0, 'LWPOLYLINE', 8, '0', 90, 4, 70, 1,
+      10, 0, 20, 0, 10, 10, 20, 0, 10, 10, 20, 10, 10, 0, 20, 10,
+      0, 'ENDBLK',
+      0, 'ENDSEC'
+    );
+    const insert = dxf(0, 'INSERT', 2, 'SQ', 10, 100, 20, 50, 41, 2, 42, 2, 50, 0);
+    const p = dxfToPattern(blocks + '\n' + entities(insert));
+    expect(p.pieces.length).toBe(1); // exactly one square: the placed instance
+    const xs = p.points.map((q) => q.x);
+    const ys = p.points.map((q) => q.y);
+    expect(Math.min(...xs)).toBeCloseTo(100, 5); // translated
+    expect(Math.max(...xs)).toBeCloseTo(120, 5); // 10 × scale 2
+    expect(Math.min(...ys)).toBeCloseTo(50, 5);
+  });
+});

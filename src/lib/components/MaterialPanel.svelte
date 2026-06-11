@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Pattern, Material, TextureSlot } from '$lib/types/pattern';
+  import MaterialPreview3D from '$lib/components/MaterialPreview3D.svelte';
 
   interface Props {
     currentPattern: Pattern;
@@ -111,6 +112,7 @@
     {#each currentPattern.materials as mat (mat.id)}
       {#if editingId === mat.id}
         <div class="bg-base-200 p-2 rounded space-y-1">
+          <MaterialPreview3D material={mat} />
           <input type="text" class="input input-bordered input-xs w-full" value={mat.name}
             oninput={(e) => patch(mat.id, (m) => ({ ...m, name: e.currentTarget.value }))} />
           <label class="flex items-center gap-1">Color
@@ -132,6 +134,9 @@
             <label class="col-span-2">Weight (g/m²)
               <input type="number" class="input input-bordered input-xs w-full" value={mat.weight}
                 oninput={(e) => patch(mat.id, (m) => ({ ...m, weight: +e.currentTarget.value }))} /></label>
+            <label class="col-span-2" title="3D-only visual shell: >0 extrudes the fabric front/back apart with a darkened edge strip">Visual thickness (mm, 3D)
+              <input type="number" step="0.5" min="0" class="input input-bordered input-xs w-full" value={mat.visualizationThickness ?? 0}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, visualizationThickness: Math.max(0, +e.currentTarget.value) }))} /></label>
           </div>
           <div class="font-semibold mt-1 opacity-70">Material shrinkage</div>
           <div class="grid grid-cols-2 gap-1">

@@ -17,6 +17,12 @@ export interface GarmentMatOpts {
   /** mirror instances have X-negated geometry (reversed winding), which inverts gl_FrontFacing — set
    *  true so the "face side" badge still lands on the outward surface. */
   labelFlipFace?: boolean;
+  /** pre-baked per-piece map (print anchored at origin + rotated by grain + internal lines). When
+   *  set it replaces the plain tiled slot image; its offset/repeat already map mm UVs onto it. */
+  pieceMap?: THREE.Texture;
+  /** visual shell offset along the vertex normal (meters, signed): visualizationThickness/2 pushes
+   *  the front face out and the back face in so the fabric reads with depth. */
+  shellOffset?: number;
 }
 
 /** True when this material wants its back face rendered with a different texture. */
@@ -46,6 +52,11 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
 
   // Texture maps. UVs are in mm, so repeat = 1/scale tiles every `scale` mm. Best-effort loads
   // (remote media may be unavailable offline / CORS-blocked) — failures keep the solid color/no-map.
+  if (opts.pieceMap) {
+    // baked per-piece map: grain-aligned print + internal lines, mm→bbox transform already on it
+    mat.map = opts.pieceMap;
+    mat.color.set('#ffffff');
+  }
   if (slot) {
     const scale = slot.scale && slot.scale > 0 ? slot.scale : 100;
     const loader = new THREE.TextureLoader();
@@ -55,7 +66,7 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
       tex.wrapT = THREE.RepeatWrapping;
       tex.repeat.set(1 / scale, 1 / scale);
     };
-    if (slot.url) {
+    if (slot.url && !opts.pieceMap) {
       loader.load(slot.url, (tex) => {
         tile(tex, true);
         mat.map = tex; mat.color.set('#ffffff'); mat.needsUpdate = true;
@@ -81,18 +92,29 @@ export function createGarmentMaterial(material: Material | undefined, flat: bool
   // Piece-name badge: composited into the lit diffuse colour using a per-piece `uvLabel` attribute
   // (0..1 across the piece's pattern bbox). Because it lives in the surface shading — not a floating
   // plane — it deforms with the cloth, shades under the scene lights, and tiles under the weave normal.
-  if (opts.labelTexture) {
+  // The optional shell offset (visual fabric thickness) shares the same compile hook.
+  const hasShell = opts.shellOffset !== undefined;
+  const shellU = { value: opts.shellOffset ?? 0 };
+  if (hasShell) mat.userData.shellUniform = shellU;
+  if (opts.labelTexture || hasShell) {
     const uniforms = {
-      uLabelMap: { value: opts.labelTexture },
-      uLabelMapBack: { value: opts.labelTextureBack ?? opts.labelTexture },
+      uLabelMap: { value: opts.labelTexture ?? null },
+      uLabelMapBack: { value: opts.labelTextureBack ?? opts.labelTexture ?? null },
       uLabelOpacity: { value: opts.labelOpacity ?? 1 },
       uLabelFlip: { value: opts.labelFlipFace ? 1 : 0 }
     };
-    mat.userData.labelUniforms = uniforms;
-    // Distinguish the label-injected program from a plain garment program with identical parameters,
+    if (opts.labelTexture) mat.userData.labelUniforms = uniforms;
+    // Distinguish injected programs from plain garment programs with identical parameters,
     // so three's program cache doesn't hand a label-less material the label shader (or vice versa).
-    mat.customProgramCacheKey = () => 'garment-label';
+    mat.customProgramCacheKey = () => `garment${opts.labelTexture ? '-label' : ''}${hasShell ? '-shell' : ''}`;
     mat.onBeforeCompile = (shader) => {
+      if (hasShell) {
+        shader.uniforms.uShellOffset = shellU;
+        shader.vertexShader = shader.vertexShader
+          .replace('#include <common>', '#include <common>\nuniform float uShellOffset;')
+          .replace('#include <begin_vertex>', '#include <begin_vertex>\n\ttransformed += objectNormal * uShellOffset;');
+      }
+      if (!opts.labelTexture) return;
       shader.uniforms.uLabelMap = uniforms.uLabelMap;
       shader.uniforms.uLabelMapBack = uniforms.uLabelMapBack;
       shader.uniforms.uLabelOpacity = uniforms.uLabelOpacity;
@@ -129,16 +151,24 @@ export function disposeGarmentMaterial(material: THREE.Material): void {
   m.dispose();
 }
 
-/** Skin-like avatar material. */
+/** Skin-like avatar material (the original's updateBodyMaterial: sheen tinted from the body color,
+ *  a whisper of transmission + IOR for the waxy sub-surface read). */
 export function createAvatarMaterial(bodyColor: string): THREE.MeshPhysicalMaterial {
+  const base = new THREE.Color(bodyColor || '#b58a6a');
   return new THREE.MeshPhysicalMaterial({
-    color: new THREE.Color(bodyColor || '#b58a6a'),
+    color: base,
     roughness: 0.55,
     metalness: 0,
     clearcoat: 0.25,
     clearcoatRoughness: 0.45,
     sheen: 0.15,
     sheenRoughness: 0.6,
+    sheenColor: base.clone().offsetHSL(0, -0.04, 0.02),
+    transmission: 0.02,
+    thickness: 0.4,
+    ior: 1.38,
+    reflectivity: 0.2,
+    envMapIntensity: 0.6,
     specularIntensity: 0.35,
     specularColor: new THREE.Color('#f5ede2'),
     side: THREE.DoubleSide

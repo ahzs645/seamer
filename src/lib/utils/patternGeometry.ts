@@ -304,7 +304,9 @@ export function pieceGeometrySignature(pattern: Pattern, piece: Piece): string {
   const g = piece.grainVector ?? { x: 0, y: 1 };
   // the mirror/fold line changes the 3D cloth (it reflects across it), so it must affect the signature
   const mirror = piece.mainPaths.find((pp) => pp.isMirrorLine)?.id ?? '';
-  return `${outline}#${internals}#g${r(g.x)},${r(g.y)}#pd${piece.settings3d.particleDistance ?? ''}#m${mirror}`;
+  // baked-texture inputs: which internal lines show in 3D (toggling must refresh the piece map)
+  const shown3d = piece.internalPaths.filter((pp) => pp.showIn3d !== false).map((pp) => pp.id).join(',');
+  return `${outline}#${internals}#g${r(g.x)},${r(g.y)}#pd${piece.settings3d.particleDistance ?? ''}#m${mirror}#i3d${shown3d}`;
 }
 
 // ---------------------------------------------------------------------------

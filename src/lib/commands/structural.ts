@@ -47,11 +47,32 @@ export function layerRename(p: Pattern, layerId: string, name: string): Pattern 
 }
 
 /** A per-layer style override applied to elements that don't set their own style. */
+export type LayerLineStyle = 'solid' | 'dashed' | 'dotted' | 'dash-dot' | 'dash-dot-dot';
+
 export interface LayerStyle {
-  color?: string; // hex stroke/fill override
+  color?: string; // hex stroke/fill override (light theme)
+  colorDark?: string; // dark-theme override (falls back to `color`)
   lineWidth?: number; // px
-  dashed?: boolean;
+  dashed?: boolean; // legacy boolean (lineStyle wins when set)
+  lineStyle?: LayerLineStyle; // the original's full line-style vocabulary
   opacity?: number; // 0..1
+}
+
+/** Canvas dash pattern for a layer style (legacy `dashed` maps to 'dashed'). */
+export function layerDashPattern(style: LayerStyle | null | undefined): number[] {
+  const s = style?.lineStyle ?? (style?.dashed ? 'dashed' : 'solid');
+  switch (s) {
+    case 'dashed': return [6, 4];
+    case 'dotted': return [1.5, 3];
+    case 'dash-dot': return [8, 3, 1.5, 3];
+    case 'dash-dot-dot': return [8, 3, 1.5, 3, 1.5, 3];
+    default: return [];
+  }
+}
+
+/** Resolve the layer stroke color for the current theme. */
+export function layerStrokeColor(style: LayerStyle | null | undefined, dark: boolean): string | undefined {
+  return dark ? (style?.colorDark ?? style?.color) : style?.color;
 }
 
 /** Set or clear (pass null) a layer's style override. */

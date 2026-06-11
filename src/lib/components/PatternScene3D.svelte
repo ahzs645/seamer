@@ -5,7 +5,7 @@
   import type { SimConfig } from '$lib/sim/config';
   import { isDarkTheme, toggleTheme, applyStoredTheme } from '$lib/utils/theme';
   import { pieceGeometrySignature, indexPoints, placedPoints } from '$lib/utils/patternGeometry';
-  import { show3dStats, simAnchors, selectedTool, seamTool, selectedSeamId } from '$lib/stores/pattern';
+  import { show3dStats, simAnchors, selectedTool, seamTool, selectedSeamId, bodyZoomRequest } from '$lib/stores/pattern';
   import { get } from 'svelte/store';
   import { applySeamPick, type SeamPick } from '$lib/utils/seamTool';
   import { toast } from '$lib/stores/toast';
@@ -121,7 +121,10 @@
     dark = isDarkTheme();
     renderer = new PatternRenderer(containerEl);
     webgpu = renderer.webgpuAvailable();
-    renderer.onStatus = (s, msg) => { status = s; statusMessage = msg ?? ''; };
+    renderer.onStatus = (s, msg) => {
+      status = s; statusMessage = msg ?? '';
+      if (s === 'ready') stretchError = renderer?.getStretchError() ?? null;
+    };
     renderer.onModeChange = (m, piece, kind) => { sceneMode = m; selectedPiece = piece; arrangeKind = kind ?? null; };
     renderer.onSelectPiece = (id) => { onpieceselect?.(id); };
     renderer.onCameraChanged = (pos, target, fov) => { oncamerachange?.(pos, target, fov); };
@@ -222,6 +225,18 @@
     renderer?.setSeamToolState(active ? state : null, tool === 'seam-multi' ? 'multi' : 'single');
   });
 
+  // a seam selected in the SeamPanel/ObjectBrowser displays in 3D even with "Show seams" off
+  $effect(() => { renderer?.setSelectedSeam($selectedSeamId); });
+
+  // BodyPanel measurement clicks: fly the camera to the measurement's framing AND draw its
+  // on-mesh segment (clicking the same one again hides it).
+  $effect(() => {
+    const name = $bodyZoomRequest;
+    if (!name || !renderer) return;
+    if (renderer.showBodyMeasurement(name)) renderer.zoomToBodyMeasurement(name);
+    bodyZoomRequest.set(null);
+  });
+
   let hoveredArrangementPoint = $state<string | null>(null);
 
   // freeze/unfreeze the active piece (3D selection first, falling back to the 2D selection)
@@ -254,6 +269,12 @@
 
   // arrangement-point overlay toggle
   $effect(() => { renderer?.setShowArrangementPoints(currentPattern.settings3d.showArrangementPoints ?? false); });
+
+  // render quality: SMAA supersample scale + "Force low-performance mode"
+  $effect(() => {
+    const s = currentPattern.settings3d;
+    renderer?.setRenderQualityOptions({ forceLowEnd: s.forceLowEndHardware, smaaScale: s.smaaScale });
+  });
 
   // 3D measurements: mirror the 2D Measure tool's distance measurements onto the draped garment
   $effect(() => {
@@ -343,6 +364,7 @@
 
   // Simulation controls: expose the solver parameters (matches the source's "Simulation controls").
   let showSimPanel = $state(false);
+  let stretchError = $state<number | null>(null);
   let simCfg = $state<SimConfig | null>(null);
   let cameraFov = $state(54);
   function toggleSimPanel() {
@@ -350,6 +372,8 @@
     if (showSimPanel && renderer) { simCfg = renderer.getSimConfig(); cameraFov = renderer.getCameraFov(); }
   }
   function setFov(v: number) { cameraFov = v; renderer?.setCameraFov(v); }
+  // 36mm-frame equivalent focal length for the current FOV (the original's Focal(mm) slider)
+  const focalMm = $derived(18 / Math.tan(((cameraFov / 2) * Math.PI) / 180));
   function setSim(patch: Partial<SimConfig>) {
     if (!renderer || !simCfg) return;
     simCfg = { ...simCfg, ...patch };
@@ -467,6 +491,11 @@
       <div class="flex items-center justify-between"><span class="font-bold">Simulation controls</span>
         <button class="btn btn-ghost btn-xs btn-circle" onclick={() => (showSimPanel = false)} aria-label="Close">✕</button>
       </div>
+      {#if stretchError !== null}
+        <div class="flex items-center justify-between opacity-80" title="RMS deviation of every cloth edge from its rest length at the last settled drape">
+          <span>RMS stretch error</span><span class="tabular-nums">{(stretchError * 100).toFixed(1)}%</span>
+        </div>
+      {/if}
       <label class="flex items-center justify-between gap-2"><span>Self-collision</span>
         <input type="checkbox" class="toggle toggle-xs" checked={simCfg.handleSelfCollisions} onchange={(e) => setSim({ handleSelfCollisions: e.currentTarget.checked })} /></label>
       <label class="flex items-center justify-between gap-2"><span>Body collision</span>
@@ -505,6 +534,10 @@
         <label class="flex flex-col gap-0.5">
           <span class="flex justify-between"><span>Camera FOV</span><span class="opacity-60">{cameraFov.toFixed(0)}°</span></span>
           <input type="range" class="range range-xs" min="20" max="90" step="1" value={cameraFov} oninput={(e) => setFov(parseFloat(e.currentTarget.value))} />
+          <!-- photographic twin of the FOV slider: 36mm-equivalent focal length (drives DoF aperture) -->
+          <span class="flex justify-between"><span>Focal length</span><span class="opacity-60">{focalMm.toFixed(0)} mm</span></span>
+          <input type="range" class="range range-xs" min="24" max="200" step="1" value={focalMm}
+            oninput={(e) => setFov((2 * Math.atan(18 / Math.max(24, parseFloat(e.currentTarget.value)))) * 180 / Math.PI)} />
         </label>
       </div>
       <div class="border-t border-base-300 pt-2 space-y-1">

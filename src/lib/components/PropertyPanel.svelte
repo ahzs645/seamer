@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Pattern, ConstrainablePoint, ConstrainablePath, Piece, PieceArrangement, PiecePath, GradeSize, PointConstraint, SeamCornerJoinType, Notch, NotchType } from '$lib/types/pattern';
-  import { selectedPointIds, selectedPathIds, selectedPieceIds, panelRequest } from '$lib/stores/pattern';
+  import { selectedPointIds, selectedPathIds, selectedPieceIds, panelRequest, pathPickRequest } from '$lib/stores/pattern';
   import FormulaDialog from '$lib/components/FormulaDialog.svelte';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import {
@@ -10,6 +10,7 @@
   import { MATERIAL_PRESETS, getPreset } from '$lib/data/materialPresets';
   import { variableReorder, variableSetOptions, imageUpdate } from '$lib/commands/structural';
   import { rebakeArc, arcCenter } from '$lib/utils/arcParametric';
+  import { formulaSet } from '$lib/commands/create';
   import { isLinkedPath, linkSourceCandidates, linkPath, unlinkPath, syncLinkedPaths } from '$lib/utils/linkedPaths';
 
   interface Props {
@@ -238,6 +239,19 @@
     { id: 'material', icon: 'texture', title: 'Material' },
     { id: '3d', icon: 'view_in_ar', title: '3D Settings' }
   ];
+
+  // ---- property formulas (the original's *Formula fields) ------------------
+  // Compact inline editor: the ƒ button toggles a formula input that overrides the numeric field.
+  let formulaEditKey = $state<string | null>(null);
+  function setPathFormula(ppId: string, field: 'seamAllowance' | 'cornerRadius' | 'seamCornerLength' | 'seamCornerMaxLength', formula: string) {
+    onchange(formulaSet($state.snapshot(currentPattern) as Pattern, 'piecePath', ppId, field, formula, 'mm'), 'Edit formula');
+  }
+  function setPieceFormula(pieceId: string, field: 'rotation' | 'grain' | 'condition', formula: string) {
+    onchange(formulaSet($state.snapshot(currentPattern) as Pattern, 'piece', pieceId, field, formula, 'degrees'), 'Edit formula');
+  }
+  function setNotchFormula(notchId: string, formula: string) {
+    onchange(formulaSet($state.snapshot(currentPattern) as Pattern, 'notch', notchId, 'distance', formula, 'mm'), 'Edit formula');
+  }
 
   // ---- piece points (piece-local construction points) ----------------------
   function updatePiecePointLocal(id: string, patch: { name?: string; x?: number; y?: number }) {
@@ -759,10 +773,16 @@
         {#if axisCandidates.length === 0}
           <p class="text-[11px] opacity-50">Draw another line to use as the mirror axis, then select this edge again.</p>
         {:else}
-          <select class="select select-bordered select-xs w-full" value={mirrorAxisId} onchange={(e) => (mirrorAxisId = e.currentTarget.value)}>
-            <option value="">Choose axis line…</option>
-            {#each axisCandidates as ax}<option value={ax.id}>{ax.name || ax.id.slice(0, 8)}</option>{/each}
-          </select>
+          <div class="flex items-center gap-1">
+            <select class="select select-bordered select-xs flex-1" value={mirrorAxisId} onchange={(e) => (mirrorAxisId = e.currentTarget.value)}>
+              <option value="">Choose axis line…</option>
+              {#each axisCandidates as ax}<option value={ax.id}>{ax.name || ax.id.slice(0, 8)}</option>{/each}
+            </select>
+            <button class="btn btn-xs px-1" title="Click the axis path on the canvas (the original's path picker)"
+              onclick={() => pathPickRequest.set({ label: 'Click on a path to select the mirror axis', onPick: (id) => (mirrorAxisId = id) })}>
+              <span class="material-symbols-rounded text-sm">colorize</span>
+            </button>
+          </div>
           <button class="btn btn-xs btn-primary btn-block" disabled={!mirrorAxisId} onclick={createMirror}>Create mirrored edge</button>
           <p class="text-[11px] opacity-50">Adds a referenced edge whose points stay reflected across the axis (a parametric symmetry constraint).</p>
         {/if}
@@ -861,14 +881,36 @@
 
             {:else if s.id === 'orientation'}
               <label class="flex flex-col gap-0.5">Rotation (°)
-                <input type="number" class="input input-bordered input-xs" value={piece.rotation} step="1"
-                  oninput={(e) => updatePiece((p) => ({ ...p, rotation: parseFloat(e.currentTarget.value) || 0 }))} /></label>
+                <span class="flex items-center gap-1">
+                  <input type="number" class="input input-bordered input-xs flex-1" value={piece.rotation} step="1" disabled={!!piece.rotationFormula}
+                    oninput={(e) => updatePiece((p) => ({ ...p, rotation: parseFloat(e.currentTarget.value) || 0 }))} />
+                  <button class="btn btn-xs px-1" class:btn-accent={!!piece.rotationFormula} title="Drive rotation with a formula (degrees)"
+                    onclick={() => (formulaEditKey = formulaEditKey === `rot:${piece.id}` ? null : `rot:${piece.id}`)}>ƒ</button>
+                </span></label>
+              {#if formulaEditKey === `rot:${piece.id}`}
+                <input type="text" class="input input-bordered input-xs w-full font-mono" placeholder="rotation formula (degrees) — empty clears" value={piece.rotationFormula?.formula ?? ''}
+                  onchange={(e) => setPieceFormula(piece.id, 'rotation', e.currentTarget.value)} />
+              {/if}
               <div class="grid grid-cols-2 gap-1">
-                <label>Grain X<input type="number" step="0.1" class="input input-bordered input-xs w-full" value={piece.grainVector.x}
+                <label>Grain X<input type="number" step="0.1" class="input input-bordered input-xs w-full" value={piece.grainVector.x} disabled={!!piece.grainFormula}
                   oninput={(e) => updatePiece((p) => ({ ...p, grainVector: { ...p.grainVector, x: parseFloat(e.currentTarget.value) || 0 } }))} /></label>
-                <label>Grain Y<input type="number" step="0.1" class="input input-bordered input-xs w-full" value={piece.grainVector.y}
+                <label>Grain Y<input type="number" step="0.1" class="input input-bordered input-xs w-full" value={piece.grainVector.y} disabled={!!piece.grainFormula}
                   oninput={(e) => updatePiece((p) => ({ ...p, grainVector: { ...p.grainVector, y: parseFloat(e.currentTarget.value) || 0 } }))} /></label>
               </div>
+              <label class="flex items-center justify-between gap-2 text-[11px]">Grain angle formula (°)
+                <button class="btn btn-xs px-1" class:btn-accent={!!piece.grainFormula}
+                  onclick={() => (formulaEditKey = formulaEditKey === `grain:${piece.id}` ? null : `grain:${piece.id}`)}>ƒ</button></label>
+              {#if formulaEditKey === `grain:${piece.id}`}
+                <input type="text" class="input input-bordered input-xs w-full font-mono" placeholder="grain angle formula (degrees) — empty clears" value={piece.grainFormula?.formula ?? ''}
+                  onchange={(e) => setPieceFormula(piece.id, 'grain', e.currentTarget.value)} />
+              {/if}
+              <label class="flex items-center justify-between gap-2 text-[11px]" title="Condition formula: evaluates to 0 → piece hidden">Condition formula
+                <button class="btn btn-xs px-1" class:btn-accent={!!piece.conditionFormula}
+                  onclick={() => (formulaEditKey = formulaEditKey === `cond:${piece.id}` ? null : `cond:${piece.id}`)}>ƒ</button></label>
+              {#if formulaEditKey === `cond:${piece.id}`}
+                <input type="text" class="input input-bordered input-xs w-full font-mono" placeholder="condition (0 hides the piece) — empty clears" value={piece.conditionFormula?.formula ?? ''}
+                  onchange={(e) => setPieceFormula(piece.id, 'condition', e.currentTarget.value)} />
+              {/if}
 
             {:else if s.id === 'piecePoints'}
               {#each piece.piecePoints ?? [] as pt (pt.id)}
@@ -911,10 +953,13 @@
                     </div>
 
                     {#if s.id === 'internal'}
-                      <div class="border-t border-base-200 px-2 py-1.5 bg-base-100">
+                      <div class="border-t border-base-200 px-2 py-1.5 bg-base-100 space-y-1">
                         <label class="flex items-center justify-between gap-2 text-[11px]">Fold angle (°) — dart/pleat dihedral
                           <input type="number" step="1" class="input input-bordered input-xs w-20" value={pp.foldAngle ?? 0}
                             oninput={(e) => updateInternalPath(pp.id, { foldAngle: parseFloat(e.currentTarget.value) || 0 })} /></label>
+                        <label class="flex items-center gap-2 text-[11px]" title="Bake this style line into the 3D fabric texture">
+                          <input type="checkbox" class="checkbox checkbox-xs" checked={pp.showIn3d !== false}
+                            onchange={(e) => updateInternalPath(pp.id, { showIn3d: e.currentTarget.checked }, 'Show line in 3D')} /> Show in 3D</label>
                       </div>
                     {/if}
 
@@ -955,8 +1000,16 @@
                             onchange={(e) => updateMainPath(pp.id, e.currentTarget.checked ? { seamAllowance: piece.seamAllowance ?? currentPattern.seamAllowance } : { seamAllowance: undefined }, 'Override edge allowance')} /> Override seam allowance on this edge</label>
                           {#if pp.seamAllowance !== undefined}
                             <label class="flex items-center justify-between gap-2 text-[11px]">Edge allowance ({unitLabel})
-                              <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(pp.seamAllowance).toFixed(2)}
-                                oninput={(e) => updateMainPath(pp.id, { seamAllowance: fromUnit(parseFloat(e.currentTarget.value) || 0) }, 'Edit edge allowance')} /></label>
+                              <span class="flex items-center gap-1">
+                                <input type="number" min="0" step="0.1" class="input input-bordered input-xs w-20" value={toUnit(pp.seamAllowance).toFixed(2)} disabled={!!pp.seamAllowanceFormula}
+                                  oninput={(e) => updateMainPath(pp.id, { seamAllowance: fromUnit(parseFloat(e.currentTarget.value) || 0) }, 'Edit edge allowance')} />
+                                <button class="btn btn-xs px-1" class:btn-accent={!!pp.seamAllowanceFormula} title="Drive with a formula (variables/measurements by name; mm)"
+                                  onclick={() => (formulaEditKey = formulaEditKey === `sa:${pp.id}` ? null : `sa:${pp.id}`)}>ƒ</button>
+                              </span></label>
+                            {#if formulaEditKey === `sa:${pp.id}`}
+                              <input type="text" class="input input-bordered input-xs w-full font-mono" placeholder="formula (mm) — empty clears" value={pp.seamAllowanceFormula?.formula ?? ''}
+                                onchange={(e) => setPathFormula(pp.id, 'seamAllowance', e.currentTarget.value)} />
+                            {/if}
                           {/if}
                         </div>
 
@@ -981,8 +1034,10 @@
                               <div class="flex items-center gap-1">
                                 {#if anchored}
                                   <input type="number" min="0" step="0.1" class="input input-bordered input-xs flex-1" title="Distance from point ({unitLabel})"
-                                    value={toUnit((n.distance as number) ?? 0).toFixed(1)}
+                                    value={toUnit((n.distance as number) ?? 0).toFixed(1)} disabled={!!n.distanceFormula}
                                     oninput={(e) => updateNotch(pp, n.id as string, { distance: fromUnit(parseFloat(e.currentTarget.value) || 0) })} />
+                                  <button class="btn btn-xs px-1" class:btn-accent={!!n.distanceFormula} title="Drive the distance with a formula (mm)"
+                                    onclick={() => (formulaEditKey = formulaEditKey === `nd:${n.id}` ? null : `nd:${n.id}`)}>ƒ</button>
                                 {:else}
                                   <input type="range" min="0" max="1" step="0.01" class="range range-xs flex-1" value={typeof n.position === 'number' ? n.position : 0.5}
                                     title="Position along edge" oninput={(e) => updateNotch(pp, n.id as string, { position: parseFloat(e.currentTarget.value) })} />
@@ -997,6 +1052,10 @@
                                 <button class="material-symbols-rounded text-base opacity-60 hover:text-error" title="Remove notch" aria-label="Remove notch"
                                   onclick={() => removeNotch(pp, n.id as string)}>delete</button>
                               </div>
+                              {#if anchored && formulaEditKey === `nd:${n.id}`}
+                                <input type="text" class="input input-bordered input-xs w-full font-mono" placeholder="distance formula (mm) — empty clears" value={n.distanceFormula?.formula ?? ''}
+                                  onchange={(e) => setNotchFormula(n.id as string, e.currentTarget.value)} />
+                              {/if}
                               <label class="flex items-center justify-between gap-2 text-[10px] opacity-80">From point
                                 <select class="select select-bordered select-xs w-28" value={n.referencePointId ?? ''}
                                   onchange={(e) => {
@@ -1070,6 +1129,22 @@
         <label>X (mm)<input type="number" class="input input-bordered input-xs w-full" value={ep.x.toFixed(1)} disabled={!!cn} oninput={(e) => updatePoint('x', parseFloat(e.currentTarget.value) || 0)} step="0.1" /></label>
         <label>Y (mm)<input type="number" class="input input-bordered input-xs w-full" value={ep.y.toFixed(1)} disabled={!!cn} oninput={(e) => updatePoint('y', parseFloat(e.currentTarget.value) || 0)} step="0.1" /></label>
       </div>
+
+      {#if currentPattern.gradingProfile?.rulTable}
+        <label class="flex items-center justify-between gap-2 text-[11px]"
+          title="Bind this point to a grade rule from the imported RUL table — it shifts per size in the grading overlay (0 = unbound)">
+          Grade rule # ({currentPattern.gradingProfile.rulTable.name})
+          <input type="number" min="0" step="1" class="input input-bordered input-xs w-16"
+            value={currentPattern.gradingProfile.rulAnchors?.find((a) => a.pointId === ep.id)?.ruleNumber ?? 0}
+            onchange={(e) => {
+              const rule = Math.max(0, Math.round(parseFloat(e.currentTarget.value) || 0));
+              const gp = currentPattern.gradingProfile!;
+              const anchors = (gp.rulAnchors ?? []).filter((a) => a.pointId !== ep.id);
+              if (rule > 0) anchors.push({ pointId: ep.id, ruleNumber: rule });
+              onchange({ ...currentPattern, gradingProfile: { ...gp, rulAnchors: anchors }, hasChanged: true }, 'Bind grade rule');
+            }} />
+        </label>
+      {/if}
 
       <hr class="border-base-200" />
       <h5 class="font-semibold">Construction</h5>
@@ -1169,6 +1244,10 @@
                   oninput={(e) => updateSettings3D({ gravity: [currentPattern.settings3d.gravity[0], parseFloat(e.currentTarget.value) || 0, currentPattern.settings3d.gravity[2]] })} /></label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.handleSelfCollisions} onchange={(e) => updateSettings3D({ handleSelfCollisions: e.currentTarget.checked })} /> Self-collisions</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.forceLowEndHardware} onchange={(e) => updateSettings3D({ forceLowEndHardware: e.currentTarget.checked })} /> Force low-end hardware</label>
+              <label class="flex items-center gap-2" title="Debug: pin each piece's topmost particles while simulating"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.fixTop ?? false} onchange={(e) => updateSettings3D({ fixTop: e.currentTarget.checked })} /> Fix top (debug pin)</label>
+              <label class="flex items-center justify-between gap-2" title="Override the particle spacing of EVERY piece (0 = per-piece settings)">Global particle distance (mm)
+                <input type="number" min="0" step="1" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.globalParticleDistanceOverride ?? 0}
+                  onchange={(e) => updateSettings3D({ globalParticleDistanceOverride: Math.max(0, parseFloat(e.currentTarget.value) || 0) })} /></label>
               <label class="flex items-center gap-2" title="Experimental: also drape an X-mirrored copy of each left/right-paired piece"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.drapeMirroredPieces ?? false} onchange={(e) => updateSettings3D({ drapeMirroredPieces: e.currentTarget.checked })} /> Drape mirrored pieces (experimental)</label>
               <hr class="border-base-200" />
               <span class="text-xs font-semibold opacity-70">Overlays</span>
@@ -1286,7 +1365,7 @@
               <div class="grid grid-cols-2 gap-1">
                 <label>Gender
                   <select class="select select-bordered select-xs w-full" value={currentPattern.body.gender} onchange={(e) => updateBody({ gender: e.currentTarget.value })}>
-                    <option value="female">female</option><option value="male">male</option></select></label>
+                    <option value="female">female</option><option value="male">male</option><option value="neutral">neutral</option></select></label>
                 <label>Units
                   <select class="select select-bordered select-xs w-full" value={currentPattern.body.unitType} onchange={(e) => updateBody({ unitType: e.currentTarget.value })}>
                     <option value="imperial">imperial</option><option value="metric">metric</option></select></label>

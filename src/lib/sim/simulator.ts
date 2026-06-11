@@ -67,7 +67,8 @@ export function prepareCloth(
     // POSITIONS via the source's 3-way reuse below. Building topology from the saved blob instead
     // (buildSavedCloth) leaves edgeParticles empty — seams can't link such pieces, and a free-running
     // garment falls apart (it only held together via the anchor hold + proximity sewing).
-    const cloth = buildPieceCloth(pattern, piece, undefined, edgeIntervals);
+    const pdOverride = pattern.settings3d.globalParticleDistanceOverride;
+    const cloth = buildPieceCloth(pattern, piece, pdOverride && pdOverride > 0 ? pdOverride : undefined, edgeIntervals);
     if (!cloth || cloth.mesh.points.length < 3) {
       // Fallback for degenerate 2D path data: rebuild from the saved blob (no edgeParticles —
       // the proximity-sewing pass covers these).
@@ -111,6 +112,20 @@ export function prepareCloth(
   // (source parity).
   const proximitySeams = arranged.some((a) => a.cloth.edgeParticles.size === 0);
   const simData = buildSimData(pattern, arranged, { proximitySeams });
+  // fixTop (debug): pin each piece's topmost particles in place (invMass 0) while simulating
+  if (pattern.settings3d.fixTop) {
+    for (const sp of simData.pieces) {
+      let maxY = -Infinity;
+      for (let i = 0; i < sp.count; i++) maxY = Math.max(maxY, simData.positions[(sp.start + i) * 4 + 1]);
+      for (let i = 0; i < sp.count; i++) {
+        const g = sp.start + i;
+        if (simData.positions[g * 4 + 1] >= maxY - 0.02) {
+          simData.positions[g * 4 + 3] = 0;
+          simData.arrangedPositions[g * 4 + 3] = 0;
+        }
+      }
+    }
+  }
   const body = packBodyMesh(init.avatarVertices, init.avatarIndices);
   return { simData, body };
 }

@@ -2,6 +2,7 @@
   import type { Pattern } from '$lib/types/pattern';
   import { patternBoundsMm, printPatternTiled, patternToPDF, downloadBlob, TILE_OVERLAP_MM } from '$lib/utils/exporters';
   import { PAGE_SIZES_MM, tilePageCount } from '$lib/utils/pdf';
+  import { nestPatternForPaper } from '$lib/utils/markerLayout';
   import { toastSuccess, toastError } from '$lib/stores/toast';
 
   let { pattern, patternName = 'Pattern', onclose }:
@@ -16,12 +17,19 @@
   let marginMm = $state(10);
   let orientation = $state<'portrait' | 'landscape'>('portrait');
   let scalePct = $state(100); // 100% = true scale
+  let renest = $state(false); // re-nest pieces onto the paper strip to minimize pages
 
-  const contentBounds = $derived(patternBoundsMm(pattern));
   const pageDims = $derived.by(() => {
     const [w, h] = PAGE_SIZES_MM[paperSize] ?? PAGE_SIZES_MM.A4;
     return orientation === 'landscape' ? { w: h, h: w } : { w, h };
   });
+  // the pattern actually printed: re-nested onto the printable width when requested
+  const printedPattern = $derived.by(() => {
+    if (!renest) return pattern;
+    const usable = (pageDims.w - 2 * marginMm) / (scalePct / 100);
+    return nestPatternForPaper(pattern, usable);
+  });
+  const contentBounds = $derived(patternBoundsMm(printedPattern));
   const pageCount = $derived(tilePageCount(
     contentBounds.width * (scalePct / 100),
     contentBounds.height * (scalePct / 100),
@@ -29,7 +37,7 @@
   ));
 
   function doPrint() {
-    printPatternTiled(pattern, {
+    printPatternTiled(printedPattern, {
       pageWmm: pageDims.w, pageHmm: pageDims.h, marginMm,
       scale: scalePct / 100, title: patternName
     });
@@ -39,7 +47,7 @@
   async function doExportPDF() {
     const base = patternName.replace(/\s+/g, '_') || 'pattern';
     try {
-      const blob = await patternToPDF(pattern, {
+      const blob = await patternToPDF(printedPattern, {
         page: paperSize, landscape: orientation === 'landscape',
         marginMm, overlapMm: TILE_OVERLAP_MM, scale: scalePct / 100,
         tile: true, title: patternName
@@ -84,6 +92,11 @@
     <label class="form-control w-full mb-3">
       <div class="label py-1"><span class="label-text">Scale (%)</span><span class="label-text-alt opacity-60">100 = true scale</span></div>
       <input type="number" min="1" max="400" step="1" class="input input-sm input-bordered w-full" bind:value={scalePct} />
+    </label>
+
+    <label class="flex items-center gap-2 mb-3 text-sm" title="Pack the pieces onto the printable paper width before tiling (fewer pages)">
+      <input type="checkbox" class="checkbox checkbox-sm" bind:checked={renest} />
+      Re-nest pieces to minimize pages
     </label>
 
     <div class="text-sm bg-base-200 rounded p-2 mb-4">

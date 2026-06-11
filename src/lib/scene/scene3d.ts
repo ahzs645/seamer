@@ -5,6 +5,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import { OBJExporter } from 'three/examples/jsm/exporters/OBJExporter.js';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
@@ -16,13 +19,17 @@ import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import type { Pattern, Material } from '$lib/types/pattern';
 import { AvatarController } from '$lib/model/avatarController';
 import { buildCylinders, type CylinderFrame } from '$lib/geometry/cylinders';
+import { arrangeParticles } from '$lib/geometry/arrangement';
 import { prepareCloth, ClothSimulation, type PreparedCloth } from '$lib/sim/simulator';
 import { SIM_CONFIG, type SimConfig } from '$lib/sim/config';
 import { cylinderRefit } from '$lib/sim/cylinderRefit';
 import { requestClothDevice, isWebGPUAvailable } from '$lib/sim/webgpu/device';
 import { createGarmentMaterial, createAvatarMaterial, hasSeparateBack, disposeGarmentMaterial } from './materials';
+import { createPieceTexture, pieceNeedsBake } from './pieceTexture';
+import { indexPoints, pieceInternalPolylines, seamColor } from '$lib/utils/patternGeometry';
 import { isDarkTheme, onThemeChange } from '$lib/utils/theme';
 import { samePick, type SeamPick, type SeamToolState } from '$lib/utils/seamTool';
+import { measurementSegment } from '$lib/model/bodyMeasurements3d';
 
 export type RendererStatus = 'idle' | 'loading' | 'ready' | 'simulating' | 'error';
 
@@ -33,6 +40,10 @@ interface ClothMeshEntry {
   geometry: THREE.BufferGeometry;
   mesh: THREE.Mesh;
   backMesh?: THREE.Mesh; // optional separate back-face mesh (shares geometry); for distinct back textures
+  // visual fabric thickness (visualizationThickness > 0): the edge strip closing the front/back shells
+  sideMesh?: THREE.Mesh;
+  sidePairs?: number[]; // flat LOCAL index pairs of boundary edges
+  shellM?: number; // half thickness in meters
 }
 
 // One movable piece in the pre-simulation arrangement editor: its flat-on-body geometry is centred
@@ -182,18 +193,22 @@ export class PatternRenderer {
    */
   setHighlightedPiece(id: string | null): void {
     this.highlightId = id;
+    this.invalidate();
+    // The original keeps the fabric colour and draws a resolution-aware fat-line outline instead
+    // of tinting; a faint emissive remains as a fallback cue on very dense meshes.
     const HI = 0x1d4ed8;
     for (const e of this.clothMeshes) {
       const m = e.mesh.material as THREE.MeshPhysicalMaterial;
       if (!m.emissive) continue;
       m.emissive.setHex(e.pieceId === id ? HI : 0x000000);
-      m.emissiveIntensity = e.pieceId === id ? 0.45 : 1;
+      m.emissiveIntensity = e.pieceId === id ? 0.12 : 1;
       if (e.backMesh) {
         const bm = e.backMesh.material as THREE.MeshPhysicalMaterial;
         bm.emissive.setHex(e.pieceId === id ? HI : 0x000000);
-        bm.emissiveIntensity = e.pieceId === id ? 0.45 : 1;
+        bm.emissiveIntensity = e.pieceId === id ? 0.12 : 1;
       }
     }
+    this.rebuildSelectionOutline();
     if (this.mode === 'arrange') {
       const idx = this.arrangeEntries.findIndex((e) => e.pieceId === id);
       // applying an EXTERNAL selection: don't echo onSelectPiece back out, or the
@@ -207,12 +222,86 @@ export class PatternRenderer {
     }
   }
 
+  // ---- Selected-piece outline: fat lines along the piece's boundary edges (the original's
+  // createOutlineMesh / setOutlineResolution — keeps the fabric colour, draws a crisp edge). ----
+  private outlineMesh: LineSegments2 | null = null;
+  private outlineMat: LineMaterial | null = null;
+  private outlinePairs: number[] = []; // flat [a0,b0,...] global particle indices
+
+  private clearSelectionOutline(): void {
+    if (!this.outlineMesh) return;
+    this.clothGroup.remove(this.outlineMesh);
+    this.outlineMesh.geometry.dispose();
+    this.outlineMat?.dispose();
+    this.outlineMesh = null;
+    this.outlineMat = null;
+    this.outlinePairs = [];
+  }
+
+  private rebuildSelectionOutline(): void {
+    this.clearSelectionOutline();
+    const id = this.highlightId;
+    if (!id || !this.prepared) return;
+    const sp = this.prepared.simData.pieces.find((p) => p.pieceId === id);
+    if (!sp) return;
+    // boundary edges = triangle edges used exactly once
+    const counts = new Map<string, [number, number]>();
+    const seen = new Map<string, number>();
+    for (let t = 0; t < sp.triangles.length; t += 3) {
+      const v = [sp.triangles[t], sp.triangles[t + 1], sp.triangles[t + 2]];
+      for (let e = 0; e < 3; e++) {
+        const a = v[e], b = v[(e + 1) % 3];
+        const k = `${Math.min(a, b)}_${Math.max(a, b)}`;
+        seen.set(k, (seen.get(k) ?? 0) + 1);
+        counts.set(k, [a, b]);
+      }
+    }
+    this.outlinePairs = [];
+    for (const [k, n] of seen) {
+      if (n !== 1) continue;
+      const [a, b] = counts.get(k)!;
+      this.outlinePairs.push(a, b);
+    }
+    if (this.outlinePairs.length === 0) return;
+    const geo = new LineSegmentsGeometry();
+    geo.setPositions(new Float32Array(this.outlinePairs.length * 3));
+    this.outlineMat = new LineMaterial({ color: 0x1d4ed8, linewidth: 4, transparent: true, opacity: 0.95 });
+    this.updateOutlineResolution();
+    this.outlineMesh = new LineSegments2(geo, this.outlineMat);
+    this.outlineMesh.frustumCulled = false;
+    this.outlineMesh.renderOrder = 10;
+    this.clothGroup.add(this.outlineMesh);
+    this.updateSelectionOutlinePositions();
+  }
+
+  private updateOutlineResolution(): void {
+    if (!this.outlineMat) return;
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    this.outlineMat.resolution.copy(size);
+  }
+
+  private updateSelectionOutlinePositions(): void {
+    if (!this.outlineMesh || this.outlinePairs.length === 0) return;
+    const pos = this.lastClothPositions ?? this.prepared?.simData.positions;
+    if (!pos) return;
+    const arr = new Float32Array(this.outlinePairs.length * 3);
+    for (let k = 0; k < this.outlinePairs.length; k++) {
+      const g = this.outlinePairs[k];
+      arr[k * 3] = pos[g * 4];
+      arr[k * 3 + 1] = pos[g * 4 + 1];
+      arr[k * 3 + 2] = pos[g * 4 + 2];
+    }
+    (this.outlineMesh.geometry as LineSegmentsGeometry).setPositions(arr);
+  }
+
   constructor(container: HTMLElement, opts: { preserveDrawingBuffer?: boolean } = {}) {
     this.container = container;
     const w = Math.max(1, container.clientWidth);
     const h = Math.max(1, container.clientHeight);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: opts.preserveDrawingBuffer ?? false });
+    this.isMobile = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+    this.lowEnd = this.detectLowEndHardware();
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(w, h);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -247,8 +336,82 @@ export class PatternRenderer {
     this.applySceneTheme(isDarkTheme());
     this.themeUnsub = onThemeChange(() => this.applySceneTheme(isDarkTheme()));
 
+    this.applyRenderQuality();
+    // orbit/zoom/pan must repaint under render-on-demand
+    this.controls.addEventListener('change', () => this.invalidate());
+
     this.renderLoop();
     window.addEventListener('resize', this.onResize);
+  }
+
+  // ---- Adaptive render quality + render-on-demand (the original's applyHdrAaSettings /
+  // applyShadowQuality / detectLowEndHardware / invalidateRender) -------------------------------
+  private isMobile = false;
+  private lowEnd = false;
+  private forceLowEnd = false;
+  private smaaScale = 2;
+  private renderInvalidated = true;
+  private framesSinceRender = 0;
+
+  /** Request a repaint (render-on-demand: frames only draw when something changed). */
+  invalidate(): void {
+    this.renderInvalidated = true;
+  }
+
+  /** Low-end heuristics: few cores / little memory / known mobile-class GPU strings. */
+  private detectLowEndHardware(): boolean {
+    try {
+      const cores = navigator.hardwareConcurrency ?? 8;
+      const mem = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8;
+      if (cores <= 4 || mem <= 4) return true;
+      const gl = this.renderer.getContext();
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      const name = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : '';
+      if (/Mali|Adreno|PowerVR|SwiftShader/i.test(name)) return true;
+    } catch { /* conservative default below */ }
+    return false;
+  }
+
+  /** Pixel-ratio / MSAA / shadow-map policy: mobile ≤0.75×, low-end ≤1× + no MSAA + 512 shadows;
+   *  HDRI lighting modes supersample by smaaScale (≥2), capped at 2× device ratio. */
+  private applyRenderQuality(): void {
+    const lowEnd = this.lowEnd || this.forceLowEnd;
+    const hdr = this.lightingMode !== 'flat';
+    const dpr = window.devicePixelRatio || 1;
+    const ratio = this.isMobile
+      ? Math.min(0.75, dpr)
+      : lowEnd
+        ? Math.min(1, dpr)
+        : Math.min(2, dpr * (hdr ? Math.max(2, this.smaaScale) : 1));
+    this.renderer.setPixelRatio(ratio);
+    if (this.composer) {
+      const samples = lowEnd ? 0 : hdr ? 16 : 4;
+      this.composer.renderTarget1.samples = samples;
+      this.composer.renderTarget2.samples = samples;
+      this.composer.setPixelRatio(ratio);
+    }
+    const sm = lowEnd ? 512 : 2048;
+    const key = this.lightRig[0] as THREE.DirectionalLight | undefined;
+    if (key?.shadow && key.shadow.mapSize.width !== sm) {
+      key.shadow.mapSize.set(sm, sm);
+      key.shadow.map?.dispose();
+      key.shadow.map = null as unknown as THREE.WebGLRenderTarget;
+    }
+    const w = Math.max(1, this.container.clientWidth);
+    const h = Math.max(1, this.container.clientHeight);
+    this.renderer.setSize(w, h);
+    this.composer?.setSize(w, h);
+    this.invalidate();
+  }
+
+  /** Wire the pattern's quality settings (smaaScale supersampling, Force low-performance mode). */
+  setRenderQualityOptions(opts: { forceLowEnd?: boolean; smaaScale?: number }): void {
+    const force = !!opts.forceLowEnd;
+    const scale = typeof opts.smaaScale === 'number' && opts.smaaScale > 0 ? opts.smaaScale : 2;
+    if (force === this.forceLowEnd && scale === this.smaaScale) return;
+    this.forceLowEnd = force;
+    this.smaaScale = scale;
+    this.applyRenderQuality();
   }
 
   // Build the post-processing chain: RenderPass -> GTAO (ambient occlusion) -> SMAA (edge AA) ->
@@ -281,6 +444,7 @@ export class PatternRenderer {
 
   /** Apply the pattern's post-processing settings: AO enable/intensity/radius/falloff + bokeh f-stop. */
   applyPostSettings(s: { aoEnabled?: boolean; aoIntensity?: number; aoRadius?: number; aoFalloff?: number; bokehFStop?: number }): void {
+    this.invalidate();
     if (this.gtaoPass) {
       this.gtaoPass.enabled = s.aoEnabled !== false;
       if (typeof s.aoIntensity === 'number' && Number.isFinite(s.aoIntensity)) {
@@ -335,36 +499,206 @@ export class PatternRenderer {
 
   /** Switch lighting mode: 'flat' | 'studio1' | 'studio2' | 'sunset'. */
   setLightingMode(mode: string): void {
+    // Mobile GPUs can't afford the HDRI path (supersampling + PMREM): force flat, like the original.
+    if (this.isMobile && PatternRenderer.HDRI[mode]) mode = 'flat';
     this.lightingMode = mode;
+    this.applyRenderQuality(); // HDRI modes supersample (smaaScale), flat returns to 1×
     const url = PatternRenderer.HDRI[mode];
+    if (this.grid) this.grid.visible = !url; // the original hides the grid in HDRI modes
+    this.invalidate();
     if (!url) {
       // Flat: bare rig at full intensity, no environment.
       this.scene.environment = null;
-      this.renderer.toneMappingExposure = 1.0;
+      this.renderer.toneMappingExposure = this.themeExposure;
       this.lightRig.forEach((l, i) => { (l as THREE.Light).intensity = this.lightRigBase[i]; });
+      this.clearEnvRig();
       return;
     }
-    // HDRI: dim the rig (env carries the lighting) and apply the equirect env as a PMREM cubemap.
+    // HDRI: the environment carries the ambient light; a per-mode directional rig (replaced by
+    // HDR texel analysis once the file loads) provides crisp shadows matched to the environment.
     this.renderer.toneMappingExposure = 1.0;
-    this.lightRig.forEach((l, i) => { (l as THREE.Light).intensity = this.lightRigBase[i] * (l instanceof THREE.AmbientLight ? 0.0 : 0.35); });
+    this.lightRig.forEach((l) => { (l as THREE.Light).intensity = 0; });
+    this.applyEnvLightRig(PatternRenderer.ENV_RIGS[mode] ?? []);
     const cached = this.envCache.get(url);
-    if (cached) { this.scene.environment = cached; return; }
+    if (cached) { this.scene.environment = cached; this.applyAnalyzedRig(url, mode); return; }
+    this.loadHdri(url, mode, 0);
+  }
+
+  /** Load + PMREM an HDRI with retry/backoff (the original's scheduleHdriRetry). */
+  private loadHdri(url: string, mode: string, attempt: number): void {
     if (!this.pmrem) { this.pmrem = new THREE.PMREMGenerator(this.renderer); this.pmrem.compileEquirectangularShader(); }
-    new RGBELoader().load(url, (hdr) => {
+    new RGBELoader().setDataType(THREE.FloatType).load(url, (hdr) => {
       if (this.disposed || !this.pmrem) { hdr.dispose(); return; }
+      // analyze BEFORE PMREM consumes the texel data
+      const img = hdr.image as unknown as { data: Float32Array; width: number; height: number };
+      if (img?.data) this.hdriLightCache.set(url, PatternRenderer.analyzeHdriLights(img, 3));
       hdr.mapping = THREE.EquirectangularReflectionMapping;
       const env = this.pmrem.fromEquirectangular(hdr).texture;
       hdr.dispose();
       this.envCache.set(url, env);
-      if (this.lightingMode === mode) this.scene.environment = env; // still the active mode
-    }, undefined, () => { /* HDRI unavailable -> keep the dimmed rig */ });
+      if (this.lightingMode === mode) {
+        this.scene.environment = env;
+        this.applyAnalyzedRig(url, mode);
+        this.invalidate();
+      }
+    }, undefined, () => {
+      if (this.disposed || attempt >= 3) return; // keep the hand-tuned rig
+      setTimeout(() => { if (this.lightingMode === mode) this.loadHdri(url, mode, attempt + 1); }, 1000 * Math.pow(1.5, attempt));
+    });
+  }
+
+  // ---- HDRI light rigs: hand-tuned per-mode directionals, replaced by lights extracted from the
+  // HDR's brightest texel regions when available (the original's analyzeHdriLights). ----
+  private envRig: THREE.DirectionalLight[] = [];
+  private hdriLightCache = new Map<string, { dir: [number, number, number]; color: [number, number, number]; intensity: number }[]>();
+
+  private static readonly ENV_RIGS: Record<string, { dir: [number, number, number]; color: number; intensity: number }[]> = {
+    studio1: [
+      { dir: [2, 3, 2], color: 0xffffff, intensity: 2.0 },
+      { dir: [-2.5, 2, -1], color: 0xe8ecf5, intensity: 0.8 },
+      { dir: [0, 2.5, -3], color: 0xffffff, intensity: 1.0 }
+    ],
+    studio2: [
+      { dir: [3, 4, 1], color: 0xfff4e0, intensity: 1.8 },
+      { dir: [-3, 2, 2], color: 0xdfe8ff, intensity: 0.7 },
+      { dir: [0, 3, -3], color: 0xffffff, intensity: 0.9 }
+    ],
+    sunset: [
+      { dir: [-4, 1.5, 3], color: 0xffb070, intensity: 2.2 },
+      { dir: [3, 2, -2], color: 0x7088b8, intensity: 0.6 },
+      { dir: [0, 2, -4], color: 0xffd0a0, intensity: 0.8 }
+    ]
+  };
+
+  private clearEnvRig(): void {
+    for (const l of this.envRig) { this.scene.remove(l); l.dispose(); }
+    this.envRig = [];
+  }
+
+  private applyEnvLightRig(rig: { dir: [number, number, number]; color: number | [number, number, number]; intensity: number }[]): void {
+    this.clearEnvRig();
+    rig.forEach((spec, i) => {
+      const light = new THREE.DirectionalLight(
+        Array.isArray(spec.color) ? new THREE.Color(...spec.color) : spec.color,
+        spec.intensity
+      );
+      light.position.set(spec.dir[0], spec.dir[1], spec.dir[2]);
+      if (i === 0) {
+        // the key light carries the shadows
+        light.castShadow = true;
+        const lowEnd = this.lowEnd || this.forceLowEnd;
+        light.shadow.mapSize.set(lowEnd ? 512 : 2048, lowEnd ? 512 : 2048);
+        const cam = light.shadow.camera as THREE.OrthographicCamera;
+        cam.near = 0.1; cam.far = 50; cam.left = -2; cam.right = 2; cam.top = 3; cam.bottom = -1;
+        light.shadow.bias = -5e-4;
+        light.shadow.normalBias = 0.03;
+      }
+      this.scene.add(light);
+      this.envRig.push(light);
+    });
+    this.invalidate();
+  }
+
+  private applyAnalyzedRig(url: string, mode: string): void {
+    const analyzed = this.hdriLightCache.get(url);
+    if (!analyzed?.length || this.lightingMode !== mode) return;
+    this.applyEnvLightRig(analyzed.map((a) => ({ dir: a.dir, color: a.color, intensity: a.intensity })));
+  }
+
+  /** Extract the N brightest directional regions of an equirect HDR: coarse-grid luminance with
+   *  neighbourhood suppression; returns directions + normalized colors + relative intensities. */
+  private static analyzeHdriLights(
+    img: { data: Float32Array; width: number; height: number },
+    n: number
+  ): { dir: [number, number, number]; color: [number, number, number]; intensity: number }[] {
+    const GW = 32, GH = 16;
+    const stride = img.data.length / (img.width * img.height) >= 4 ? 4 : 3;
+    const cells: { lum: number; r: number; g: number; b: number }[] = [];
+    for (let cy = 0; cy < GH; cy++) {
+      for (let cx = 0; cx < GW; cx++) {
+        let r = 0, g = 0, b = 0, cnt = 0;
+        const x0 = Math.floor((cx * img.width) / GW), x1 = Math.floor(((cx + 1) * img.width) / GW);
+        const y0 = Math.floor((cy * img.height) / GH), y1 = Math.floor(((cy + 1) * img.height) / GH);
+        for (let y = y0; y < y1; y += 2) {
+          for (let x = x0; x < x1; x += 2) {
+            const o = (y * img.width + x) * stride;
+            r += img.data[o]; g += img.data[o + 1]; b += img.data[o + 2];
+            cnt++;
+          }
+        }
+        if (cnt > 0) { r /= cnt; g /= cnt; b /= cnt; }
+        cells.push({ lum: 0.2126 * r + 0.7152 * g + 0.0722 * b, r, g, b });
+      }
+    }
+    const picked: number[] = [];
+    const out: { dir: [number, number, number]; color: [number, number, number]; intensity: number }[] = [];
+    let maxLum = 0;
+    for (const c of cells) maxLum = Math.max(maxLum, c.lum);
+    if (maxLum <= 0) return out;
+    for (let k = 0; k < n; k++) {
+      let best = -1, bestLum = -1;
+      for (let i = 0; i < cells.length; i++) {
+        if (cells[i].lum <= bestLum) continue;
+        // suppress neighbours of already-picked cells (wrap-around in x)
+        const cx = i % GW, cy = Math.floor(i / GW);
+        const near = picked.some((p) => {
+          const px = p % GW, py = Math.floor(p / GW);
+          const dx = Math.min(Math.abs(px - cx), GW - Math.abs(px - cx));
+          return dx <= 3 && Math.abs(py - cy) <= 2;
+        });
+        if (near) continue;
+        best = i; bestLum = cells[i].lum;
+      }
+      if (best < 0) break;
+      picked.push(best);
+      const c = cells[best];
+      const cx = (best % GW + 0.5) / GW, cy = (Math.floor(best / GW) + 0.5) / GH;
+      // equirect uv -> direction (three's convention: u wraps longitude, v=0 is the top)
+      const phi = cy * Math.PI;
+      const theta = cx * 2 * Math.PI - Math.PI;
+      const dir: [number, number, number] = [
+        Math.sin(phi) * Math.sin(theta) * 5,
+        Math.max(0.5, Math.cos(phi) * 5),
+        Math.sin(phi) * Math.cos(theta) * 5
+      ];
+      const m = Math.max(c.r, c.g, c.b) || 1;
+      out.push({
+        dir,
+        color: [c.r / m, c.g / m, c.b / m],
+        intensity: k === 0 ? 2.0 : 0.5 + 1.0 * (c.lum / maxLum)
+      });
+    }
+    return out;
+  }
+
+  // Radial "origin fog" (the original's applyFogOriginToMaterial): floor + grid fade toward the
+  // theme colour with distance from the world origin, so the stage dissolves instead of ending in
+  // a hard edge. Shared uniforms so a theme switch retints the fade live.
+  private originFade = {
+    color: { value: new THREE.Color('#dfe3e8') },
+    near: { value: 3 },
+    far: { value: 8 }
+  };
+
+  private applyOriginFade(mat: THREE.Material): void {
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uFadeColor = this.originFade.color;
+      shader.uniforms.uFadeNear = this.originFade.near;
+      shader.uniforms.uFadeFar = this.originFade.far;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vFadeWorldPos;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvFadeWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform vec3 uFadeColor;\nuniform float uFadeNear;\nuniform float uFadeFar;\nvarying vec3 vFadeWorldPos;')
+        .replace('#include <fog_fragment>', '#include <fog_fragment>\n\tgl_FragColor.rgb = mix(gl_FragColor.rgb, uFadeColor, smoothstep(uFadeNear, uFadeFar, length(vFadeWorldPos.xz)));');
+    };
+    mat.customProgramCacheKey = () => 'origin-fade';
   }
 
   private setupFloor() {
-    this.floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(20, 20),
-      new THREE.MeshStandardMaterial({ color: '#c8ccd2', roughness: 0.9, metalness: 0, depthWrite: true })
-    );
+    const floorMat = new THREE.MeshStandardMaterial({ color: '#c8ccd2', roughness: 0.9, metalness: 0, depthWrite: true });
+    this.applyOriginFade(floorMat);
+    this.floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), floorMat);
     this.floor.rotation.x = -Math.PI / 2;
     this.floor.receiveShadow = true;
     this.scene.add(this.floor);
@@ -372,21 +706,38 @@ export class PatternRenderer {
     this.grid.position.y = 0.002;
     (this.grid.material as THREE.Material).opacity = 0.4;
     (this.grid.material as THREE.Material).transparent = true;
+    {
+      const g = this.grid as unknown as { material: THREE.Material[] | THREE.Material };
+      for (const m of Array.isArray(g.material) ? g.material : [g.material]) this.applyOriginFade(m);
+    }
     this.scene.add(this.grid);
   }
 
   // Light/dark theme for the 3D canvas: scene background + floor + grid. HDRI modes set
   // scene.environment (lighting) but leave background = the theme colour, so dark mode reads as a
   // dark studio. Driven by the app's data-theme (see utils/theme).
+  private themeExposure = 1.0;
+
   private applySceneTheme(dark: boolean) {
     const bg = dark ? '#171b21' : '#dfe3e8';
     (this.scene.background as THREE.Color)?.set?.(bg) ?? (this.scene.background = new THREE.Color(bg));
+    // themed distance fog: the stage fades into the background past the max orbit distance
+    // (the original's fogNear/fogFar, scaled to this scene's metre stage)
+    if (this.scene.fog instanceof THREE.Fog) this.scene.fog.color.set(bg);
+    else this.scene.fog = new THREE.Fog(bg, 6, 16);
+    this.originFade.color.value.set(bg);
+    // per-theme exposure (the original's applyRendererTheme): a touch brighter in dark mode so the
+    // garment doesn't read flat against the dark stage. (The original's absolute values pair with
+    // its own light rig; only the dark/light differential transplants.)
+    this.themeExposure = dark ? 1.05 : 1.0;
+    if (this.lightingMode === 'flat') this.renderer.toneMappingExposure = this.themeExposure;
     if (this.floor) (this.floor.material as THREE.MeshStandardMaterial).color.set(dark ? '#1c2128' : '#c8ccd2');
     if (this.grid) {
       const g = this.grid as unknown as { material: THREE.LineBasicMaterial[] | THREE.LineBasicMaterial };
       const mats = Array.isArray(g.material) ? g.material : [g.material];
       for (const m of mats) m.color.set(dark ? '#39424e' : '#b8bcc2');
     }
+    this.invalidate();
   }
 
   /** Mouse interaction: grab a cloth particle and drag it (pulls the fabric, like the reference). */
@@ -495,6 +846,9 @@ export class PatternRenderer {
           this.apHover = mesh;
           if (this.apHover) (this.apHover.material as THREE.MeshBasicMaterial).color.setHex(0xf97316);
           this.onArrangementPointHover(marker?.name ?? null);
+          // ghost preview of the selected piece at the hovered marker's placement
+          this.updateArrangementGhost(marker ?? null);
+          this.invalidate();
         }
       }
       if (!this.grabbing || !this.sim) return;
@@ -560,6 +914,9 @@ export class PatternRenderer {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
     this.composer?.setSize(w, h);
+    this.updateOutlineResolution();
+    this.updateSeamLineResolution();
+    this.invalidate();
   };
 
   private renderLoop = () => {
@@ -572,16 +929,60 @@ export class PatternRenderer {
       this.camera.position.lerpVectors(this.camTween.fromPos, this.camTween.toPos, e);
       this.controls.target.lerpVectors(this.camTween.fromTgt, this.camTween.toTgt, e);
       if (t >= 1) { this.camTween = null; this.queueCameraSave(); }
+      this.renderInvalidated = true;
     }
-    this.controls.update();
-    // depth of field: keep the focal plane on the orbit target (the garment)
-    if (this.bokehPass?.enabled) {
-      (this.bokehPass.uniforms as unknown as Record<string, { value: number }>)['focus'].value =
-        this.camera.position.distanceTo(this.controls.target);
+    const moved = this.controls.update();
+    // Render-on-demand (the original's invalidateRender): draw only when the sim is running, the
+    // camera moved, something invalidated, or an interaction is live. A ~1 s heartbeat repaints
+    // anything a mutator forgot to invalidate.
+    this.framesSinceRender++;
+    const needs = this.simulating || this.userSimulating || this.grabbing || moved ||
+      this.renderInvalidated || !!(this.transform && (this.transform.dragging || this.transform.axis)) ||
+      this.framesSinceRender > 60;
+    if (!needs) return;
+    this.renderInvalidated = false;
+    this.framesSinceRender = 0;
+    // Photographic depth of field (the original): aperture derives from the 35mm-equivalent focal
+    // length and the f-stop; focus autofocuses on whatever is at screen centre (clamped around the
+    // orbit-target distance); the effect pauses while editing/selecting/grabbing so manipulation
+    // stays crisp.
+    if (this.bokehPass) {
+      const wantBokeh = this.bokehFStop > 0 && this.mode === 'view' && !this.grabbing && !this.highlightId && !this.seamToolState;
+      this.bokehPass.enabled = wantBokeh;
+      if (wantBokeh) {
+        const u = this.bokehPass.uniforms as unknown as Record<string, { value: number }>;
+        u['focus'].value = this.computeFocusDistance();
+        const focal = 18 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)); // 36mm-frame equivalent
+        u['aperture'].value = focal / Math.max(0.7, this.bokehFStop) / 36 * 0.012;
+        u['maxblur'].value = 0.01;
+      }
     }
     if (this.composer && this.postEnabled) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
   };
+
+  // Autofocus: raycast the screen centre against the garment, clamped to 0.5×–1.5× the orbit-target
+  // distance (the original's getFocusDistanceFromCenter). Throttled — bounding volumes refresh at
+  // most every 250 ms so per-frame raycasts stay cheap while the sim runs.
+  private focusNdc = new THREE.Vector2(0, 0);
+  private lastFocusAt = 0;
+  private lastFocusDist = 0;
+
+  private computeFocusDistance(): number {
+    const tdist = this.camera.position.distanceTo(this.controls.target);
+    const now = performance.now();
+    if (now - this.lastFocusAt < 250 && this.lastFocusDist > 0) return this.lastFocusDist;
+    this.lastFocusAt = now;
+    let dist = tdist;
+    if (this.clothMeshes.length) {
+      for (const e of this.clothMeshes) e.geometry.computeBoundingSphere();
+      this.raycaster.setFromCamera(this.focusNdc, this.camera);
+      const hits = this.raycaster.intersectObjects(this.clothMeshes.map((e) => e.mesh), false);
+      if (hits[0]) dist = Math.max(0.5 * tdist, Math.min(1.5 * tdist, hits[0].distance));
+    }
+    this.lastFocusDist = dist;
+    return dist;
+  }
 
   /** Debounced camera write-back (orbit end, tween end, FOV change). */
   private queueCameraSave(): void {
@@ -680,6 +1081,10 @@ export class PatternRenderer {
       geo.setIndex(localIndex);
       const pieceMat = matById.get(piece.materialId);
       const separateBack = hasSeparateBack(pieceMat);
+      // visualizationThickness extrudes the sheet into front/back shells + an edge strip
+      const shellMm = pieceMat?.visualizationThickness ?? 0;
+      const dualShell = separateBack || shellMm > 0;
+      const shellM = shellMm > 0 ? shellMm / 2000 : 0; // half thickness, meters
       const srcPiece = pattern.pieces.find((p) => p.id === piece.pieceId);
       const name = srcPiece?.name ?? 'Piece';
       const hidden = !!srcPiece?.hidden; // object-browser visibility toggle
@@ -689,35 +1094,93 @@ export class PatternRenderer {
       // 'flat' look (deforms + shades with the cloth). The shader picks the "face side" badge on the
       // outward face and the "back side" badge on the reverse. Built unconditionally so toggling
       // label mode is a cheap uniform flip rather than a full cloth rebuild (which would re-drape).
-      const { face: faceLabelTex, back: backLabelTex } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
+      const { face: faceLabelTex, back: backLabelTex, bbox } = this.buildPieceLabelTextures(geo, piece.uv, piece.count, piece.pieceId, name);
       // mirror instances have reversed winding; flipNormals also inverts the outward face — XOR them.
       const labelFlipFace = piece.pieceId.includes('#M') !== !!srcPiece?.settings3d.flipNormals;
       const labelOpacity = this.showLabels && !hidden && this.labelMode === 'flat' ? 1 : 0;
+
+      // Baked piece maps (the original's buildPieceTextureCanvas): print anchored at the piece
+      // origin + rotated by grain, internal style lines drawn in. Only built when there is a print
+      // or lines to show — plain solid pieces keep the cheaper untextured material.
+      let pieceMapFront: THREE.Texture | undefined;
+      let pieceMapBack: THREE.Texture | undefined;
+      if (srcPiece) {
+        const mirror = piece.pieceId.includes('#M');
+        const sgn = mirror ? -1 : 1;
+        const pts = indexPoints(pattern);
+        const visibleInternals = { ...srcPiece, internalPaths: srcPiece.internalPaths.filter((ip) => ip.showIn3d !== false) };
+        const internals = pieceInternalPolylines(pattern, visibleInternals, undefined, pts, 4)
+          .map((poly) => poly.map((p) => ({ x: sgn * p.x, y: p.y })));
+        const origin = pts.get(srcPiece.originPoint);
+        const g = srcPiece.grainVector;
+        const grainDeg0 = (Math.atan2(g.y, g.x) * 180) / Math.PI;
+        const bakeBase = {
+          internalPolys: internals,
+          originUV: { x: sgn * (origin?.x ?? 0), y: origin?.y ?? 0 },
+          grainDeg: mirror ? 180 - grainDeg0 : grainDeg0,
+          uMin: bbox.uMin, vMin: bbox.vMin, wMM: bbox.wMM, hMM: bbox.hMM,
+          anisotropy: Math.min(this.renderer.capabilities.getMaxAnisotropy(), 8)
+        };
+        const frontSlot = pieceMat?.frontTexture ?? null;
+        const frontBake = { ...bakeBase, slot: frontSlot, fillColor: frontSlot?.color ?? '#6b7a8f' };
+        if (pieceNeedsBake(frontBake)) pieceMapFront = createPieceTexture(frontBake);
+        if (dualShell) {
+          const backSlot = pieceMat?.backTexture ?? frontSlot;
+          const backBake = { ...bakeBase, slot: backSlot, fillColor: backSlot?.color ?? '#6b7a8f' };
+          if (pieceNeedsBake(backBake)) pieceMapBack = createPieceTexture(backBake);
+        }
+      }
 
       // Our cloth triangles wind with their geometric front face pointing INWARD, so the outward
       // surface the camera sees is the BackSide. For a separate back texture we therefore render the
       // FACE (front) texture on a BackSide mesh (shows outward) and the back texture on a FrontSide
       // mesh (shows inward). With a single double-sided material this doesn't matter (both sides same).
-      const mat = createGarmentMaterial(pieceMat, flat, { side: separateBack ? THREE.BackSide : THREE.DoubleSide, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity, labelFlipFace });
-      mat.wireframe = this.showTriangles;
+      const mat = createGarmentMaterial(pieceMat, flat, { side: dualShell ? THREE.BackSide : THREE.DoubleSide, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity, labelFlipFace, pieceMap: pieceMapFront, shellOffset: shellM > 0 ? shellM : undefined });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       mesh.frustumCulled = false;
       mesh.visible = !hidden;
       this.clothGroup.add(mesh);
-      // separate back side: a second mesh on the same (deforming) geometry, back faces only
+      // back shell: a second mesh on the same (deforming) geometry — distinct back texture and/or
+      // the inner face of a thick fabric (offset inward by half the visual thickness)
       let backMesh: THREE.Mesh | undefined;
-      if (separateBack) {
-        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity, labelFlipFace });
-        backMat.wireframe = this.showTriangles;
+      if (dualShell) {
+        const backMat = createGarmentMaterial(pieceMat, flat, { side: THREE.FrontSide, back: true, labelTexture: faceLabelTex, labelTextureBack: backLabelTex, labelOpacity, labelFlipFace, pieceMap: pieceMapBack, shellOffset: shellM > 0 ? -shellM : undefined });
         backMesh = new THREE.Mesh(geo, backMat);
         backMesh.castShadow = true; backMesh.receiveShadow = true; backMesh.frustumCulled = false;
         backMesh.visible = !hidden;
         this.clothGroup.add(backMesh);
         this.clothBackMeshes.push(backMesh);
       }
-      this.clothMeshes.push({ pieceId: piece.pieceId, start: piece.start, count: piece.count, geometry: geo, mesh, backMesh });
+      // side strip closing the shells at the boundary (darkened like the original's side mesh)
+      let sideMesh: THREE.Mesh | undefined;
+      let sidePairs: number[] | undefined;
+      if (shellM > 0) {
+        const seen = new Map<string, number>();
+        const ends = new Map<string, [number, number]>();
+        for (let t = 0; t < localIndex.length; t += 3) {
+          const v = [localIndex[t], localIndex[t + 1], localIndex[t + 2]];
+          for (let e = 0; e < 3; e++) {
+            const a = v[e], b = v[(e + 1) % 3];
+            const k = `${Math.min(a, b)}_${Math.max(a, b)}`;
+            seen.set(k, (seen.get(k) ?? 0) + 1);
+            ends.set(k, [a, b]);
+          }
+        }
+        sidePairs = [];
+        for (const [k, cnt] of seen) if (cnt === 1) { const [a, b] = ends.get(k)!; sidePairs.push(a, b); }
+        if (sidePairs.length) {
+          const sideGeo = new THREE.BufferGeometry();
+          sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array((sidePairs.length / 2) * 18), 3));
+          const sideColor = new THREE.Color(pieceMat?.frontTexture?.color ?? '#6b7a8f').multiplyScalar(0.7);
+          sideMesh = new THREE.Mesh(sideGeo, new THREE.MeshStandardMaterial({ color: sideColor, roughness: 0.95, metalness: 0, side: THREE.DoubleSide }));
+          sideMesh.frustumCulled = false;
+          sideMesh.visible = !hidden;
+          this.clothGroup.add(sideMesh);
+        }
+      }
+      this.clothMeshes.push({ pieceId: piece.pieceId, start: piece.start, count: piece.count, geometry: geo, mesh, backMesh, sideMesh, sidePairs, shellM: shellM > 0 ? shellM : undefined });
 
       // Camera-facing sprite badge for 'billboard' mode (hidden unless that mode is active).
       const { obj, aspect } = this.makeLabel(`${name} face side`);
@@ -726,11 +1189,12 @@ export class PatternRenderer {
       this.pieceLabels.push({ pieceId: piece.pieceId, obj, aspect });
     }
     this.applyClothPositions(this.prepared.simData.positions);
+    if (this.showTriangles) this.setShowTriangles(true); // rebuild the wireframe overlays on the new meshes
     this.rebuildMeasurements();
   }
 
-  /** Add a per-piece `uvLabel` attribute (0..1 across the piece's pattern bbox); returns bbox size in mm. */
-  private addLabelUVs(geo: THREE.BufferGeometry, uv: Float32Array, count: number): { wMM: number; hMM: number } {
+  /** Add a per-piece `uvLabel` attribute (0..1 across the piece's pattern bbox); returns the bbox. */
+  private addLabelUVs(geo: THREE.BufferGeometry, uv: Float32Array, count: number): { wMM: number; hMM: number; uMin: number; vMin: number } {
     let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
     for (let i = 0; i < count; i++) {
       const u = uv[i * 2], v = uv[i * 2 + 1];
@@ -744,22 +1208,24 @@ export class PatternRenderer {
       uvLabel[i * 2 + 1] = (uv[i * 2 + 1] - vMin) / hMM;
     }
     geo.setAttribute('uvLabel', new THREE.BufferAttribute(uvLabel, 2));
-    return { wMM, hMM };
+    return { wMM, hMM, uMin, vMin };
   }
 
   /** Set up uvLabel on `geo` and build the face/back name badges for a piece (back text is flipped
    *  the opposite way so it reads correctly when viewed from the reverse face). */
-  private buildPieceLabelTextures(geo: THREE.BufferGeometry, uv: Float32Array, count: number, pieceId: string, name: string): { face: THREE.CanvasTexture; back: THREE.CanvasTexture } {
-    const { wMM, hMM } = this.addLabelUVs(geo, uv, count);
+  private buildPieceLabelTextures(geo: THREE.BufferGeometry, uv: Float32Array, count: number, pieceId: string, name: string): { face: THREE.CanvasTexture; back: THREE.CanvasTexture; bbox: { wMM: number; hMM: number; uMin: number; vMin: number } } {
+    const bbox = this.addLabelUVs(geo, uv, count);
     const mirror = pieceId.includes('#M'); // mirror instances have a negated U
     return {
-      face: this.makeBakedLabelTexture(`${name}\nface side`, wMM, hMM, mirror),
-      back: this.makeBakedLabelTexture(`${name}\nback side`, wMM, hMM, !mirror)
+      face: this.makeBakedLabelTexture(`${name}\nface side`, bbox.wMM, bbox.hMM, mirror),
+      back: this.makeBakedLabelTexture(`${name}\nback side`, bbox.wMM, bbox.hMM, !mirror),
+      bbox
     };
   }
 
   private applyClothPositions(global: Float32Array) {
     this.lastClothPositions = global;
+    this.invalidate();
     this.updateSeamToolOverlayPositions();
     for (const entry of this.clothMeshes) {
       const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
@@ -775,6 +1241,32 @@ export class PatternRenderer {
       entry.geometry.computeVertexNormals();
       // bounding sphere not recomputed per frame: cloth meshes have frustumCulled = false.
 
+      // visual-thickness side strip: rebuild the boundary quads between the front/back shells
+      if (entry.sideMesh && entry.sidePairs && entry.shellM) {
+        const nrm = entry.geometry.getAttribute('normal') as THREE.BufferAttribute;
+        const narr = nrm.array as Float32Array;
+        const sp = entry.sideMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+        const out = sp.array as Float32Array;
+        const t = entry.shellM;
+        let o = 0;
+        for (let k = 0; k + 1 < entry.sidePairs.length; k += 2) {
+          const a = entry.sidePairs[k], b = entry.sidePairs[k + 1];
+          const ax = arr[a * 3], ay = arr[a * 3 + 1], az = arr[a * 3 + 2];
+          const bx = arr[b * 3], by = arr[b * 3 + 1], bz = arr[b * 3 + 2];
+          const nax = narr[a * 3] * t, nay = narr[a * 3 + 1] * t, naz = narr[a * 3 + 2] * t;
+          const nbx = narr[b * 3] * t, nby = narr[b * 3 + 1] * t, nbz = narr[b * 3 + 2] * t;
+          // front a, front b, back b — then front a, back b, back a
+          out[o++] = ax + nax; out[o++] = ay + nay; out[o++] = az + naz;
+          out[o++] = bx + nbx; out[o++] = by + nby; out[o++] = bz + nbz;
+          out[o++] = bx - nbx; out[o++] = by - nby; out[o++] = bz - nbz;
+          out[o++] = ax + nax; out[o++] = ay + nay; out[o++] = az + naz;
+          out[o++] = bx - nbx; out[o++] = by - nby; out[o++] = bz - nbz;
+          out[o++] = ax - nax; out[o++] = ay - nay; out[o++] = az - naz;
+        }
+        sp.needsUpdate = true;
+        entry.sideMesh.geometry.computeVertexNormals();
+      }
+
       // Flat (default) badges are baked into the material and need no per-frame work. Billboard
       // sprites, if present, get parked at the piece's (live) centroid to face the camera.
       const label = this.pieceLabels.find((l) => l.pieceId === entry.pieceId);
@@ -782,17 +1274,27 @@ export class PatternRenderer {
       label.obj.position.set(cx / entry.count, cy / entry.count, cz / entry.count);
     }
     this.updateSeamLines(global);
+    this.updateSelectionOutlinePositions();
     this.updateMeasureGroup(global);
   }
 
   private clearClothMeshes() {
     this.clearSnapshot(); // a ghost from the old drape would be stale once pieces rebuild
     this.clearSeamLines();
+    this.clearSelectionOutline(); // particle indices die with the meshes
+    this.clearSeamToolOverlay();
+    for (const m of this.triangleOverlays) { this.clothGroup.remove(m); (m.material as THREE.Material).dispose(); }
+    this.triangleOverlays = [];
     this.clearMeasurements(); // particle indices die with the meshes; rebuilt after the new build
     for (const e of this.clothMeshes) {
       this.clothGroup.remove(e.mesh);
       e.geometry.dispose();
       disposeGarmentMaterial(e.mesh.material as THREE.Material);
+      if (e.sideMesh) {
+        this.clothGroup.remove(e.sideMesh);
+        e.sideMesh.geometry.dispose();
+        (e.sideMesh.material as THREE.Material).dispose();
+      }
     }
     this.clothMeshes = [];
     for (const b of this.clothBackMeshes) { this.clothGroup.remove(b); disposeGarmentMaterial(b.material as THREE.Material); }
@@ -1060,10 +1562,72 @@ export class PatternRenderer {
     const wasUser = this.userSimulating;
     this.simulating = false;
     this.userSimulating = false;
+    if (wasUser) {
+      // Weld settled seams (counterpart particles within 2 mm snap to their midpoint — the
+      // original's snapSeamPointsToCounterparts) and grade the drape before baking it.
+      const pos = this.sim?.positions ?? this.prepared?.simData.positions;
+      if (pos) {
+        this.weldSeamCounterparts(pos);
+        this.applyClothPositions(pos);
+        this.lastStretchError = this.computeStretchError(pos);
+      }
+    }
     if (this.pattern) this.onStatus('ready');
     // Bake the settled drape so it can be persisted (re-open shows the new drape instantly, and
     // body re-fits chain off the latest result rather than the stale authored blob).
     if (wasUser) { try { this.onDrapeSettled(this.extractSavedPositions()); } catch { /* ignore */ } }
+  }
+
+  private lastStretchError: number | null = null;
+
+  /** RMS relative stretch error over all stretch constraints at the last user-run stop (the
+   *  original's calculateErrors): 0 = every edge at rest length. Null until a sim has run. */
+  getStretchError(): number | null {
+    return this.lastStretchError;
+  }
+
+  private weldSeamCounterparts(pos: Float32Array): number {
+    if (!this.prepared) return 0;
+    const s = this.prepared.simData.seams;
+    const n = this.prepared.simData.particleCount;
+    const TOL2 = 0.002 * 0.002; // 2 mm
+    let welded = 0;
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < 4; j++) {
+        const p = s[i * 4 + j];
+        if (p <= i) continue; // each symmetric pair once
+        const dx = pos[i * 4] - pos[p * 4];
+        const dy = pos[i * 4 + 1] - pos[p * 4 + 1];
+        const dz = pos[i * 4 + 2] - pos[p * 4 + 2];
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 <= 0 || d2 > TOL2) continue;
+        const mx = (pos[i * 4] + pos[p * 4]) / 2;
+        const my = (pos[i * 4 + 1] + pos[p * 4 + 1]) / 2;
+        const mz = (pos[i * 4 + 2] + pos[p * 4 + 2]) / 2;
+        pos[i * 4] = mx; pos[i * 4 + 1] = my; pos[i * 4 + 2] = mz;
+        pos[p * 4] = mx; pos[p * 4 + 1] = my; pos[p * 4 + 2] = mz;
+        welded++;
+      }
+    }
+    return welded;
+  }
+
+  private computeStretchError(pos: Float32Array): number | null {
+    if (!this.prepared) return null;
+    let sum = 0, count = 0;
+    for (const group of this.prepared.simData.stretchColors) {
+      for (let i = 0; i < group.count; i++) {
+        const a = group.edges[i * 4], b = group.edges[i * 4 + 1], rest = group.edges[i * 4 + 2];
+        if (rest <= 1e-9) continue;
+        const dx = pos[a * 4] - pos[b * 4];
+        const dy = pos[a * 4 + 1] - pos[b * 4 + 1];
+        const dz = pos[a * 4 + 2] - pos[b * 4 + 2];
+        const rel = (Math.sqrt(dx * dx + dy * dy + dz * dz) - rest) / rest;
+        sum += rel * rel;
+        count++;
+      }
+    }
+    return count ? Math.sqrt(sum / count) : null;
   }
 
   /** Per-piece settled positions in the savedPositions format (stride-5: x2d,y2d in mm; x3d,y3d,z3d
@@ -1247,6 +1811,7 @@ export class PatternRenderer {
   /** Leave arrange mode without draping; restore the previous drape view. */
   exitArrangeMode(): void {
     if (this.mode !== 'arrange') return;
+    this.clearArrangementGhost();
     this.selectArrange(-1);
     this.transform?.detach();
     for (const e of this.arrangeEntries) {
@@ -1302,11 +1867,28 @@ export class PatternRenderer {
   }
 
   /** Overlay the cloth triangle mesh (wireframe). */
+  // showTriangles overlays a flat pale-yellow wireframe on each piece (the original's distinct
+  // debug material) instead of switching the lit PBR material to wireframe; back meshes hide so
+  // the topology reads cleanly.
+  private triangleOverlays: THREE.Mesh[] = [];
+
   setShowTriangles(v: boolean) {
     this.showTriangles = v;
+    this.invalidate();
+    for (const m of this.triangleOverlays) {
+      this.clothGroup.remove(m);
+      (m.material as THREE.Material).dispose();
+    }
+    this.triangleOverlays = [];
     for (const e of this.clothMeshes) {
-      (e.mesh.material as THREE.MeshPhysicalMaterial).wireframe = v;
-      if (e.backMesh) (e.backMesh.material as THREE.MeshPhysicalMaterial).wireframe = v;
+      if (e.backMesh) e.backMesh.visible = !v && e.mesh.visible;
+      if (!v) continue;
+      const overlay = new THREE.Mesh(e.geometry, new THREE.MeshBasicMaterial({ color: 0xffeeaa, wireframe: true, transparent: true, opacity: 0.9, depthTest: true }));
+      overlay.frustumCulled = false;
+      overlay.renderOrder = 5;
+      overlay.visible = e.mesh.visible;
+      this.clothGroup.add(overlay);
+      this.triangleOverlays.push(overlay);
     }
   }
 
@@ -1395,57 +1977,127 @@ export class PatternRenderer {
     return !!this.snapshotGroup;
   }
 
-  // ---- 3D seam lines: thin segments connecting sewn particle pairs, toggled by "Show seams" ----
-  private seamLines: THREE.LineSegments | null = null;
-  private seamPairs: number[] = []; // flat [a0,b0,a1,b1,...] global particle indices
+  // ---- Arrangement preview ghost (the original's ensureArrangementPreviewGhost): hovering a
+  // marker with a piece selected shows a transparent clone of the piece at that placement. ----
+  private arrangementGhost: THREE.Mesh | null = null;
+
+  private clearArrangementGhost(): void {
+    if (!this.arrangementGhost) return;
+    this.scene.remove(this.arrangementGhost);
+    this.arrangementGhost.geometry.dispose();
+    (this.arrangementGhost.material as THREE.Material).dispose();
+    this.arrangementGhost = null;
+    this.invalidate();
+  }
+
+  private updateArrangementGhost(marker: { cylinderName: string; uDegrees: number; v: number } | null): void {
+    this.clearArrangementGhost();
+    if (!marker || this.selectedArrange < 0 || !this.prepared || !this.pattern) return;
+    const entry = this.arrangeEntries[this.selectedArrange];
+    if (!entry) return;
+    const piece = this.pattern.pieces.find((p) => p.id === entry.pieceId.replace(/#M$/, ''));
+    const sp = this.prepared.simData.pieces.find((p) => p.pieceId === entry.pieceId);
+    if (!piece || !sp) return;
+    // candidate placement: the piece's arrangement re-seated on the hovered marker
+    const arr = {
+      ...piece.settings3d.arrangement,
+      cylinderName: marker.cylinderName, uDegrees: marker.uDegrees, v: marker.v,
+      uOffsetMm: 0, vOffsetMm: 0, use2DPosition: false, positionChanged: false
+    };
+    const p2d = this.prepared.simData.positions2d;
+    const pts = new Array<{ x: number; y: number }>(sp.count);
+    for (let i = 0; i < sp.count; i++) {
+      const g = sp.start + i;
+      pts[i] = { x: p2d[g * 4] * 1000, y: p2d[g * 4 + 1] * 1000 };
+    }
+    const pos3 = arrangeParticles(pts, arr, this.cylinders.get(marker.cylinderName) ?? null, { flipNormals: piece.settings3d.flipNormals });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos3, 3));
+    geo.setIndex(sp.triangles.map((g) => g - sp.start));
+    const mat = new THREE.MeshBasicMaterial({ color: 0x0ea5e9, transparent: true, opacity: 0.35, depthWrite: false, side: THREE.DoubleSide });
+    this.arrangementGhost = new THREE.Mesh(geo, mat);
+    this.arrangementGhost.frustumCulled = false;
+    this.arrangementGhost.renderOrder = 6;
+    this.scene.add(this.arrangementGhost);
+    this.invalidate();
+  }
+
+  // ---- 3D seam lines: per-seam golden-angle colored fat lines connecting sewn particle pairs.
+  // Shown when "Show seams" is on OR a seam is selected (the original's shouldDisplaySeams). ----
+  private seamLineEntries: { seamId: string; mesh: LineSegments2; mat: LineMaterial; pairs: number[] }[] = [];
   private showSeams3d = false;
+  private selectedSeam3d: string | null = null;
 
   private buildSeamLines(): void {
-    if (!this.prepared) return;
-    const s = this.prepared.simData.seams;
-    const n = this.prepared.simData.particleCount;
-    this.seamPairs = [];
-    for (let i = 0; i < n; i++) for (let j = 0; j < 4; j++) {
-      const p = s[i * 4 + j];
-      if (p > i) this.seamPairs.push(i, p); // partner > i dedupes the symmetric entry
+    if (!this.prepared || this.seamLineEntries.length) return;
+    for (const { seamId, index, pairs } of this.prepared.simData.seamPairsBySeam) {
+      if (pairs.length === 0) continue;
+      const geo = new LineSegmentsGeometry();
+      geo.setPositions(new Float32Array(pairs.length * 3));
+      const mat = new LineMaterial({ color: new THREE.Color(seamColor(index)).getHex(), linewidth: 2.5, transparent: true, opacity: 0.95 });
+      const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+      mat.resolution.copy(size);
+      const mesh = new LineSegments2(geo, mat);
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 3;
+      mesh.visible = false;
+      this.clothGroup.add(mesh);
+      this.seamLineEntries.push({ seamId, mesh, mat, pairs });
     }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.seamPairs.length * 3), 3));
-    const mat = new THREE.LineBasicMaterial({ color: 0xff3b6b, transparent: true, opacity: 0.9 });
-    this.seamLines = new THREE.LineSegments(geo, mat);
-    this.seamLines.frustumCulled = false;
-    this.seamLines.renderOrder = 3;
-    this.clothGroup.add(this.seamLines);
+    this.applySeamLineVisibility();
+  }
+
+  private applySeamLineVisibility(): void {
+    const anyVisible = this.showSeams3d || !!this.selectedSeam3d;
+    if (anyVisible && this.seamLineEntries.length === 0) this.buildSeamLines();
+    for (const e of this.seamLineEntries) {
+      const isSel = e.seamId === this.selectedSeam3d;
+      e.mesh.visible = this.showSeams3d || isSel;
+      e.mat.linewidth = isSel ? 4.5 : 2.5;
+      e.mat.opacity = !this.selectedSeam3d || isSel ? 0.95 : 0.5;
+    }
+    if (anyVisible) this.updateSeamLines(this.lastClothPositions ?? this.prepared?.simData.positions ?? new Float32Array());
+    this.invalidate();
   }
 
   private updateSeamLines(global: Float32Array): void {
-    if (!this.seamLines || !this.seamLines.visible) return;
-    const attr = this.seamLines.geometry.getAttribute('position') as THREE.BufferAttribute;
-    const arr = attr.array as Float32Array;
-    for (let k = 0; k < this.seamPairs.length; k++) {
-      const g = this.seamPairs[k];
-      arr[k * 3] = global[g * 4]; arr[k * 3 + 1] = global[g * 4 + 1]; arr[k * 3 + 2] = global[g * 4 + 2];
+    if (global.length === 0) return;
+    for (const e of this.seamLineEntries) {
+      if (!e.mesh.visible) continue;
+      const arr = new Float32Array(e.pairs.length * 3);
+      for (let k = 0; k < e.pairs.length; k++) {
+        const g = e.pairs[k];
+        arr[k * 3] = global[g * 4]; arr[k * 3 + 1] = global[g * 4 + 1]; arr[k * 3 + 2] = global[g * 4 + 2];
+      }
+      (e.mesh.geometry as LineSegmentsGeometry).setPositions(arr);
     }
-    attr.needsUpdate = true;
+  }
+
+  private updateSeamLineResolution(): void {
+    if (this.seamLineEntries.length === 0) return;
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    for (const e of this.seamLineEntries) e.mat.resolution.copy(size);
   }
 
   private clearSeamLines(): void {
-    if (!this.seamLines) return;
-    this.clothGroup.remove(this.seamLines);
-    this.seamLines.geometry.dispose();
-    (this.seamLines.material as THREE.Material).dispose();
-    this.seamLines = null;
-    this.seamPairs = [];
+    for (const e of this.seamLineEntries) {
+      this.clothGroup.remove(e.mesh);
+      e.mesh.geometry.dispose();
+      e.mat.dispose();
+    }
+    this.seamLineEntries = [];
   }
 
   /** Toggle the 3D seam overlay (lines between sewn edges). */
   setShowSeams(on: boolean): void {
     this.showSeams3d = on;
-    if (on && !this.seamLines) this.buildSeamLines();
-    if (this.seamLines) {
-      this.seamLines.visible = on;
-      if (on) this.updateSeamLines(this.lastClothPositions ?? this.prepared?.simData.positions ?? new Float32Array());
-    }
+    this.applySeamLineVisibility();
+  }
+
+  /** A selected seam displays (emphasized) even when "Show seams" is off. */
+  setSelectedSeam(seamId: string | null): void {
+    this.selectedSeam3d = seamId;
+    this.applySeamLineVisibility();
   }
 
   // ---- 3D seam tool: pick piece edges on the draped garment (the original's handleSeamPointerDown /
@@ -1529,6 +2181,7 @@ export class PatternRenderer {
   }
 
   private rebuildSeamToolOverlay(): void {
+    this.invalidate();
     this.clearSeamToolOverlay();
     const state = this.seamToolState;
     if (!state) { this.seamToolGroup.visible = false; return; }
@@ -1608,6 +2261,78 @@ export class PatternRenderer {
         upto += len;
       }
     }
+  }
+
+  // ---- On-mesh body measurement segments (the original's GeneratedMeasurementSegment): girths as
+  // mesh slices, straight/floor/vertical segments — drawn as a fat line with a value label. ----
+  private bodyMeasureLine: LineSegments2 | null = null;
+  private bodyMeasureLabel: THREE.Sprite | null = null;
+  private bodyMeasureName: string | null = null;
+
+  clearBodyMeasurement(): void {
+    if (this.bodyMeasureLine) {
+      this.scene.remove(this.bodyMeasureLine);
+      this.bodyMeasureLine.geometry.dispose();
+      (this.bodyMeasureLine.material as THREE.Material).dispose();
+      this.bodyMeasureLine = null;
+    }
+    if (this.bodyMeasureLabel) {
+      this.scene.remove(this.bodyMeasureLabel);
+      (this.bodyMeasureLabel.material.map as THREE.Texture | null)?.dispose();
+      this.bodyMeasureLabel.material.dispose();
+      this.bodyMeasureLabel = null;
+    }
+    this.bodyMeasureName = null;
+    this.invalidate();
+  }
+
+  /** Show (or toggle off) a measurement's on-mesh segment. Returns whether it is now visible. */
+  showBodyMeasurement(name: string): boolean {
+    if (this.bodyMeasureName === name) { this.clearBodyMeasurement(); return false; }
+    this.clearBodyMeasurement();
+    if (!this.avatar) return false;
+    const def = this.avatar.measurementSegmentDefs.find((d) => d.name === name);
+    if (!def) return false;
+    const seg = measurementSegment(def, this.avatar.vertexPositions, this.avatar.indices);
+    if (!seg || seg.points.length < 2) return false;
+    const pts = seg.closed ? [...seg.points, seg.points[0]] : seg.points;
+    const flat: number[] = [];
+    for (let i = 1; i < pts.length; i++) flat.push(...pts[i - 1], ...pts[i]);
+    const geo = new LineSegmentsGeometry();
+    geo.setPositions(new Float32Array(flat));
+    const mat = new LineMaterial({ color: 0xe11d8f, linewidth: 3, transparent: true, opacity: 0.95, depthTest: false });
+    mat.resolution.copy(this.renderer.getDrawingBufferSize(new THREE.Vector2()));
+    this.bodyMeasureLine = new LineSegments2(geo, mat);
+    this.bodyMeasureLine.frustumCulled = false;
+    this.bodyMeasureLine.renderOrder = 12;
+    this.scene.add(this.bodyMeasureLine);
+    // value badge floating at the segment's highest point
+    const { obj } = this.makeLabel(`${name}: ${(seg.lengthM * 100).toFixed(1)} cm`);
+    const top = pts.reduce((best, p) => (p[1] > best[1] ? p : best), pts[0]);
+    obj.position.set(top[0], top[1] + 0.05, top[2]);
+    obj.visible = true;
+    this.scene.add(obj);
+    this.bodyMeasureLabel = obj as THREE.Sprite;
+    this.bodyMeasureName = name;
+    this.invalidate();
+    return true;
+  }
+
+  /** Animated fly-to framing a body measurement (the original's avatar zoomToMeasurement, 700 ms):
+   *  uses the per-measurement cameraSettings shipped in the base model. */
+  zoomToBodyMeasurement(name: string): boolean {
+    const cam = this.avatar?.measurementCamera(name);
+    if (!cam) return false;
+    this.camTween = {
+      fromPos: this.camera.position.clone(),
+      toPos: new THREE.Vector3(cam.position[0], cam.position[1], cam.position[2]),
+      fromTgt: this.controls.target.clone(),
+      toTgt: new THREE.Vector3(cam.target[0], cam.target[1], cam.target[2]),
+      start: performance.now(),
+      dur: 700
+    };
+    this.invalidate();
+    return true;
   }
 
   /** Animate the camera to an orthographic-style preset around the current target. */
@@ -1822,6 +2547,7 @@ export class PatternRenderer {
     this.clearClothMeshes();
     this.avatar?.dispose();
     this.scene.environment = null;
+    this.clearEnvRig();
     for (const t of this.envCache.values()) t.dispose();
     this.envCache.clear();
     this.pmrem?.dispose();

@@ -245,7 +245,120 @@ export function dxfToPattern(text: string, name = 'Imported DXF', options: DxfIm
     }
   }
 
+  // BLOCK definitions (BLOCKS section): name → its entity tokens. The main pass skips these ranges
+  // so block geometry only imports where an INSERT places it.
+  const blocks = new Map<string, { code: number; val: string }[]>();
+  const inBlock = new Uint8Array(toks.length);
+  for (let k = 0; k < toks.length; k++) {
+    if (toks[k].code !== 0 || toks[k].val !== 'BLOCK') continue;
+    const start = k;
+    let name = '';
+    let end = toks.length;
+    for (let j = k + 1; j < toks.length; j++) {
+      if (toks[j].code === 2 && !name) name = toks[j].val;
+      if (toks[j].code === 0 && toks[j].val === 'ENDBLK') { end = j + 1; break; }
+    }
+    for (let j = start; j < end; j++) inBlock[j] = 1;
+    if (name) blocks.set(name, toks.slice(start + 1, end - 1));
+    k = end - 1;
+  }
+  const mainToks = toks.filter((_, k) => !inBlock[k]);
+
+  const { loops, texts, inserts } = parseDxfEntities(mainToks);
+
+  // INSERT expansion (one level): transform the block's geometry by the insert's
+  // scale → rotation → translation and import it like top-level entities.
+  for (const ins of inserts) {
+    const bt = blocks.get(ins.name);
+    if (!bt) continue;
+    const sub = parseDxfEntities(bt); // nested INSERTs inside blocks are not expanded
+    const rad = (ins.rotation * Math.PI) / 180;
+    const cosR = Math.cos(rad), sinR = Math.sin(rad);
+    const tfPt = (p: Vec2): Vec2 => {
+      const x = p.x * ins.sx, y = p.y * ins.sy;
+      return { x: ins.x + x * cosR - y * sinR, y: ins.y + x * sinR + y * cosR };
+    };
+    const tfVec = (p: Vec2): Vec2 => {
+      const x = p.x * ins.sx, y = p.y * ins.sy;
+      return { x: x * cosR - y * sinR, y: x * sinR + y * cosR };
+    };
+    for (const loop of sub.loops) {
+      loops.push({
+        ...loop,
+        points: loop.points.map((v) => ({
+          ...tfPt(v),
+          ...(v.out ? { out: tfVec(v.out) } : {}),
+          ...(v.in ? { in: tfVec(v.in) } : {})
+        }))
+      });
+    }
+    for (const t of sub.texts) {
+      const p = tfPt({ x: t.x, y: t.y });
+      texts.push({ ...t, x: p.x, y: p.y, rotation: t.rotation + ins.rotation, size: t.size * Math.abs(ins.sy) });
+    }
+  }
+
+  // units: explicit override wins; 'auto' reads $INSUNITS; default (no options) keeps mm
+  const scale = options.unitsOverride === 'inch' ? 25.4
+    : options.unitsOverride === 'cm' ? 10
+    : options.unitsOverride === 'mm' ? 1
+    : options.unitsOverride === 'auto' ? (INSUNITS_TO_MM[insunits ?? 4] ?? 1)
+    : 1;
+  if (scale !== 1) {
+    for (const loop of loops) for (const v of loop.points) {
+      v.x *= scale; v.y *= scale;
+      if (v.out) { v.out.x *= scale; v.out.y *= scale; }
+      if (v.in) { v.in.x *= scale; v.in.y *= scale; }
+    }
+    for (const t of texts) { t.x *= scale; t.y *= scale; t.size *= scale; }
+  }
+
+  // line classification (only when requested — keeps the plain call path untouched)
+  let imported: Loop[] = loops;
+  if (options.classify) {
+    const c = options.classify;
+    imported = loops
+      .map((loop) => ({ ...loop, cls: classifyEntity(loop.layer, loop.color, loop.closed, c) }))
+      .filter((loop) =>
+        loop.cls === 'cut' ? (c.importCut ?? true)
+        : loop.cls === 'seam' ? (c.importSeam ?? true)
+        : (c.importInternal ?? true));
+  }
+  const p = patternFromLoops(imported, name);
+  // TEXT/MTEXT entities import as text annotations
+  if (texts.length) {
+    p.texts = [
+      ...p.texts,
+      ...texts.map((t) => ({
+        id: 'Text_' + crypto.randomUUID().replace(/-/g, '').slice(0, 9),
+        value: t.value,
+        x: t.x,
+        y: t.y,
+        fontSize: Math.max(2, t.size),
+        rotation: t.rotation,
+        align: 'left' as const
+      }))
+    ];
+  }
+  return p;
+}
+
+interface DxfText { value: string; x: number; y: number; size: number; rotation: number }
+interface DxfInsert { name: string; x: number; y: number; sx: number; sy: number; rotation: number }
+
+/**
+ * Walk one DXF entity stream (the file body or a block definition). Handles LWPOLYLINE (bulges),
+ * POLYLINE/VERTEX, LINE, ARC, CIRCLE, SPLINE (control or fit points), TEXT/MTEXT, and collects
+ * INSERTs for the caller to expand.
+ */
+function parseDxfEntities(toks: { code: number; val: string }[]): {
+  loops: (Loop & { layer: string; color: number | null })[];
+  texts: DxfText[];
+  inserts: DxfInsert[];
+} {
   const loops: (Loop & { layer: string; color: number | null })[] = [];
+  const texts: DxfText[] = [];
+  const inserts: DxfInsert[] = [];
   let i = 0;
   const isEntityStart = (t: { code: number }) => t.code === 0;
   while (i < toks.length) {
@@ -305,35 +418,120 @@ export function dxfToPattern(text: string, name = 'Imported DXF', options: DxfIm
         else if (code === 62) color = parseInt(val, 10);
       }
       loops.push({ points: [{ x: x1, y: y1 }, { x: x2, y: y2 }], closed: false, layer, color });
+    } else if (type === 'ARC' || type === 'CIRCLE') {
+      let cx = 0, cy = 0, r = 0, a0 = 0, a1 = 360;
+      let layer = '', color: number | null = null;
+      for (; i < toks.length && !isEntityStart(toks[i]); i++) {
+        const { code, val } = toks[i];
+        if (code === 10) cx = parseFloat(val);
+        else if (code === 20) cy = parseFloat(val);
+        else if (code === 40) r = parseFloat(val);
+        else if (code === 50) a0 = parseFloat(val);
+        else if (code === 51) a1 = parseFloat(val);
+        else if (code === 8) layer = val;
+        else if (code === 62) color = parseInt(val, 10);
+      }
+      if (r > 0) {
+        const closed = type === 'CIRCLE';
+        if (closed) { a0 = 0; a1 = 360; }
+        else if (a1 <= a0) a1 += 360; // DXF arcs sweep CCW
+        const span = ((a1 - a0) * Math.PI) / 180;
+        const segs = Math.max(8, Math.ceil(Math.abs(span) / (Math.PI / 12)));
+        const pts: Vtx[] = [];
+        const last = closed ? segs - 1 : segs;
+        for (let s = 0; s <= last; s++) {
+          const a = (a0 * Math.PI) / 180 + (span * s) / segs;
+          pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+        }
+        loops.push({ points: pts, closed, layer, color });
+      }
+    } else if (type === 'SPLINE') {
+      const ctrl: Vec2[] = [];
+      const fit: Vec2[] = [];
+      const knots: number[] = [];
+      let degree = 3;
+      let closed = false;
+      let layer = '', color: number | null = null;
+      let px: number | null = null, fx: number | null = null;
+      for (; i < toks.length && !isEntityStart(toks[i]); i++) {
+        const { code, val } = toks[i];
+        if (code === 70) closed = (parseInt(val, 10) & 1) === 1;
+        else if (code === 71) degree = parseInt(val, 10) || 3;
+        else if (code === 40) knots.push(parseFloat(val));
+        else if (code === 10) px = parseFloat(val);
+        else if (code === 20 && px !== null) { ctrl.push({ x: px, y: parseFloat(val) }); px = null; }
+        else if (code === 11) fx = parseFloat(val);
+        else if (code === 21 && fx !== null) { fit.push({ x: fx, y: parseFloat(val) }); fx = null; }
+        else if (code === 8) layer = val;
+        else if (code === 62) color = parseInt(val, 10);
+      }
+      // fit points interpolate the curve directly; otherwise sample the B-spline
+      const pts = fit.length >= 2 ? fit : sampleBSpline(ctrl, knots, degree, Math.max(16, ctrl.length * 6));
+      if (pts.length >= 2) loops.push({ points: pts.map((p) => ({ x: p.x, y: p.y })), closed, layer, color });
+    } else if (type === 'TEXT' || type === 'MTEXT') {
+      let value = '', x = 0, y = 0, size = 5, rotation = 0;
+      for (; i < toks.length && !isEntityStart(toks[i]); i++) {
+        const { code, val } = toks[i];
+        if (code === 1) value += val;
+        else if (code === 3) value += val; // MTEXT continuation chunks
+        else if (code === 10) x = parseFloat(val);
+        else if (code === 20) y = parseFloat(val);
+        else if (code === 40) size = parseFloat(val);
+        else if (code === 50) rotation = parseFloat(val);
+      }
+      // strip the common MTEXT formatting codes (\P = newline, {\...;} wrappers)
+      value = value.replace(/\\P/g, ' ').replace(/\{\\[^;]*;/g, '').replace(/[{}]/g, '').trim();
+      if (value) texts.push({ value, x, y, size, rotation });
+    } else if (type === 'INSERT') {
+      let name = '', x = 0, y = 0, sx = 1, sy = 1, rotation = 0;
+      for (; i < toks.length && !isEntityStart(toks[i]); i++) {
+        const { code, val } = toks[i];
+        if (code === 2) name = val;
+        else if (code === 10) x = parseFloat(val);
+        else if (code === 20) y = parseFloat(val);
+        else if (code === 41) sx = parseFloat(val) || 1;
+        else if (code === 42) sy = parseFloat(val) || 1;
+        else if (code === 50) rotation = parseFloat(val);
+      }
+      if (name) inserts.push({ name, x, y, sx, sy, rotation });
     }
   }
+  return { loops, texts, inserts };
+}
 
-  // units: explicit override wins; 'auto' reads $INSUNITS; default (no options) keeps mm
-  const scale = options.unitsOverride === 'inch' ? 25.4
-    : options.unitsOverride === 'cm' ? 10
-    : options.unitsOverride === 'mm' ? 1
-    : options.unitsOverride === 'auto' ? (INSUNITS_TO_MM[insunits ?? 4] ?? 1)
-    : 1;
-  if (scale !== 1) {
-    for (const loop of loops) for (const v of loop.points) {
-      v.x *= scale; v.y *= scale;
-      if (v.out) { v.out.x *= scale; v.out.y *= scale; }
-      if (v.in) { v.in.x *= scale; v.in.y *= scale; }
+/** Sample a clamped B-spline by de Boor's algorithm (invalid/missing knots → uniform clamped). */
+function sampleBSpline(ctrl: Vec2[], knots: number[], degree: number, samples: number): Vec2[] {
+  const n = ctrl.length;
+  if (n === 0) return [];
+  if (n <= degree) return ctrl.slice();
+  let kn = knots;
+  if (kn.length !== n + degree + 1) {
+    kn = [];
+    for (let i = 0; i <= degree; i++) kn.push(0);
+    for (let i = 1; i < n - degree; i++) kn.push(i);
+    for (let i = 0; i <= degree; i++) kn.push(n - degree);
+  }
+  const t0 = kn[degree], t1 = kn[n];
+  const out: Vec2[] = [];
+  for (let s = 0; s <= samples; s++) {
+    const t = t0 + ((t1 - t0) * s) / samples;
+    // find knot span k with kn[k] <= t < kn[k+1]
+    let k = degree;
+    while (k < n - 1 && t >= kn[k + 1]) k++;
+    // de Boor
+    const d: Vec2[] = [];
+    for (let j = 0; j <= degree; j++) d.push({ ...ctrl[j + k - degree] });
+    for (let r = 1; r <= degree; r++) {
+      for (let j = degree; j >= r; j--) {
+        const i2 = j + k - degree;
+        const den = kn[i2 + degree - r + 1] - kn[i2];
+        const alpha = den > 1e-12 ? (t - kn[i2]) / den : 0;
+        d[j] = { x: (1 - alpha) * d[j - 1].x + alpha * d[j].x, y: (1 - alpha) * d[j - 1].y + alpha * d[j].y };
+      }
     }
+    out.push(d[degree]);
   }
-
-  // line classification (only when requested — keeps the plain call path untouched)
-  let imported: Loop[] = loops;
-  if (options.classify) {
-    const c = options.classify;
-    imported = loops
-      .map((loop) => ({ ...loop, cls: classifyEntity(loop.layer, loop.color, loop.closed, c) }))
-      .filter((loop) =>
-        loop.cls === 'cut' ? (c.importCut ?? true)
-        : loop.cls === 'seam' ? (c.importSeam ?? true)
-        : (c.importInternal ?? true));
-  }
-  return patternFromLoops(imported, name);
+  return out;
 }
 
 /** Convert bulge-bearing DXF vertices into tangent-bearing loop vertices. */

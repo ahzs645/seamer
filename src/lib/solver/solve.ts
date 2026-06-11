@@ -2,7 +2,7 @@
 // formula-constrained points (offset / length+angle / sliding) in dependency order. Points without a
 // `constraint` keep their fixed x/y. Enables measurement-driven re-drafting and true grading.
 
-import type { Pattern, ConstrainablePoint, ConstrainablePath, AlterationDelta, AlterationTrack, PathPoint, BezierHandle } from '$lib/types/pattern';
+import type { Pattern, ConstrainablePoint, ConstrainablePath, AlterationDelta, AlterationTrack, PathPoint, BezierHandle, PiecePath } from '$lib/types/pattern';
 import { evalExpr, referencedNames } from './formula';
 
 export type Scope = Record<string, number>;
@@ -293,7 +293,14 @@ export function solvePoints(pattern: Pattern, scope: Scope): Map<string, Pt> {
 
 /** Any point in the pattern is parametrically constrained? */
 export function hasConstraints(pattern: Pattern): boolean {
-  return pattern.points.some((p) => !!p.constraint);
+  if (pattern.points.some((p) => !!p.constraint)) return true;
+  // property formulas (seam allowance / rotation / grain / condition / notch distance) also redraft
+  return pattern.pieces.some((piece) =>
+    piece.rotationFormula?.formula || piece.grainFormula?.formula || piece.conditionFormula?.formula ||
+    [...piece.mainPaths, ...piece.internalPaths].some((pp) =>
+      pp.seamAllowanceFormula?.formula || pp.cornerRadiusFormula?.formula ||
+      pp.seamCornerLengthFormula?.formula || pp.seamCornerMaxLengthFormula?.formula ||
+      pp.notches?.some((n) => n.distanceFormula?.formula)));
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +411,28 @@ export function captureAlterationDelta(
 
 /** Return a copy of the pattern with variables resolved, constrained points recomputed, alterations applied. */
 export function applySolved(pattern: Pattern, scope: Scope): Pattern {
-  const solved = solvePoints(pattern, scope);
+  // Iterate to a fixed point (the original's "Satisfied constraints after N"): constraints that
+  // read path geometry (sliding/mirror/intersection) see the PREVIOUS pass's positions, so passes
+  // repeat until no point moves more than 0.01 mm (or the pass budget runs out).
+  let solved = solvePoints(pattern, scope);
+  for (let pass = 0; pass < 6; pass++) {
+    const fedBack = {
+      ...pattern,
+      points: pattern.points.map((p) => {
+        const s = solved.get(p.id);
+        return s && (s.x !== p.x || s.y !== p.y) ? { ...p, x: s.x, y: s.y } : p;
+      })
+    };
+    const next = solvePoints(fedBack, scope);
+    let maxD = 0;
+    for (const [id, pt] of next) {
+      const prev = solved.get(id);
+      if (prev) maxD = Math.max(maxD, Math.hypot(pt.x - prev.x, pt.y - prev.y));
+    }
+    solved = next;
+    if (maxD < 0.01) break;
+    if (pass === 5) console.warn(`Failed to satisfy constraints after ${pass + 2} passes (residual ${maxD.toFixed(2)} mm)`);
+  }
   const delta = combinedAlterationDelta(pattern, scope);
   const points: ConstrainablePoint[] = pattern.points.map((p) => {
     const s = solved.get(p.id);
@@ -429,7 +457,67 @@ export function applySolved(pattern: Pattern, scope: Scope): Pattern {
       })
     : pattern.paths;
   const variables = pattern.variables.map((v) => (v.name in scope ? { ...v, value: scope[v.name] } : v));
-  return { ...pattern, points, paths, variables };
+  return applyPropertyFormulas({ ...pattern, points, paths, variables }, scope);
+}
+
+/**
+ * Formula-driven properties (the original's *Formula fields): seam allowance, corner radius/length,
+ * notch distance, piece rotation/grain, and conditionFormula (0 → piece hidden). Evaluated against
+ * the same variable/measurement scope as point constraints on every redraft; an empty formula
+ * leaves the plain numeric field in charge.
+ */
+function applyPropertyFormulas(pattern: Pattern, scope: Scope): Pattern {
+  const num = (f: { formula: string; unit?: string } | undefined): number | null => {
+    if (!f?.formula?.trim()) return null;
+    const v = evalExpr(f.formula, scope);
+    if (v === null || !Number.isFinite(v)) return null;
+    const u = f.unit;
+    return u === 'cm' ? v * 10 : u === 'inch' ? v * 25.4 : v; // lengths default to mm; angles raw
+  };
+  let touched = false;
+  const mapPath = (pp: PiecePath): PiecePath => {
+    const sa = num(pp.seamAllowanceFormula);
+    const cr = num(pp.cornerRadiusFormula);
+    const cl = num(pp.seamCornerLengthFormula);
+    const cm = num(pp.seamCornerMaxLengthFormula);
+    let notches = pp.notches;
+    if (pp.notches?.some((n) => n.distanceFormula?.formula?.trim())) {
+      notches = pp.notches.map((n) => {
+        const d = num(n.distanceFormula);
+        return d === null || d === n.distance ? n : { ...n, distance: d };
+      });
+      if (notches.some((n, i) => n !== pp.notches![i])) touched = true;
+      else notches = pp.notches;
+    }
+    if (sa === null && cr === null && cl === null && cm === null && notches === pp.notches) return pp;
+    const next: PiecePath = { ...pp, notches };
+    if (sa !== null && sa !== pp.seamAllowance) { next.seamAllowance = sa; touched = true; }
+    if (cr !== null && cr !== pp.cornerRadius) { next.cornerRadius = cr; touched = true; }
+    if (cl !== null && cl !== pp.seamCornerLength) { next.seamCornerLength = cl; touched = true; }
+    if (cm !== null && cm !== pp.seamCornerMaxLength) { next.seamCornerMaxLength = cm; touched = true; }
+    return touched ? next : pp;
+  };
+  const pieces = pattern.pieces.map((piece) => {
+    const next = { ...piece, mainPaths: piece.mainPaths.map(mapPath), internalPaths: piece.internalPaths.map(mapPath) };
+    const rot = num(piece.rotationFormula);
+    if (rot !== null && rot !== piece.rotation) { next.rotation = rot; touched = true; }
+    const grain = num(piece.grainFormula);
+    if (grain !== null) {
+      const rad = (grain * Math.PI) / 180;
+      const gv = { ...piece.grainVector, x: Math.cos(rad), y: Math.sin(rad) };
+      if (Math.abs(gv.x - piece.grainVector.x) > 1e-9 || Math.abs(gv.y - piece.grainVector.y) > 1e-9) {
+        next.grainVector = gv;
+        touched = true;
+      }
+    }
+    const cond = num(piece.conditionFormula);
+    if (cond !== null) {
+      const hidden = cond === 0;
+      if (hidden !== !!piece.hidden) { next.hidden = hidden; touched = true; }
+    }
+    return next;
+  });
+  return touched ? { ...pattern, pieces } : pattern;
 }
 
 /** Re-draft from the pattern's own variable values/formulas (live editing). */

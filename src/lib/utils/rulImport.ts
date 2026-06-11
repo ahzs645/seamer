@@ -149,10 +149,67 @@ export function applyRulToPattern(pattern: Pattern, table: RulTable, opts: Apply
       scale: 1,
       color: SIZE_COLORS[i % SIZE_COLORS.length]
     }));
-  pattern.gradingProfile = { ...(pattern.gradingProfile ?? {}), sizes };
+  // persist the parsed table (serializable form) so per-point grade anchors preview live
+  pattern.gradingProfile = {
+    ...(pattern.gradingProfile ?? {}),
+    sizes,
+    rulTable: toStoredRul({ ...table, sampleSize: base })
+  };
   pattern.currentSize = base;
   pattern.hasChanged = true;
   return pattern;
+}
+
+// ---- persistent grading profile (the original's GradingProfile + grade anchors) -------------------
+
+export type StoredRulTable = NonNullable<NonNullable<Pattern['gradingProfile']>['rulTable']>;
+
+export function toStoredRul(table: RulTable): StoredRulTable {
+  return {
+    name: table.name,
+    isNumeric: table.isNumeric,
+    units: table.units,
+    sizes: table.sizes,
+    sampleSize: table.sampleSize,
+    rules: Object.fromEntries([...table.rules.entries()].map(([k, v]) => [String(k), v]))
+  };
+}
+
+export function fromStoredRul(s: StoredRulTable): RulTable {
+  return {
+    name: s.name,
+    isNumeric: s.isNumeric,
+    units: s.units as RulTable['units'],
+    sizes: s.sizes,
+    sampleSize: s.sampleSize,
+    rules: new Map(Object.entries(s.rules).map(([k, v]) => [Number(k), v]))
+  };
+}
+
+/**
+ * Live per-size geometry from the stored RUL table: every point bound to a rule (gradingProfile.
+ * rulAnchors) shifts by that rule's cumulative offset from the sample size to `sizeName`.
+ * No-op when the profile has no table/anchors or the size isn't in the table.
+ */
+export function applyRulOffsetsToPattern(pattern: Pattern, sizeName: string): Pattern {
+  const gp = pattern.gradingProfile;
+  if (!gp?.rulTable || !gp.rulAnchors?.length) return pattern;
+  const table = fromStoredRul(gp.rulTable);
+  if (!table.sizes.includes(sizeName) || sizeName === table.sampleSize) return pattern;
+  const byPoint = new Map<string, RulSizeBreak>();
+  for (const a of gp.rulAnchors) {
+    try {
+      byPoint.set(a.pointId, cumulativeRuleOffset(table, a.ruleNumber, sizeName));
+    } catch { /* unknown rule/size: skip the anchor */ }
+  }
+  if (byPoint.size === 0) return pattern;
+  return {
+    ...pattern,
+    points: pattern.points.map((p) => {
+      const o = byPoint.get(p.id);
+      return o ? { ...p, x: p.x + o.dx, y: p.y + o.dy } : p;
+    })
+  };
 }
 
 /** One-call helper for the studio import flow: parse the RUL text and apply it to the pattern. */
