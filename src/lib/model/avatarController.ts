@@ -3,7 +3,7 @@
 
 import * as THREE from 'three';
 import type { Body } from '$lib/types/pattern';
-import { loadAvatarAssets, loadGenderAssets, type AvatarAssets, type Cylinder } from './assets';
+import { loadAvatarAssets, loadGenderAssets, type AvatarAssets, type Cylinder, type ArrangementPointDef } from './assets';
 import { solveBodyCoefficients } from './measurements';
 import { reconstructVertices } from './avatar';
 import { SkinnedAvatar } from './skinnedAvatar';
@@ -80,6 +80,10 @@ export class AvatarController {
 
   get cylinderDefs(): Cylinder[] {
     return this.assets.baseModel.cylinders;
+  }
+
+  get arrangementPointDefs(): ArrangementPointDef[] {
+    return this.assets.baseModel.arrangementPoints ?? [];
   }
 
   bonePosition(name: string, out: THREE.Vector3): THREE.Vector3 | null {

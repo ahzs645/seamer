@@ -24,6 +24,7 @@
     generations: number;
     cutOff: CutOffType;
     cutIds: string[];
+    maxLengthMm?: number;
   }
   // svelte-ignore state_referenced_locally -- intentional one-time read of persisted settings on open
   const saved = (currentPattern.markerSettings ?? null) as Partial<MarkerSettings> | null;
@@ -31,6 +32,7 @@
   let algorithm = $state<MarkerSettings['algorithm']>(saved?.algorithm ?? 'nfp');
   let fabricWidthMm = $state(saved?.fabricWidthMm ?? 1400);
   let gapMm = $state(saved?.gapMm ?? 10);
+  let maxLengthMm = $state(saved?.maxLengthMm ?? 0); // 0 = unlimited (single sheet)
   let rotationMode = $state(rotationsToMode(saved?.allowedRotations));
   let generations = $state(saved?.generations ?? 12);
   let cutOff = $state<CutOffType>(saved?.cutOff ?? 'none');
@@ -57,7 +59,7 @@
   }
 
   function persist() {
-    const settings: MarkerSettings = { algorithm, fabricWidthMm, gapMm, allowedRotations: modeToRotations(), generations, cutOff, cutIds: [...cutIds] };
+    const settings: MarkerSettings = { algorithm, fabricWidthMm, gapMm, maxLengthMm, allowedRotations: modeToRotations(), generations, cutOff, cutIds: [...cutIds] };
     onchange({ ...currentPattern, markerSettings: settings, hasChanged: true }, 'Cutting room settings');
   }
 
@@ -72,7 +74,7 @@
         job?.cancel();
         job = nestInWorker(
           currentPattern,
-          { fabricWidthMm, gapMm, allowedRotations: modeToRotations(), generations, strategy: 'nfp' },
+          { fabricWidthMm, gapMm, maxLengthMm, allowedRotations: modeToRotations(), generations, strategy: 'nfp' },
           (p) => (progress = p)
         );
         layout = await job.promise;
@@ -217,6 +219,10 @@
           <input type="number" min="100" step="10" class="input input-bordered input-sm" bind:value={fabricWidthMm} /></label>
         <label class="flex flex-col gap-1">Gap (mm)
           <input type="number" min="0" step="1" class="input input-bordered input-sm" bind:value={gapMm} /></label>
+        {#if algorithm === 'nfp'}
+          <label class="flex flex-col gap-1" title="Limit each fabric sheet's marker length; overflow pieces spill onto more sheets (bins)">Max sheet length (mm, 0 = unlimited)
+            <input type="number" min="0" step="100" class="input input-bordered input-sm" bind:value={maxLengthMm} /></label>
+        {/if}
         {#if algorithm === 'trueShape' || algorithm === 'nfp'}
           <label class="flex flex-col gap-1">Allowed rotations
             <select class="select select-bordered select-sm" bind:value={rotationMode}>
@@ -310,6 +316,7 @@
           <div class="border-t border-base-300 pt-2 text-xs space-y-1">
             <div>Pieces: <b>{layout.placements.length}</b> ({uncut} uncut)</div>
             <div>Length: <b>{Math.round(layout.usedLengthMm)}</b> mm</div>
+            {#if layout.bins?.length}<div>Sheets: <b>{layout.bins.length}</b></div>{/if}
             {#if layout.efficiency !== undefined}<div>Efficiency: <b>{(layout.efficiency * 100).toFixed(1)}%</b></div>{/if}
           </div>
           <div class="flex gap-1">

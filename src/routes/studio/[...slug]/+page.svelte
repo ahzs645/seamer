@@ -279,6 +279,14 @@
     saved = false;
   }
 
+  // Camera write-back from the 3D view (debounced upstream). Not an undo-able edit — like a
+  // settled drape, it just persists so reload restores the same view.
+  function handleCameraChange(pos: [number, number, number], target: [number, number, number], fov: number) {
+    currentPattern = { ...currentPattern, settings3d: { ...currentPattern.settings3d, cameraPosition: pos, controlsTarget: target, cameraFov: fov } };
+    pattern.set(currentPattern);
+    saved = false;
+  }
+
   async function handleSave() {
     currentPattern = { ...currentPattern, name: patternName };
     await saveToDB(currentPattern); saved = true; saveCount += 1;
@@ -666,11 +674,11 @@
     <div class="flex-1 flex overflow-hidden">
       {#if viewMode === 'both'}
         <div class="w-1/2 border-r relative" data-tour-id="tour-canvas-2d"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
-        <div class="w-1/2 relative" data-tour-id="tour-canvas-3d"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
+        <div class="w-1/2 relative" data-tour-id="tour-canvas-3d"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} onpatternupdate={handlePatternUpdate} oncamerachange={handleCameraChange} {labelDisplay} /></div>
       {:else if viewMode === '2d'}
         <div class="flex-1 relative" data-tour-id="tour-canvas-2d"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
       {:else}
-        <div class="flex-1 relative" data-tour-id="tour-canvas-3d"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
+        <div class="flex-1 relative" data-tour-id="tour-canvas-3d"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} onpatternupdate={handlePatternUpdate} oncamerachange={handleCameraChange} {labelDisplay} /></div>
       {/if}
     </div>
 

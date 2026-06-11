@@ -21,6 +21,8 @@ export interface Placement {
   rotationDeg?: number;
   /** stable instance id (pieceId + occurrence) — used for cut tracking */
   instanceId?: string;
+  /** multi-bin nests: which fabric sheet this piece landed on (0-based) */
+  bin?: number;
 }
 
 export interface MarkerLayout {
@@ -30,6 +32,8 @@ export interface MarkerLayout {
   placements: Placement[];
   /** fabric utilisation: sum of piece areas ÷ (fabricWidth × usedLength), 0..1 (true-shape only) */
   efficiency?: number;
+  /** multi-bin nests: each sheet's vertical band in the continuous marker space */
+  bins?: { startYmm: number; usedLengthMm: number }[];
 }
 
 function polyBounds(poly: Vec2[]) {
@@ -112,6 +116,8 @@ export interface NestOptions {
   generations?: number;
   /** GA population size. Default 16. */
   population?: number;
+  /** max marker length per fabric sheet (mm); overflow spills into more bins. 0 = unlimited. */
+  maxLengthMm?: number;
 }
 
 function rotatePoly(poly: Vec2[], deg: number): Vec2[] {
@@ -328,6 +334,11 @@ export function markerToSVG(layout: MarkerLayout, cutOff: CutOffType = 'none', c
   const cutSVG = cut.length >= 3
     ? `  <path d="${path(cut, false)}" fill="none" stroke="#ef4444" stroke-width="0.8" stroke-dasharray="6,3"/>\n`
     : '';
+  // multi-bin layouts: outline each fabric sheet's band + label it
+  const binsSVG = (layout.bins ?? []).map((b, i) =>
+    `  <rect x="0" y="${b.startYmm.toFixed(1)}" width="${W.toFixed(1)}" height="${b.usedLengthMm.toFixed(1)}" fill="none" stroke="#ef4444" stroke-width="0.6" stroke-dasharray="8,4"/>\n` +
+    `  <text x="2" y="${(b.startYmm + 10).toFixed(1)}" font-size="9" fill="#ef4444">Sheet ${i + 1}</text>`
+  ).join('\n');
   const body = layout.placements.map((pl) => {
     const cx = pl.poly.reduce((s, p) => s + p.x, 0) / (pl.poly.length || 1);
     const cy = pl.poly.reduce((s, p) => s + p.y, 0) / (pl.poly.length || 1);
@@ -341,6 +352,6 @@ export function markerToSVG(layout: MarkerLayout, cutOff: CutOffType = 'none', c
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${W.toFixed(1)}mm" height="${H.toFixed(1)}mm" viewBox="0 0 ${W.toFixed(1)} ${H.toFixed(1)}">
   <rect x="0" y="0" width="${W.toFixed(1)}" height="${H.toFixed(1)}" fill="none" stroke="#0ea5e9" stroke-width="0.6"/>
-${cutSVG}${body}
+${binsSVG}${cutSVG}${body}
 </svg>`;
 }

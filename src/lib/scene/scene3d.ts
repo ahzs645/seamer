@@ -10,6 +10,7 @@ import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { BokehPass } from 'three/examples/jsm/postprocessing/BokehPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import type { Pattern, Material } from '$lib/types/pattern';
@@ -67,7 +68,31 @@ export class PatternRenderer {
   // if the composer fails to build, we fall back to direct rendering.
   private composer: EffectComposer | null = null;
   private gtaoPass: GTAOPass | null = null;
+  private bokehPass: BokehPass | null = null;
   private postEnabled = true;
+  private bokehFStop = 0; // 0 = depth of field off; focus auto-tracks the orbit target each frame
+
+  // camera persistence: fired (debounced) after the user orbits/zooms so the app can save the view
+  onCameraChanged: (pos: [number, number, number], target: [number, number, number], fov: number) => void = () => {};
+  private cameraSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  // camera view tween (animated front/back/left/… transitions)
+  private camTween: { fromPos: THREE.Vector3; toPos: THREE.Vector3; fromTgt: THREE.Vector3; toTgt: THREE.Vector3; start: number; dur: number } | null = null;
+
+  // Named arrangement-point markers from base_model.json: rendered on the body when enabled;
+  // in arrange mode, clicking one snaps the selected piece's arrangement to that point.
+  private apGroup = new THREE.Group();
+  private apGeo: THREE.SphereGeometry | null = null;
+  private apMarkers: { name: string; cylinderName: string; uDegrees: number; v: number; mesh: THREE.Mesh }[] = [];
+  private showArrangementPointsFlag = false;
+  private apHover: THREE.Mesh | null = null;
+  onArrangementPointPicked: (pick: { pieceId: string; name: string; cylinderName: string; uDegrees: number; v: number }) => void = () => {};
+  onArrangementPointHover: (name: string | null) => void = () => {};
+
+  // 3D measurements: the 2D Measure tool's distance measurements shown on the draped garment
+  // (endpoints mapped to the nearest cloth particles; lines/labels track the live sim).
+  private measureGroup = new THREE.Group();
+  private measureDefs: { id: string; name: string; a: { x: number; y: number }; b: { x: number; y: number }; unit: string }[] = [];
+  private measureEntries: { aIdx: number; bIdx: number; name: string; unit: string; line: THREE.Line; label: THREE.Sprite; lastLen: number; lastTextAt: number }[] = [];
 
   private avatar: AvatarController | null = null;
   private cylinders: Map<string, CylinderFrame> = new Map();
@@ -207,8 +232,13 @@ export class PatternRenderer {
     this.controls.minDistance = 0.3;
     this.controls.maxDistance = 6;
     this.controls.update();
+    // persist the view: debounce-fire after each completed orbit/zoom/pan interaction
+    this.controls.addEventListener('end', () => this.queueCameraSave());
+    this.controls.addEventListener('start', () => { this.camTween = null; }); // user grabbed: stop tweening
 
     this.scene.add(this.clothGroup);
+    this.scene.add(this.apGroup);
+    this.scene.add(this.measureGroup);
     this.setupLights();
     this.setupFloor();
     this.setupGrab();
@@ -232,13 +262,40 @@ export class PatternRenderer {
       // World-space radii tuned for human/garment scale (metres): subtle contact darkening.
       gtao.updateGtaoMaterial({ radius: 0.12, distanceExponent: 1.0, thickness: 0.1, scale: 1.0, samples: 16 });
       composer.addPass(gtao);
+      // Depth of field (the source's bokeh camera setting). Disabled until a positive f-stop is
+      // applied; the focus distance auto-tracks the orbit target in the render loop.
+      const bokeh = new BokehPass(this.scene, this.camera, { focus: 1.0, aperture: 0, maxblur: 0.01 });
+      bokeh.enabled = false;
+      composer.addPass(bokeh);
       composer.addPass(new SMAAPass(w, h));
       composer.addPass(new OutputPass());
       this.composer = composer;
       this.gtaoPass = gtao;
+      this.bokehPass = bokeh;
     } catch (e) {
-      this.composer = null; this.gtaoPass = null;
+      this.composer = null; this.gtaoPass = null; this.bokehPass = null;
       console.warn('Post-processing unavailable, using direct render:', e);
+    }
+  }
+
+  /** Apply the pattern's post-processing settings: AO enable/intensity/radius/falloff + bokeh f-stop. */
+  applyPostSettings(s: { aoEnabled?: boolean; aoIntensity?: number; aoRadius?: number; aoFalloff?: number; bokehFStop?: number }): void {
+    if (this.gtaoPass) {
+      this.gtaoPass.enabled = s.aoEnabled !== false;
+      if (typeof s.aoIntensity === 'number' && Number.isFinite(s.aoIntensity)) {
+        this.gtaoPass.blendIntensity = Math.max(0, Math.min(2, s.aoIntensity));
+      }
+      const radius = typeof s.aoRadius === 'number' && s.aoRadius > 0 ? s.aoRadius : 0.12;
+      const falloff = typeof s.aoFalloff === 'number' && s.aoFalloff > 0 ? s.aoFalloff : 1.0;
+      this.gtaoPass.updateGtaoMaterial({ radius, distanceExponent: falloff, thickness: 0.1, scale: 1.0, samples: 16 });
+    }
+    if (this.bokehPass) {
+      this.bokehFStop = typeof s.bokehFStop === 'number' && s.bokehFStop > 0 ? s.bokehFStop : 0;
+      this.bokehPass.enabled = this.bokehFStop > 0;
+      // BokehPass aperture: smaller f-stop -> wider aperture -> more blur.
+      const uniforms = this.bokehPass.uniforms as unknown as Record<string, { value: number }>;
+      uniforms['aperture'].value = this.bokehFStop > 0 ? Math.min(0.05, 0.025 / this.bokehFStop) : 0;
+      uniforms['maxblur'].value = 0.01;
     }
   }
 
@@ -346,6 +403,13 @@ export class PatternRenderer {
       if (this.mode === 'arrange') {
         if (this.transform && (this.transform.dragging || this.transform.axis)) return; // gizmo handle -> let it drag
         setNdc(ev);
+        // arrangement-point snap: with a piece selected, clicking a marker binds the piece to it
+        const marker = this.pickArrangementMarker(ndc);
+        if (marker && this.selectedArrange >= 0) {
+          const pieceId = this.arrangeEntries[this.selectedArrange].pieceId.replace(/#M$/, '');
+          this.onArrangementPointPicked({ pieceId, name: marker.name, cylinderName: marker.cylinderName, uDegrees: marker.uDegrees, v: marker.v });
+          return;
+        }
         // A piece just moved by the gizmo only has its world matrix updated at render time; force it
         // current (and refresh bounds) so the raycast hits the piece at its NEW location.
         this.arrangeGroup.updateMatrixWorld(true);
@@ -402,6 +466,18 @@ export class PatternRenderer {
     });
 
     dom.addEventListener('pointermove', (ev) => {
+      // arrangement-marker hover highlight (cheap raycast against the small marker set)
+      if (!this.grabbing && this.apGroup.visible && this.apMarkers.length) {
+        setNdc(ev);
+        const marker = this.pickArrangementMarker(ndc);
+        const mesh = marker?.mesh ?? null;
+        if (mesh !== this.apHover) {
+          if (this.apHover) (this.apHover.material as THREE.MeshBasicMaterial).color.setHex(0x0ea5e9);
+          this.apHover = mesh;
+          if (this.apHover) (this.apHover.material as THREE.MeshBasicMaterial).color.setHex(0xf97316);
+          this.onArrangementPointHover(marker?.name ?? null);
+        }
+      }
       if (!this.grabbing || !this.sim) return;
       setNdc(ev);
       this.raycaster.setFromCamera(ndc, this.camera);
@@ -470,10 +546,33 @@ export class PatternRenderer {
   private renderLoop = () => {
     if (this.disposed) return;
     this.rafId = requestAnimationFrame(this.renderLoop);
+    // animated camera-view transition (eased; cancelled by user interaction)
+    if (this.camTween) {
+      const t = Math.min(1, (performance.now() - this.camTween.start) / this.camTween.dur);
+      const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; // easeInOutCubic
+      this.camera.position.lerpVectors(this.camTween.fromPos, this.camTween.toPos, e);
+      this.controls.target.lerpVectors(this.camTween.fromTgt, this.camTween.toTgt, e);
+      if (t >= 1) { this.camTween = null; this.queueCameraSave(); }
+    }
     this.controls.update();
+    // depth of field: keep the focal plane on the orbit target (the garment)
+    if (this.bokehPass?.enabled) {
+      (this.bokehPass.uniforms as unknown as Record<string, { value: number }>)['focus'].value =
+        this.camera.position.distanceTo(this.controls.target);
+    }
     if (this.composer && this.postEnabled) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
   };
+
+  /** Debounced camera write-back (orbit end, tween end, FOV change). */
+  private queueCameraSave(): void {
+    clearTimeout(this.cameraSaveTimer);
+    this.cameraSaveTimer = setTimeout(() => {
+      if (this.disposed) return;
+      const p = this.camera.position, t = this.controls.target;
+      this.onCameraChanged([p.x, p.y, p.z], [t.x, t.y, t.z], this.camera.fov);
+    }, 600);
+  }
 
   /** Build or update the avatar + cloth for a pattern. */
   async setPattern(pattern: Pattern, changedPieces?: Set<string>): Promise<void> {
@@ -545,6 +644,7 @@ export class PatternRenderer {
     // later body edit these are the OLD frames the cylinder re-fit projects from. (Keep them across a
     // dirty rebuild — don't overwrite with the new-body frames.)
     if (!this.bodyDirty || !this.baseCylinders) this.baseCylinders = this.cylinders;
+    this.rebuildArrangementMarkers();
     this.prepared = prepareCloth({ pattern, avatarVertices: verts, avatarIndices: indices, cylinders: this.cylinders }, { changedPieces });
     if (!this.prepared) return;
 
@@ -607,6 +707,7 @@ export class PatternRenderer {
       this.pieceLabels.push({ pieceId: piece.pieceId, obj, aspect });
     }
     this.applyClothPositions(this.prepared.simData.positions);
+    this.rebuildMeasurements();
   }
 
   /** Add a per-piece `uvLabel` attribute (0..1 across the piece's pattern bbox); returns bbox size in mm. */
@@ -661,11 +762,13 @@ export class PatternRenderer {
       label.obj.position.set(cx / entry.count, cy / entry.count, cz / entry.count);
     }
     this.updateSeamLines(global);
+    this.updateMeasureGroup(global);
   }
 
   private clearClothMeshes() {
     this.clearSnapshot(); // a ghost from the old drape would be stale once pieces rebuild
     this.clearSeamLines();
+    this.clearMeasurements(); // particle indices die with the meshes; rebuilt after the new build
     for (const e of this.clothMeshes) {
       this.clothGroup.remove(e.mesh);
       e.geometry.dispose();
@@ -1325,25 +1428,32 @@ export class PatternRenderer {
     }
   }
 
-  /** Snap the camera to an orthographic-style preset around the current target. */
+  /** Animate the camera to an orthographic-style preset around the current target. */
   setCameraView(view: 'front' | 'back' | 'left' | 'right' | 'top' | 'reset'): void {
+    let toPos: THREE.Vector3;
+    let toTgt: THREE.Vector3;
     if (view === 'reset') {
-      this.camera.position.set(0.5, 0.9, 1.6);
-      this.controls.target.set(0, 0.9, 0);
-      this.controls.update();
-      return;
+      toPos = new THREE.Vector3(0.5, 0.9, 1.6);
+      toTgt = new THREE.Vector3(0, 0.9, 0);
+    } else {
+      toTgt = this.controls.target.clone();
+      const dist = this.camera.position.distanceTo(toTgt) || 1.8;
+      const off = new THREE.Vector3();
+      if (view === 'front') off.set(0, 0, dist);
+      else if (view === 'back') off.set(0, 0, -dist);
+      else if (view === 'left') off.set(-dist, 0, 0);
+      else if (view === 'right') off.set(dist, 0, 0);
+      else off.set(0, dist, 0.001); // top (tiny z avoids a degenerate up vector)
+      toPos = toTgt.clone().add(off);
     }
-    const t = this.controls.target;
-    const dist = this.camera.position.distanceTo(t) || 1.8;
-    const off = new THREE.Vector3();
-    if (view === 'front') off.set(0, 0, dist);
-    else if (view === 'back') off.set(0, 0, -dist);
-    else if (view === 'left') off.set(-dist, 0, 0);
-    else if (view === 'right') off.set(dist, 0, 0);
-    else off.set(0, dist, 0.001); // top (tiny z avoids a degenerate up vector)
-    this.camera.position.copy(t).add(off);
-    this.camera.lookAt(t);
-    this.controls.update();
+    this.camTween = {
+      fromPos: this.camera.position.clone(),
+      toPos,
+      fromTgt: this.controls.target.clone(),
+      toTgt,
+      start: performance.now(),
+      dur: 450
+    };
   }
 
   /** Camera field of view (degrees). */
@@ -1353,6 +1463,7 @@ export class PatternRenderer {
   setCameraFov(deg: number): void {
     this.camera.fov = Math.max(10, Math.min(120, deg));
     this.camera.updateProjectionMatrix();
+    this.queueCameraSave();
   }
 
   /** Capture the current 3D view as a PNG data URL. Renders a fresh frame first, then reads the
@@ -1385,12 +1496,143 @@ export class PatternRenderer {
     return group;
   }
 
+  // ---- Arrangement-point markers ---------------------------------------------------------------
+
+  /** Toggle the named arrangement-point markers (the source's arrangement point overlay). */
+  setShowArrangementPoints(on: boolean): void {
+    this.showArrangementPointsFlag = on;
+    this.rebuildArrangementMarkers();
+  }
+
+  private clearArrangementMarkers(): void {
+    for (const m of this.apMarkers) {
+      this.apGroup.remove(m.mesh);
+      (m.mesh.material as THREE.Material).dispose();
+    }
+    this.apMarkers = [];
+    this.apHover = null;
+  }
+
+  private rebuildArrangementMarkers(): void {
+    this.clearArrangementMarkers();
+    this.apGroup.visible = this.showArrangementPointsFlag;
+    if (!this.showArrangementPointsFlag || !this.avatar || this.cylinders.size === 0) return;
+    if (!this.apGeo) this.apGeo = new THREE.SphereGeometry(0.008, 10, 8);
+    for (const def of this.avatar.arrangementPointDefs) {
+      if (def.enabled === false) continue;
+      const frame = this.cylinders.get(def.cylinderName);
+      if (!frame) continue;
+      const mat = new THREE.MeshBasicMaterial({ color: 0x0ea5e9, depthTest: false, transparent: true, opacity: 0.85 });
+      const mesh = new THREE.Mesh(this.apGeo, mat);
+      mesh.renderOrder = 10;
+      frame.uvToWorld(def.uDegrees, def.v, 0.012, mesh.position);
+      this.apGroup.add(mesh);
+      this.apMarkers.push({ name: def.name, cylinderName: def.cylinderName, uDegrees: def.uDegrees, v: def.v, mesh });
+    }
+  }
+
+  /** Raycast the arrangement markers; returns the hit marker or null. */
+  private pickArrangementMarker(ndc: THREE.Vector2): (typeof this.apMarkers)[number] | null {
+    if (!this.apGroup.visible || this.apMarkers.length === 0) return null;
+    this.raycaster.setFromCamera(ndc, this.camera);
+    const hits = this.raycaster.intersectObjects(this.apMarkers.map((m) => m.mesh), false);
+    return hits[0] ? this.apMarkers.find((m) => m.mesh === hits[0].object) ?? null : null;
+  }
+
+  // ---- 3D measurements ---------------------------------------------------------------------------
+
+  /** Show the given distance measurements on the draped garment (endpoints in plan mm). */
+  setMeasurements(defs: { id: string; name: string; a: { x: number; y: number }; b: { x: number; y: number }; unit: string }[]): void {
+    this.measureDefs = defs;
+    this.rebuildMeasurements();
+  }
+
+  private clearMeasurements(): void {
+    for (const e of this.measureEntries) {
+      this.measureGroup.remove(e.line);
+      this.measureGroup.remove(e.label);
+      e.line.geometry.dispose();
+      (e.line.material as THREE.Material).dispose();
+      ((e.label.material as THREE.SpriteMaterial).map as THREE.Texture | null)?.dispose();
+      (e.label.material as THREE.Material).dispose();
+    }
+    this.measureEntries = [];
+  }
+
+  private rebuildMeasurements(): void {
+    this.clearMeasurements();
+    if (!this.prepared || this.measureDefs.length === 0) return;
+    const sd = this.prepared.simData;
+    const count = sd.positions2d.length / 4;
+    // nearest particle by plan-space (2D) distance; measurement endpoints are mm, positions2d metres
+    const nearest = (pt: { x: number; y: number }): number => {
+      const px = pt.x / 1000, py = pt.y / 1000;
+      let best = -1, bd = 0.025 * 0.025; // 25 mm snap tolerance
+      for (let i = 0; i < count; i++) {
+        const dx = sd.positions2d[i * 4] - px, dy = sd.positions2d[i * 4 + 1] - py;
+        const d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    };
+    for (const def of this.measureDefs) {
+      const aIdx = nearest(def.a), bIdx = nearest(def.b);
+      if (aIdx < 0 || bIdx < 0) continue;
+      const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xf97316, depthTest: false, transparent: true, opacity: 0.95 }));
+      line.renderOrder = 11;
+      line.frustumCulled = false;
+      const { tex, aspect } = this.makeLabelTexture(`${def.name}: …`);
+      const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false }));
+      label.renderOrder = 12;
+      const H = 0.032;
+      label.scale.set(H * aspect, H, 1);
+      this.measureGroup.add(line);
+      this.measureGroup.add(label);
+      this.measureEntries.push({ aIdx, bIdx, name: def.name, unit: def.unit, line, label, lastLen: -1, lastTextAt: 0 });
+    }
+    this.updateMeasureGroup(this.sim?.positions ?? sd.positions);
+  }
+
+  /** Track the live cloth: reposition measurement lines/labels and refresh texts (throttled). */
+  private updateMeasureGroup(global: Float32Array): void {
+    if (this.measureEntries.length === 0) return;
+    const now = performance.now();
+    for (const e of this.measureEntries) {
+      const ax = global[e.aIdx * 4], ay = global[e.aIdx * 4 + 1], az = global[e.aIdx * 4 + 2];
+      const bx = global[e.bIdx * 4], by = global[e.bIdx * 4 + 1], bz = global[e.bIdx * 4 + 2];
+      const attr = e.line.geometry.getAttribute('position') as THREE.BufferAttribute;
+      attr.setXYZ(0, ax, ay, az);
+      attr.setXYZ(1, bx, by, bz);
+      attr.needsUpdate = true;
+      e.label.position.set((ax + bx) / 2, (ay + by) / 2 + 0.02, (az + bz) / 2);
+      const lenMm = Math.hypot(bx - ax, by - ay, bz - az) * 1000;
+      // re-bake the label text only on meaningful change, at most ~4×/s
+      if (Math.abs(lenMm - e.lastLen) > 0.5 && now - e.lastTextAt > 250) {
+        e.lastLen = lenMm;
+        e.lastTextAt = now;
+        const disp = e.unit === 'inch' ? `${(lenMm / 25.4).toFixed(2)} in` : e.unit === 'cm' ? `${(lenMm / 10).toFixed(1)} cm` : `${lenMm.toFixed(0)} mm`;
+        const { tex, aspect } = this.makeLabelTexture(`${e.name}: ${disp}`);
+        const mat = e.label.material as THREE.SpriteMaterial;
+        (mat.map as THREE.Texture | null)?.dispose();
+        mat.map = tex;
+        mat.needsUpdate = true;
+        const H = 0.032;
+        e.label.scale.set(H * aspect, H, 1);
+      }
+    }
+  }
+
   dispose() {
     this.disposed = true;
     this.simulating = false;
     cancelAnimationFrame(this.rafId);
+    clearTimeout(this.cameraSaveTimer);
     window.removeEventListener('resize', this.onResize);
     this.themeUnsub();
+    this.clearArrangementMarkers();
+    this.apGeo?.dispose();
+    this.clearMeasurements();
     if (this.mode === 'arrange') this.exitArrangeMode();
     this.transform?.detach();
     this.transform?.dispose();

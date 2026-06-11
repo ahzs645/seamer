@@ -4,7 +4,7 @@
   import { PatternRenderer, type RendererStatus, type SceneMode } from '$lib/scene/scene3d';
   import type { SimConfig } from '$lib/sim/config';
   import { isDarkTheme, toggleTheme, applyStoredTheme } from '$lib/utils/theme';
-  import { pieceGeometrySignature } from '$lib/utils/patternGeometry';
+  import { pieceGeometrySignature, indexPoints, placedPoints } from '$lib/utils/patternGeometry';
   import { show3dStats, simAnchors } from '$lib/stores/pattern';
 
   // lightweight FPS meter for the optional stats overlay (Settings → 3D stats)
@@ -28,9 +28,13 @@
     labelDisplay?: 'off' | 'billboard' | 'flat';
     /** Fired when a user-run drape settles, with per-piece settled savedPositions to persist. */
     ondrapesettled?: (savedByPiece: Record<string, number[]>) => void;
+    /** Undo-aware pattern update (arrangement-point snaps, freeze toggle). */
+    onpatternupdate?: (p: Pattern, label?: string) => void;
+    /** Non-undo camera write-back so the view survives a reload. */
+    oncamerachange?: (pos: [number, number, number], target: [number, number, number], fov: number) => void;
   }
 
-  let { currentPattern, selectedPieceId = null, onpieceselect, labelDisplay = 'flat', ondrapesettled }: Props = $props();
+  let { currentPattern, selectedPieceId = null, onpieceselect, labelDisplay = 'flat', ondrapesettled, onpatternupdate, oncamerachange }: Props = $props();
 
   let containerEl: HTMLDivElement;
   let renderer: PatternRenderer | null = null;
@@ -117,6 +121,19 @@
     renderer.onStatus = (s, msg) => { status = s; statusMessage = msg ?? ''; };
     renderer.onModeChange = (m, piece, kind) => { sceneMode = m; selectedPiece = piece; arrangeKind = kind ?? null; };
     renderer.onSelectPiece = (id) => { onpieceselect?.(id); };
+    renderer.onCameraChanged = (pos, target, fov) => { oncamerachange?.(pos, target, fov); };
+    renderer.onArrangementPointHover = (name) => { hoveredArrangementPoint = name; };
+    renderer.onArrangementPointPicked = ({ pieceId, name, cylinderName, uDegrees, v }) => {
+      // bind the selected piece's arrangement to the clicked named point (rebuild re-seats it)
+      const pieces = currentPattern.pieces.map((p) => (p.id !== pieceId ? p : {
+        ...p,
+        settings3d: {
+          ...p.settings3d,
+          arrangement: { ...p.settings3d.arrangement, cylinderName, uDegrees, v, uOffsetMm: 0, vOffsetMm: 0, use2DPosition: false, positionChanged: false }
+        }
+      }));
+      onpatternupdate?.({ ...currentPattern, pieces, hasChanged: true }, `Arrange on ${name}`);
+    };
     renderer.onDrapeSettled = (savedByPiece) => {
       ondrapesettled?.(savedByPiece);
       // the parent has now written savedPositions back into the pattern (synchronously); accept our
@@ -174,6 +191,58 @@
 
   // "Anchor to saved drape" toggle (persisted): OFF = source-parity free-run (anchor scale 0)
   $effect(() => { renderer?.setAnchorsEnabled($simAnchors); });
+
+  let hoveredArrangementPoint = $state<string | null>(null);
+
+  // freeze/unfreeze the active piece (3D selection first, falling back to the 2D selection)
+  const activePieceId = $derived(selectedPiece ?? selectedPieceId ?? null);
+  const frozenSelected = $derived.by(() => {
+    const id = activePieceId;
+    return !!id && (currentPattern.pieces.find((p) => p.id === id)?.settings3d.frozen ?? false);
+  });
+  function toggleFreezeSelected() {
+    const id = activePieceId;
+    if (!id) return;
+    const pieces = currentPattern.pieces.map((p) =>
+      p.id === id ? { ...p, settings3d: { ...p.settings3d, frozen: !p.settings3d.frozen } } : p
+    );
+    const next = pieces.find((p) => p.id === id)?.settings3d.frozen;
+    onpatternupdate?.({ ...currentPattern, pieces, hasChanged: true }, next ? 'Freeze piece' : 'Unfreeze piece');
+  }
+
+  // post-processing settings (AO + depth of field) applied live from the pattern
+  $effect(() => {
+    const s = currentPattern.settings3d;
+    renderer?.applyPostSettings({
+      aoEnabled: s.n8aoEnabled,
+      aoIntensity: s.n8aoIntensity,
+      aoRadius: s.n8aoRadius,
+      aoFalloff: s.n8aoDistanceFalloff,
+      bokehFStop: s.bokehFStop
+    });
+  });
+
+  // arrangement-point overlay toggle
+  $effect(() => { renderer?.setShowArrangementPoints(currentPattern.settings3d.showArrangementPoints ?? false); });
+
+  // 3D measurements: mirror the 2D Measure tool's distance measurements onto the draped garment
+  $effect(() => {
+    const show = currentPattern.showMeasurements !== false;
+    const points = indexPoints(currentPattern);
+    const placed = placedPoints(currentPattern, points);
+    const world = (id: string) => placed.find((q) => q.pointId === id)?.world ?? null;
+    const defs = show
+      ? (currentPattern.measurements ?? [])
+          .filter((m) => m.kind !== 'angle')
+          .map((m) => {
+            const a = world(m.fromPointId);
+            const b = world(m.toPointId);
+            return a && b ? { id: m.id, name: m.name, a, b, unit: currentPattern.lengthUnit } : null;
+          })
+          .filter((m): m is NonNullable<typeof m> => !!m)
+      : [];
+    renderer?.setMeasurements(defs);
+  });
 
   function toggleSimulate() {
     if (!renderer) return;
@@ -285,6 +354,7 @@
     { label: 'Show avatar', icon: 'person', onClick: toggleAvatar, active: () => showAvatar },
     { label: sceneMode === 'arrange' && arrangeKind === 'arrange' ? 'Exit arrange mode' : 'Arrange (A)', icon: 'scatter_plot', onClick: toggleArrangeMode, active: () => sceneMode === 'arrange' && arrangeKind === 'arrange', shortcut: 'A' },
     { label: sceneMode === 'arrange' && arrangeKind === 'manipulate' ? 'Exit move mode' : 'Move pieces (M)', icon: 'open_with', onClick: toggleManipulateMode, active: () => sceneMode === 'arrange' && arrangeKind === 'manipulate', shortcut: 'M' },
+    { label: frozenSelected ? 'Unfreeze piece' : 'Freeze piece', icon: frozenSelected ? 'lock_open' : 'lock', onClick: toggleFreezeSelected, active: () => frozenSelected },
     { label: 'Simulation controls', icon: 'tune', onClick: toggleSimPanel, active: () => showSimPanel },
     { label: dark ? 'Light mode' : 'Dark mode', icon: dark ? 'light_mode' : 'dark_mode', onClick: toggleDark, active: () => dark, sep: true },
     { label: 'Download as OBJ', icon: 'download', onClick: downloadOBJ },
@@ -298,6 +368,11 @@
   <div bind:this={containerEl} class="w-full h-full"></div>
   {#if $show3dStats}
     <div class="absolute bottom-2 right-2 z-20 font-mono text-[11px] bg-black/60 text-green-300 rounded px-2 py-1 pointer-events-none">{fps} fps</div>
+  {/if}
+  {#if hoveredArrangementPoint}
+    <div class="absolute bottom-2 left-1/2 -translate-x-1/2 z-20 text-[11px] bg-base-100/90 border border-base-300 rounded px-2 py-1 pointer-events-none shadow">
+      {hoveredArrangementPoint}{sceneMode === 'arrange' && selectedPiece ? ' — click to arrange the selected piece here' : ''}
+    </div>
   {/if}
 
   {#if !webgpu}

@@ -1104,10 +1104,16 @@
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.settings3d.n8aoEnabled} onchange={(e) => updateSettings3D({ n8aoEnabled: e.currentTarget.checked })} /> Ambient occlusion (N8AO)</label>
               {#if currentPattern.settings3d.n8aoEnabled}
                 <label class="flex items-center justify-between gap-2 text-[11px]">AO intensity
-                  <input type="number" step="0.5" min="0" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.n8aoIntensity}
+                  <input type="number" step="0.1" min="0" max="2" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.n8aoIntensity}
                     oninput={(e) => updateSettings3D({ n8aoIntensity: parseFloat(e.currentTarget.value) || 0 })} /></label>
+                <label class="flex items-center justify-between gap-2 text-[11px]" title="World-space occlusion radius (m) — larger darkens broader cavities">AO radius (m)
+                  <input type="number" step="0.02" min="0.01" max="1" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.n8aoRadius}
+                    oninput={(e) => updateSettings3D({ n8aoRadius: parseFloat(e.currentTarget.value) || 0.12 })} /></label>
+                <label class="flex items-center justify-between gap-2 text-[11px]" title="Distance falloff exponent — higher fades occlusion faster with distance">AO falloff
+                  <input type="number" step="0.1" min="0.1" max="4" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.n8aoDistanceFalloff}
+                    oninput={(e) => updateSettings3D({ n8aoDistanceFalloff: parseFloat(e.currentTarget.value) || 1 })} /></label>
               {/if}
-              <label class="flex items-center justify-between gap-2 text-[11px]">Bokeh f-stop
+              <label class="flex items-center justify-between gap-2 text-[11px]" title="Depth of field: 0 = off; lower f-stops blur more away from the orbit target">Bokeh f-stop
                 <input type="number" step="0.5" min="0" class="input input-bordered input-xs w-20" value={currentPattern.settings3d.bokehFStop}
                   oninput={(e) => updateSettings3D({ bokehFStop: parseFloat(e.currentTarget.value) || 0 })} /></label>
               <label class="flex items-center justify-between gap-2 text-[11px]">SMAA scale

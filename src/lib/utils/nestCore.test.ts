@@ -65,6 +65,37 @@ describe('nestCore (NFP strategy)', () => {
   });
 });
 
+describe('multi-bin nesting', () => {
+  it('spills overflow pieces onto additional sheets when maxLengthMm is set', () => {
+    // four 100×100 squares on a 120-wide fabric capped at 250mm per sheet: 2 fit per sheet
+    const items = Array.from({ length: 4 }, (_, i) => item(`p${i}`, square(100)));
+    const layout = nestCore(items, { ...OPTS, fabricWidthMm: 120, gapMm: 5, maxLengthMm: 250, strategy: 'nfp' });
+    expect(layout.placements).toHaveLength(4);
+    expect(layout.bins?.length).toBe(2);
+    // every piece sits inside its sheet's band
+    for (const pl of layout.placements) {
+      const band = layout.bins![pl.bin ?? 0];
+      for (const p of pl.poly) {
+        expect(p.y).toBeGreaterThanOrEqual(band.startYmm - 1e-6);
+        expect(p.y).toBeLessThanOrEqual(band.startYmm + band.usedLengthMm + 1e-6);
+      }
+    }
+    // no overlaps across the whole continuous marker
+    for (let i = 0; i < layout.placements.length; i++) {
+      for (let j = i + 1; j < layout.placements.length; j++) {
+        expect(polysOverlap(layout.placements[i].poly, layout.placements[j].poly)).toBe(false);
+      }
+    }
+  });
+
+  it('without a cap the layout stays single-bin (no bins field)', () => {
+    const items = Array.from({ length: 3 }, (_, i) => item(`p${i}`, square(80)));
+    const layout = nestCore(items, { ...OPTS, fabricWidthMm: 300, strategy: 'nfp' });
+    expect(layout.bins).toBeUndefined();
+    expect(layout.placements.every((p) => (p.bin ?? 0) === 0)).toBe(true);
+  });
+});
+
 describe('geometry helpers', () => {
   it('offsetPoly grows the bounding box by the offset distance', () => {
     const out = offsetPoly(square(100), 10);

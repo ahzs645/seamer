@@ -38,7 +38,8 @@ export function nestItemsInWorker(
     rotations: opts.allowedRotations?.length ? opts.allowedRotations : [0, 180],
     generations: opts.generations ?? 12,
     population: Math.max(4, opts.population ?? 16),
-    strategy: opts.strategy ?? 'nfp'
+    strategy: opts.strategy ?? 'nfp',
+    maxLengthMm: opts.maxLengthMm && opts.maxLengthMm > 0 ? opts.maxLengthMm : null
   };
 
   const worker = new Worker(new URL('../workers/nesting.worker.ts', import.meta.url), { type: 'module' });

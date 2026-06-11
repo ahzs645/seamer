@@ -34,6 +34,8 @@ export interface CorePlacement {
   bbox: { w: number; h: number };
   rotationDeg?: number;
   instanceId?: string;
+  /** multi-bin nests: which fabric sheet this piece landed on (0-based) */
+  bin?: number;
 }
 
 export interface CoreLayout {
@@ -42,6 +44,8 @@ export interface CoreLayout {
   gapMm: number;
   placements: CorePlacement[];
   efficiency?: number;
+  /** multi-bin nests: each sheet's vertical band in the continuous marker space */
+  bins?: { startYmm: number; usedLengthMm: number }[];
 }
 
 export type NestStrategy = 'corners' | 'nfp';
@@ -57,6 +61,8 @@ export interface CoreOptions {
   seed?: number;
   /** Douglas-Peucker tolerance (mm) for the search copies of dense cut polygons. Default 1. */
   simplifyTolMm?: number;
+  /** maximum marker length per fabric sheet (mm); overflow opens a new bin. 0/undefined = unlimited */
+  maxLengthMm?: number | null;
 }
 
 export interface CoreProgress {
@@ -236,55 +242,61 @@ function placeOrdered(
   rotations: number[],
   fabricWidthMm: number,
   gapMm: number,
-  strategy: NestStrategy
-): { placements: CorePlacement[]; usedLength: number } {
+  strategy: NestStrategy,
+  maxLengthMm?: number | null
+): { placements: CorePlacement[]; binLengths: number[] } {
   interface Placed { search: Vec2[]; inflated: Vec2[]; test: Vec2[]; bounds: ReturnType<typeof polyBounds> }
-  const placed: Placed[] = [];
+  interface Bin { placed: Placed[]; usedLength: number }
+  const maxLen = maxLengthMm && maxLengthMm > 0 ? maxLengthMm : Infinity;
+  const bins: Bin[] = [{ placed: [], usedLength: gapMm }];
   const placements: CorePlacement[] = [];
-  let usedLength = gapMm;
 
   for (let k = 0; k < order.length; k++) {
     const it = order[k];
     const deg = rotations[rotIdx[k] % rotations.length];
     const { full, outline, search, w, h } = it.variants[deg];
     const maxX = fabricWidthMm - w - gapMm;
+    const yCap = maxLen - h - gapMm; // a candidate's y must not push the piece past the bin length
 
-    let best: Vec2 | null = null;
-    if (strategy === 'nfp') {
-      // NFP vertex-contact candidates against every placed piece, plus the fabric origin.
-      const candidates: Vec2[] = [{ x: gapMm, y: gapMm }];
-      for (const pl of placed) {
-        for (const q of pl.inflated) {
-          for (const p of search) {
-            const x = q.x - p.x, y = q.y - p.y;
-            if (x >= gapMm - 1e-9 && x <= maxX + 1e-9 && y >= gapMm - 1e-9) candidates.push({ x, y });
-          }
-        }
-        // bbox corner anchors keep row/shelf structure available too
-        candidates.push({ x: pl.bounds.maxX + gapMm, y: gapMm }, { x: gapMm, y: pl.bounds.maxY + gapMm });
-      }
-      candidates.sort((a, c) => a.y - c.y || a.x - c.x);
-      let lastX = NaN, lastY = NaN;
-      for (const cnd of candidates) {
-        if (cnd.x < gapMm - 1e-9 || cnd.x > maxX + 1e-9 || cnd.y < gapMm - 1e-9) continue;
-        if (cnd.x === lastX && cnd.y === lastY) continue; // dedupe sorted run
-        lastX = cnd.x; lastY = cnd.y;
-        const cand = search.map((p) => ({ x: p.x + cnd.x, y: p.y + cnd.y }));
-        const cb = polyBounds(cand);
-        let ok = true;
+    /** Bottom-left-first feasible position within one bin (respecting the length cap), or null. */
+    const findSpot = (bin: Bin): Vec2 | null => {
+      const placed = bin.placed;
+      if (strategy === 'nfp') {
+        const candidates: Vec2[] = [{ x: gapMm, y: gapMm }];
         for (const pl of placed) {
-          if (cb.maxX < pl.bounds.minX || pl.bounds.maxX < cb.minX || cb.maxY < pl.bounds.minY || pl.bounds.maxY < cb.minY) continue;
-          if (polysOverlap(cand, pl.test)) { ok = false; break; }
+          for (const q of pl.inflated) {
+            for (const p of search) {
+              const x = q.x - p.x, y = q.y - p.y;
+              if (x >= gapMm - 1e-9 && x <= maxX + 1e-9 && y >= gapMm - 1e-9 && y <= yCap + 1e-9) candidates.push({ x, y });
+            }
+          }
+          // bbox corner anchors keep row/shelf structure available too
+          candidates.push({ x: pl.bounds.maxX + gapMm, y: gapMm }, { x: gapMm, y: pl.bounds.maxY + gapMm });
         }
-        if (ok) { best = cnd; break; }
+        candidates.sort((a, c) => a.y - c.y || a.x - c.x);
+        let lastX = NaN, lastY = NaN;
+        for (const cnd of candidates) {
+          if (cnd.x < gapMm - 1e-9 || cnd.x > maxX + 1e-9 || cnd.y < gapMm - 1e-9 || cnd.y > yCap + 1e-9) continue;
+          if (cnd.x === lastX && cnd.y === lastY) continue; // dedupe sorted run
+          lastX = cnd.x; lastY = cnd.y;
+          const cand = search.map((p) => ({ x: p.x + cnd.x, y: p.y + cnd.y }));
+          const cb = polyBounds(cand);
+          let ok = true;
+          for (const pl of placed) {
+            if (cb.maxX < pl.bounds.minX || pl.bounds.maxX < cb.minX || cb.maxY < pl.bounds.minY || pl.bounds.maxY < cb.minY) continue;
+            if (polysOverlap(cand, pl.test)) { ok = false; break; }
+          }
+          if (ok) return cnd;
+        }
+        return null;
       }
-    } else {
       // original shelf-corner candidate fill
       const xs = new Set<number>([gapMm]);
       const ys = new Set<number>([gapMm]);
       for (const pl of placed) { xs.add(pl.bounds.maxX + gapMm); ys.add(pl.bounds.maxY + gapMm); }
-      const sortedYs = [...ys].sort((a, c) => a - c);
+      const sortedYs = [...ys].sort((a, c) => a - c).filter((y) => y <= yCap + 1e-9);
       const sortedXs = [...xs].sort((a, c) => a - c);
+      let best: Vec2 | null = null;
       for (const y of sortedYs) {
         for (const x of sortedXs) {
           if (x + w + gapMm > fabricWidthMm) continue;
@@ -299,23 +311,39 @@ function placeOrdered(
         }
         if (best && best.y <= sortedYs[0]) break;
       }
+      // single-bin fallback (no length cap): below everything, preserving the original behaviour
+      if (!best && maxLen === Infinity) best = { x: gapMm, y: bin.usedLength };
+      return best;
+    };
+
+    let binIdx = -1;
+    let pos: Vec2 | null = null;
+    for (let b = 0; b < bins.length && !pos; b++) {
+      pos = findSpot(bins[b]);
+      if (pos) binIdx = b;
+    }
+    if (!pos) {
+      // open a new bin/sheet (an over-tall piece still gets its own bin at the origin)
+      bins.push({ placed: [], usedLength: gapMm });
+      binIdx = bins.length - 1;
+      pos = { x: gapMm, y: gapMm };
     }
 
-    const pos = best ?? { x: gapMm, y: usedLength };
-    const tr = (poly: Vec2[]) => poly.map((p) => ({ x: p.x + pos.x, y: p.y + pos.y }));
+    const bin = bins[binIdx];
+    const tr = (poly: Vec2[]) => poly.map((p) => ({ x: p.x + pos!.x, y: p.y + pos!.y }));
     const searchT = tr(search);
     // overlap tests run against a slightly under-inflated copy so exact vertex contacts
     // (candidates sit ON the inflated boundary) aren't rejected by numeric noise.
-    placed.push({
+    bin.placed.push({
       search: searchT,
       inflated: gapMm > 0 ? offsetPoly(searchT, gapMm) : searchT,
       test: gapMm > 0 ? offsetPoly(searchT, gapMm * 0.98) : searchT,
       bounds: polyBounds(searchT)
     });
-    placements.push({ pieceId: it.pieceId, name: it.name, poly: tr(full), outline: tr(outline), bbox: { w, h }, rotationDeg: deg, instanceId: it.instanceId });
-    usedLength = Math.max(usedLength, pos.y + h + gapMm);
+    placements.push({ pieceId: it.pieceId, name: it.name, poly: tr(full), outline: tr(outline), bbox: { w, h }, rotationDeg: deg, instanceId: it.instanceId, bin: binIdx });
+    bin.usedLength = Math.max(bin.usedLength, pos.y + h + gapMm);
   }
-  return { placements, usedLength };
+  return { placements, binLengths: bins.map((b) => b.usedLength) };
 }
 
 // ---- genetic ordering search -----------------------------------------------------------------------
@@ -345,7 +373,10 @@ export function nestCore(rawItems: CoreItem[], opts: CoreOptions, onProgress?: (
   const totalArea = items.reduce((s, it) => s + it.area, 0);
   const efficiencyOf = (len: number) => Math.min(1, totalArea / Math.max(1, fabricWidthMm * (len - gapMm)));
   const evaluate = (order: PreparedItem[], rotIdx: number[]) =>
-    placeOrdered(order, rotIdx, rotations, fabricWidthMm, gapMm, strategy);
+    placeOrdered(order, rotIdx, rotations, fabricWidthMm, gapMm, strategy, opts.maxLengthMm);
+  // fitness: fewer bins first, then total fabric used (single-bin = plain length, as before)
+  const fitnessOf = (r: ReturnType<typeof placeOrdered>) =>
+    (r.binLengths.length - 1) * 1e6 + r.binLengths.reduce((s, l) => s + l, 0);
 
   const seedOrder = [...items].sort((a, b) => b.area - a.area);
   const idxOf = new Map(items.map((it, i) => [it.instanceId, i] as const));
@@ -361,11 +392,12 @@ export function nestCore(rawItems: CoreItem[], opts: CoreOptions, onProgress?: (
     pop.push({ order: ord.map((it) => idxOf.get(it.instanceId)!), rot: ord.map(() => rndInt(rotations.length)) });
   }
 
-  const score = (c: Chrom) => evaluate(fromChrom(c), c.rot).usedLength;
+  const score = (c: Chrom) => fitnessOf(evaluate(fromChrom(c), c.rot));
   let best = pop[0];
   let bestScore = score(best);
   for (const c of pop.slice(1)) { const s = score(c); if (s < bestScore) { best = c; bestScore = s; } }
-  onProgress?.({ generation: 0, generations, bestLengthMm: bestScore, efficiency: efficiencyOf(bestScore) });
+  const lenOf = (s: number) => s % 1e6; // strip the bin-count term for progress display
+  onProgress?.({ generation: 0, generations, bestLengthMm: lenOf(bestScore), efficiency: efficiencyOf(lenOf(bestScore)) });
 
   for (let g = 0; g < generations; g++) {
     const scored = pop.map((c) => ({ c, s: score(c) })).sort((a, b) => a.s - b.s);
@@ -386,15 +418,34 @@ export function nestCore(rawItems: CoreItem[], opts: CoreOptions, onProgress?: (
       next.push({ order: childOrder, rot });
     }
     pop = next;
-    onProgress?.({ generation: g + 1, generations, bestLengthMm: bestScore, efficiency: efficiencyOf(bestScore) });
+    onProgress?.({ generation: g + 1, generations, bestLengthMm: lenOf(bestScore), efficiency: efficiencyOf(lenOf(bestScore)) });
   }
 
   const final = evaluate(fromChrom(best), best.rot);
+  // lay the bins end-to-end in one continuous marker space (visual gap between sheets) so every
+  // downstream consumer (SVG/PDF/HPGL/cut files) keeps working; `bins` records each sheet's band.
+  const BIN_GAP = 30;
+  const multi = final.binLengths.length > 1;
+  const binsMeta: { startYmm: number; usedLengthMm: number }[] = [];
+  let y0 = 0;
+  for (const len of final.binLengths) {
+    binsMeta.push({ startYmm: y0, usedLengthMm: len });
+    y0 += len + BIN_GAP;
+  }
+  const placements = multi
+    ? final.placements.map((pl) => {
+        const dy = binsMeta[pl.bin ?? 0].startYmm;
+        if (dy === 0) return pl;
+        return { ...pl, poly: pl.poly.map((p) => ({ x: p.x, y: p.y + dy })), outline: pl.outline.map((p) => ({ x: p.x, y: p.y + dy })) };
+      })
+    : final.placements;
+  const totalLen = final.binLengths.reduce((s, l) => s + l, 0);
   return {
     fabricWidthMm,
-    usedLengthMm: final.usedLength,
+    usedLengthMm: multi ? y0 - BIN_GAP : final.binLengths[0],
     gapMm,
-    placements: final.placements,
-    efficiency: efficiencyOf(final.usedLength)
+    placements,
+    efficiency: efficiencyOf(totalLen),
+    ...(multi ? { bins: binsMeta } : {})
   };
 }

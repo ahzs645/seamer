@@ -3,6 +3,11 @@
   import { BODY_FIELDS, unitSuffix, COLUMN_NAMES, type MeasurementDef } from '$lib/model/measurementDefs';
   import { loadGenderModel } from '$lib/model/assets';
   import { toMetricKnown, completeMeasurements } from '$lib/model/measurements';
+  import { bodyProfiles, saveBodyProfile, updateBodyProfile, removeBodyProfile } from '$lib/stores/bodyProfiles';
+  import { bodyToJson, bodyToCsv, bodyToObj, bodyToStl } from '$lib/utils/bodyExport';
+  import { bodyToSeamlyMe } from '$lib/utils/seamlyExport';
+  import { downloadText, downloadBlob } from '$lib/utils/exporters';
+  import { toastSuccess, toastError } from '$lib/stores/toast';
 
   interface Props {
     currentPattern: Pattern;
@@ -78,10 +83,81 @@
 
   let showAll = $state(false);
   const visibleFields = $derived(showAll ? BODY_FIELDS : BODY_FIELDS.filter((f) => f.primary));
+
+  // ---- body profiles: named reusable bodies (Save as new / Rename / Delete / Apply) --------------
+  let selectedProfileId = $state('');
+  function applyProfile(id: string) {
+    selectedProfileId = id;
+    const profile = $bodyProfiles.find((p) => p.id === id);
+    if (!profile) return;
+    onchange({ ...currentPattern, body: structuredClone(profile.body), hasChanged: true });
+    toastSuccess(`Applied body "${profile.name}"`);
+  }
+  function saveAsNewProfile() {
+    const name = prompt('Profile name:', `Body ${$bodyProfiles.length + 1}`);
+    if (name === null) return;
+    const profile = saveBodyProfile(name, structuredClone($state.snapshot(currentPattern.body)));
+    selectedProfileId = profile.id;
+    toastSuccess(`Saved body profile "${profile.name}"`);
+  }
+  function updateSelectedProfile() {
+    if (!selectedProfileId) return;
+    updateBodyProfile(selectedProfileId, { body: structuredClone($state.snapshot(currentPattern.body)) });
+    toastSuccess('Profile updated from current body');
+  }
+  function renameSelectedProfile() {
+    const profile = $bodyProfiles.find((p) => p.id === selectedProfileId);
+    if (!profile) return;
+    const name = prompt('Rename profile:', profile.name);
+    if (name === null || !name.trim()) return;
+    updateBodyProfile(profile.id, { name: name.trim() });
+  }
+  function deleteSelectedProfile() {
+    if (!selectedProfileId) return;
+    removeBodyProfile(selectedProfileId);
+    selectedProfileId = '';
+  }
+
+  // ---- export: measurements (JSON / CSV / SeamlyMe) + the body mesh alone (OBJ / STL) ------------
+  async function exportBody(kind: 'json' | 'csv' | 'seamlyme' | 'obj' | 'stl') {
+    const body = $state.snapshot(currentPattern.body);
+    const base = `body-${body.gender}`;
+    try {
+      if (kind === 'json') downloadText(`${base}.json`, await bodyToJson(body), 'application/json');
+      else if (kind === 'csv') downloadText(`${base}.csv`, await bodyToCsv(body), 'text/csv');
+      else if (kind === 'seamlyme') downloadText(`${base}.smis`, await bodyToSeamlyMe(body), 'application/xml');
+      else if (kind === 'obj') downloadText(`${base}.obj`, await bodyToObj(body), 'text/plain');
+      else downloadBlob(`${base}.stl`, new Blob([await bodyToStl(body)], { type: 'model/stl' }));
+      toastSuccess('Body exported');
+    } catch (e) {
+      toastError((e as Error)?.message || 'Body export failed');
+    }
+  }
 </script>
 
 <div class="text-xs">
   <h3 class="font-bold mb-2">Body</h3>
+
+  <div class="mb-2">
+    <span class="text-xs opacity-70">Body profile</span>
+    <div class="flex items-center gap-1 mt-0.5">
+      <select class="select select-bordered select-xs flex-1 min-w-0" value={selectedProfileId} onchange={(e) => applyProfile(e.currentTarget.value)} aria-label="Body profile">
+        <option value="">— this pattern's body —</option>
+        {#each $bodyProfiles as p (p.id)}<option value={p.id}>{p.name}</option>{/each}
+      </select>
+      <div class="dropdown dropdown-end">
+        <button class="btn btn-xs px-1.5" aria-label="Body profile options">…</button>
+        <ul class="dropdown-content z-10 menu p-1 shadow bg-base-100 rounded-box w-44 text-xs">
+          <li><button onclick={saveAsNewProfile}>Save as new…</button></li>
+          {#if selectedProfileId}
+            <li><button onclick={updateSelectedProfile}>Update from current</button></li>
+            <li><button onclick={renameSelectedProfile}>Rename</button></li>
+            <li><button class="text-error" onclick={deleteSelectedProfile}>Delete</button></li>
+          {/if}
+        </ul>
+      </div>
+    </div>
+  </div>
 
   <div class="mb-2">
     <span class="text-xs opacity-70">Gender</span>
@@ -138,4 +214,15 @@
     {showAll ? 'Show key measurements' : 'Show all measurements'}
   </button>
   <p class="text-[10px] opacity-50 mt-1">Faded values are estimated from the body model; edit to override.</p>
+
+  <div class="dropdown dropdown-top w-full mt-2">
+    <button class="btn btn-xs btn-secondary w-full">Export…</button>
+    <ul class="dropdown-content z-10 menu p-1 shadow bg-base-100 rounded-box w-full text-xs">
+      <li><button onclick={() => exportBody('json')}>Measurements (JSON)</button></li>
+      <li><button onclick={() => exportBody('csv')}>Measurements (CSV)</button></li>
+      <li><button onclick={() => exportBody('seamlyme')}>SeamlyMe (.smis)</button></li>
+      <li><button onclick={() => exportBody('obj')}>3D Body (.obj)</button></li>
+      <li><button onclick={() => exportBody('stl')}>3D Body (.stl)</button></li>
+    </ul>
+  </div>
 </div>
