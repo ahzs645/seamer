@@ -30,6 +30,7 @@
   import SizesDialog from '$lib/components/SizesDialog.svelte';
   import { cutToPattern } from '$lib/utils/cutImport';
   import { seamlyToPattern } from '$lib/utils/seamlyImport';
+  import { bodyToSeamlyMe } from '$lib/utils/seamlyExport';
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
   import WelcomeModal from '$lib/components/WelcomeModal.svelte';
@@ -311,6 +312,14 @@
       downloadText(`${base}.hpgl`, await patternToHPGL(currentPattern), 'application/vnd.hp-hpgl');
       toastSuccess('Exported HPGL');
     } catch (e) { toastError('HPGL export failed'); }
+  }
+  // Body measurements as SeamlyMe individual measurements (open in SeamlyMe / Seamly2D).
+  async function exportSeamlyMe() {
+    const base = patternName.replace(/\s+/g, '_') || 'pattern';
+    try {
+      downloadText(`${base}.smis`, await bodyToSeamlyMe(currentPattern.body), 'application/xml');
+      toastSuccess('Exported SeamlyMe measurements');
+    } catch (e) { toastError((e as Error)?.message || 'SeamlyMe export failed'); }
   }
 
   function doPrint() { printPattern(currentPattern, patternName || 'Pattern'); }
@@ -612,6 +621,7 @@
           <li><button onclick={exportHPGL}>HPGL (plotter)</button></li>
           <li><button onclick={exportPNG}>PNG</button></li>
           <li><button onclick={() => exportAs('csv')}>CSV (points)</button></li>
+          <li><button onclick={exportSeamlyMe}>SeamlyMe measurements (.smis)</button></li>
           <li class="menu-title pt-2">Cutting</li>
           <li><button onclick={() => (showCuttingRoom = true)}>Cutting room…</button></li>
           <li><button onclick={exportMarker}>Marker / nest (SVG)</button></li>

@@ -1365,11 +1365,24 @@ export class PatternRenderer {
 
   /** Export the avatar + draped garment as an OBJ download. */
   exportOBJ(): string {
-    const group = new THREE.Group();
-    if (this.avatar?.mesh) group.add(this.avatar.mesh.clone());
-    for (const e of this.clothMeshes) group.add(e.mesh.clone());
     const exporter = new OBJExporter();
-    return exporter.parse(group);
+    return exporter.parse(this.buildExportGroup());
+  }
+
+  /** Export the avatar + draped garment as binary STL (e.g. for 3D printing/CAD). */
+  async exportSTL(): Promise<DataView> {
+    const { STLExporter } = await import('three/examples/jsm/exporters/STLExporter.js');
+    const exporter = new STLExporter();
+    return exporter.parse(this.buildExportGroup(), { binary: true }) as DataView;
+  }
+
+  /** Avatar + visible cloth meshes cloned into a detached group with current world matrices. */
+  private buildExportGroup(): THREE.Group {
+    const group = new THREE.Group();
+    if (this.avatar?.mesh && this.avatar.mesh.visible) group.add(this.avatar.mesh.clone());
+    for (const e of this.clothMeshes) if (e.mesh.visible) group.add(e.mesh.clone());
+    group.updateMatrixWorld(true);
+    return group;
   }
 
   dispose() {

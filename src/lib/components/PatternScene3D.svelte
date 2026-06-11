@@ -181,11 +181,20 @@
   function downloadOBJ() {
     if (!renderer) return;
     const obj = renderer.exportOBJ();
-    const blob = new Blob([obj], { type: 'text/plain' });
+    downloadFile(new Blob([obj], { type: 'text/plain' }), 'obj');
+  }
+  // Binary STL of the draped garment (+ avatar when shown) — for 3D printing / CAD handoff.
+  async function downloadSTL() {
+    if (!renderer) return;
+    const stl = await renderer.exportSTL();
+    const bytes = new Uint8Array(stl.buffer as ArrayBuffer, stl.byteOffset, stl.byteLength);
+    downloadFile(new Blob([bytes], { type: 'model/stl' }), 'stl');
+  }
+  function downloadFile(blob: Blob, ext: string) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${currentPattern.name.replace(/\s+/g, '_') || 'garment'}.obj`;
+    a.download = `${currentPattern.name.replace(/\s+/g, '_') || 'garment'}.${ext}`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -243,7 +252,8 @@
     { label: sceneMode === 'arrange' && arrangeKind === 'manipulate' ? 'Exit move mode' : 'Move pieces (M)', icon: 'open_with', onClick: toggleManipulateMode, active: () => sceneMode === 'arrange' && arrangeKind === 'manipulate', shortcut: 'M' },
     { label: 'Simulation controls', icon: 'tune', onClick: toggleSimPanel, active: () => showSimPanel },
     { label: dark ? 'Light mode' : 'Dark mode', icon: dark ? 'light_mode' : 'dark_mode', onClick: toggleDark, active: () => dark, sep: true },
-    { label: 'Download as OBJ', icon: 'download', onClick: downloadOBJ }
+    { label: 'Download as OBJ', icon: 'download', onClick: downloadOBJ },
+    { label: 'Download as STL', icon: 'deployed_code', onClick: () => void downloadSTL() }
   ]);
 </script>
 

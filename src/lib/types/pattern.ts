@@ -264,6 +264,16 @@ export interface Seam {
   toPaths: SeamRef[];
 }
 
+/** A persistent point-to-point measurement annotation created with the 2D Measure tool. */
+export interface Measurement {
+  id: string;
+  name: string;
+  fromPointId: string;
+  toPointId: string;
+  /** Target length in mm; when set, the canvas label shows the deviation (actual − target). */
+  targetMm: number | null;
+}
+
 export interface Body {
   // Map of measurement name -> value. Always includes age (years), height, weight.
   // Lengths are in the unit indicated by unitType (imperial => inch/lb, metric => cm/kg).
@@ -402,6 +412,8 @@ export interface Pattern {
   pieces: Piece[];
   seams: Seam[];
   materials: Material[];
+  // Optional for patterns saved before the Measure tool existed.
+  measurements?: Measurement[];
 
   seamAllowance: number; // mm
   versionName: string;
@@ -427,6 +439,8 @@ export interface Pattern {
   snapToGrid: boolean;
   snapToGuides: boolean;
   showPieceNames: boolean;
+  // Show the saved Measure-tool annotations on the 2D canvas (default on).
+  showMeasurements?: boolean;
   // Show construction geometry (points/paths not used by any piece). When false the 2D canvas hides
   // helper/reference geometry to declutter the view. Faithful to the source's showConstruction flag.
   showConstruction?: boolean;
@@ -497,6 +511,7 @@ export function createEmptyPattern(): Pattern {
     pieces: [],
     seams: [],
     materials: [],
+    measurements: [],
     seamAllowance: 12.7,
     versionName: 'Initial',
     versionId: crypto.randomUUID(),
@@ -525,6 +540,7 @@ export function createEmptyPattern(): Pattern {
     snapToGrid: false,
     snapToGuides: false,
     showPieceNames: true,
+    showMeasurements: true,
     showConstruction: true,
     viewMode: 'both',
     interactionMode: 'fast',

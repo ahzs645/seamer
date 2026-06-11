@@ -7,6 +7,7 @@
   import {
     nestPieces, nestPiecesTrueShape, markerToSVG, type MarkerLayout, type CutOffType
   } from '$lib/utils/markerLayout';
+  import { nestInWorker, type NestJob, type NestProgress } from '$lib/utils/nestingClient';
   import { printMarkerTiled, downloadText, downloadBlob, markerToPDF, markerToHPGL } from '$lib/utils/exporters';
   import { toast, toastSuccess, toastError } from '$lib/stores/toast';
   import { machines, selectedMachineId, addMachine, updateMachine, removeMachine, type CuttingMachine } from '$lib/stores/machines';
@@ -16,7 +17,7 @@
     { currentPattern: Pattern; onchange: (p: Pattern, label?: string) => void; onclose: () => void } = $props();
 
   interface MarkerSettings {
-    algorithm: 'fast' | 'trueShape';
+    algorithm: 'fast' | 'trueShape' | 'nfp';
     fabricWidthMm: number;
     gapMm: number;
     allowedRotations: number[];
@@ -27,7 +28,7 @@
   // svelte-ignore state_referenced_locally -- intentional one-time read of persisted settings on open
   const saved = (currentPattern.markerSettings ?? null) as Partial<MarkerSettings> | null;
 
-  let algorithm = $state<MarkerSettings['algorithm']>(saved?.algorithm ?? 'trueShape');
+  let algorithm = $state<MarkerSettings['algorithm']>(saved?.algorithm ?? 'nfp');
   let fabricWidthMm = $state(saved?.fabricWidthMm ?? 1400);
   let gapMm = $state(saved?.gapMm ?? 10);
   let rotationMode = $state(rotationsToMode(saved?.allowedRotations));
@@ -37,6 +38,8 @@
 
   let layout = $state<MarkerLayout | null>(null);
   let busy = $state(false);
+  let job: NestJob | null = null;
+  let progress = $state<NestProgress | null>(null);
 
   function rotationsToMode(r?: number[]): '0' | '0,180' | '4way' | 'free' {
     if (!r || r.length <= 1) return '0';
@@ -60,18 +63,41 @@
 
   async function nest() {
     busy = true;
+    progress = null;
     // yield so the spinner paints before a (possibly heavy) GA run
     await new Promise((r) => setTimeout(r, 10));
     try {
-      layout = algorithm === 'fast'
-        ? nestPieces(currentPattern, fabricWidthMm, gapMm)
-        : nestPiecesTrueShape(currentPattern, { fabricWidthMm, gapMm, allowedRotations: modeToRotations(), generations });
+      if (algorithm === 'nfp') {
+        // worker-based NFP nest: streams per-generation progress, cancellable
+        job?.cancel();
+        job = nestInWorker(
+          currentPattern,
+          { fabricWidthMm, gapMm, allowedRotations: modeToRotations(), generations, strategy: 'nfp' },
+          (p) => (progress = p)
+        );
+        layout = await job.promise;
+        job = null;
+      } else {
+        layout = algorithm === 'fast'
+          ? nestPieces(currentPattern, fabricWidthMm, gapMm)
+          : nestPiecesTrueShape(currentPattern, { fabricWidthMm, gapMm, allowedRotations: modeToRotations(), generations });
+      }
       if (!layout.placements.length) toastError('No pieces to nest');
       else persist();
+    } catch (e) {
+      if ((e as Error)?.message !== 'cancelled') toastError((e as Error)?.message || 'Nesting failed');
     } finally {
       busy = false;
+      progress = null;
     }
   }
+
+  function cancelNest() {
+    job?.cancel();
+    job = null;
+  }
+  // tear the worker down if the modal closes mid-nest
+  $effect(() => () => job?.cancel());
 
   const svg = $derived(layout ? markerToSVG(layout, cutOff, cutIds) : '');
   const uncut = $derived(layout ? layout.placements.filter((p) => !cutIds.has(p.instanceId ?? '')).length : 0);
@@ -184,13 +210,14 @@
           <select class="select select-bordered select-sm" bind:value={algorithm}>
             <option value="fast">Fast (bounding box)</option>
             <option value="trueShape">True shape (rotations + GA)</option>
+            <option value="nfp">True shape (NFP, background)</option>
           </select>
         </label>
         <label class="flex flex-col gap-1">Fabric width (mm)
           <input type="number" min="100" step="10" class="input input-bordered input-sm" bind:value={fabricWidthMm} /></label>
         <label class="flex flex-col gap-1">Gap (mm)
           <input type="number" min="0" step="1" class="input input-bordered input-sm" bind:value={gapMm} /></label>
-        {#if algorithm === 'trueShape'}
+        {#if algorithm === 'trueShape' || algorithm === 'nfp'}
           <label class="flex flex-col gap-1">Allowed rotations
             <select class="select select-bordered select-sm" bind:value={rotationMode}>
               <option value="0">None (0°)</option>
@@ -213,6 +240,17 @@
         <button class="btn btn-primary btn-sm w-full" onclick={nest} disabled={busy}>
           {#if busy}<span class="loading loading-spinner loading-xs"></span> Nesting…{:else}Nest pieces{/if}
         </button>
+        {#if busy && algorithm === 'nfp'}
+          <div class="space-y-1">
+            {#if progress}
+              <progress class="progress progress-primary w-full" value={progress.generation} max={Math.max(1, progress.generations)}></progress>
+              <div class="text-xs opacity-70">
+                Gen {progress.generation}/{progress.generations} · {Math.round(progress.bestLengthMm)} mm · {(progress.efficiency * 100).toFixed(1)}%
+              </div>
+            {/if}
+            <button class="btn btn-ghost btn-xs w-full" onclick={cancelNest}>Cancel</button>
+          </div>
+        {/if}
 
         <!-- Machines: pick/manage a cutting machine, nest at its bed width, send the cut file -->
         <div class="border-t border-base-300 pt-2 space-y-2">

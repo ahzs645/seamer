@@ -69,6 +69,12 @@
       via vertex index groups.
     </p>
 
+    <h2 class="text-2xl font-bold mt-6">API</h2>
+    <ul class="list-disc pl-6 space-y-2">
+      <li><a href="/docs/api" class="link link-primary">API Overview</a> — the local pattern REST API and misc endpoints</li>
+      <li><a href="/docs/api/mcp" class="link link-primary">MCP Session API</a> — drive the live studio from external agents (sessions, ops, command catalogue)</li>
+    </ul>
+
     <h3 class="text-xl font-bold mt-4">API Endpoints</h3>
     <ul class="list-disc pl-6 space-y-2">
       <li><code>GET /api/patterns</code> - List user patterns</li>

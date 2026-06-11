@@ -165,7 +165,7 @@ export function polysOverlap(a: Vec2[], b: Vec2[]): boolean {
 export interface NestItem { pieceId: string; name: string; cut: Vec2[]; outline: Vec2[]; instanceId: string; area: number }
 
 /** Build the per-instance cut/outline polygons for nesting (one entry per cut count, incl. mirrors). */
-function buildNestItems(pattern: Pattern): NestItem[] {
+export function buildNestItems(pattern: Pattern): NestItem[] {
   const paths = indexPaths(pattern);
   const points = indexPoints(pattern);
   const items: NestItem[] = [];

@@ -63,6 +63,7 @@ curl -X POST http://localhost:5173/api/mcp-session/<id>/ops \\
     <p>
       Changes appear in the studio within a sync cycle and land in the undo history as
       "External edit". Sessions are in-memory, local-first, and expire after 30 minutes of inactivity.
+      Full endpoint + command reference: <a href="/docs/api/mcp" class="link link-primary">MCP Session API docs</a>.
     </p>
   </div>
 </div>

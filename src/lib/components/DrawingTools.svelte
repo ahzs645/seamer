@@ -36,7 +36,8 @@
     ] },
     { id: 'text', label: 'Insert text', hotkey: 'I', icon: 'text_fields', gap: true },
     { id: 'image', label: 'Insert image (reference / logo)', hotkey: 'G', icon: 'image' },
-    { id: 'trace', label: 'Trace piece', hotkey: 'R', icon: 'polyline' }
+    { id: 'trace', label: 'Trace piece', hotkey: 'R', icon: 'polyline' },
+    { id: 'measure', label: 'Measure (point to point)', hotkey: 'M', icon: 'straighten', gap: true }
   ];
 
   const groupActive = (e: Entry) => !!e.sub?.some((s) => s.id === $selectedTool);

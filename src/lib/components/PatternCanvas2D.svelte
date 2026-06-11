@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { Pattern, Piece } from '$lib/types/pattern';
+  import type { Pattern, Piece, Measurement } from '$lib/types/pattern';
   import { buildSilhouette, type Silhouette } from '$lib/model/silhouette';
   import { isDarkTheme, onThemeChange } from '$lib/utils/theme';
   import DrawingTools from '$lib/components/DrawingTools.svelte';
@@ -404,7 +404,7 @@
         if (penDraft.length > 0) { e.preventDefault(); finishDraft(); }
         else if (seamMultiEdges.length > 0) { e.preventDefault(); finishMultiSeam(); }
       } else if (e.key === 'Escape') {
-        if (penDraft.length || seamFirstEdge || seamMultiEdges.length || drawing) { e.preventDefault(); cancelOperation(); }
+        if (penDraft.length || seamFirstEdge || seamMultiEdges.length || measureFrom || drawing) { e.preventDefault(); cancelOperation(); }
       } else if ((e.key === 'v' || e.key === 'V') && drawing && !e.metaKey && !e.ctrlKey) {
         // 'V' returns to select and cancels the in-progress operation (like the source)
         e.preventDefault(); cancelOperation();
@@ -890,26 +890,7 @@
       drawSelectedEdge(c, paths, points);
     }
 
-    if ($selectedTool === 'measure' && measureFrom) {
-      const placed = placedPoints(currentPattern, points);
-      const a = placed.find((p) => p.pointId === measureFrom)?.world;
-      const b = placed.find((p) => p.pointId === hoveredPointId)?.world;
-      if (a) {
-        const ca = toCanvas(a);
-        const cb = b ? toCanvas(b) : cursorPos;
-        c.strokeStyle = '#f97316';
-        c.setLineDash([4, 3]);
-        c.beginPath(); c.moveTo(ca.x, ca.y); c.lineTo(cb.x, cb.y); c.stroke();
-        c.setLineDash([]);
-        if (b) {
-          const dmm = Math.hypot(b.x - a.x, b.y - a.y);
-          const disp = currentPattern.lengthUnit === 'inch' ? dmm / 25.4 : currentPattern.lengthUnit === 'cm' ? dmm / 10 : dmm;
-          c.fillStyle = '#f97316';
-          c.font = 'bold 12px sans-serif';
-          c.fillText(`${disp.toFixed(2)} ${currentPattern.lengthUnit}`, (ca.x + cb.x) / 2 + 6, (ca.y + cb.y) / 2 - 6);
-        }
-      }
-    }
+    drawMeasurements(c, points);
 
     // live drag readout (dX / dY / dL), like the source
     if (isDragging && dragStartWorld) {
@@ -1629,7 +1610,7 @@
 
   /** Reset any in-progress operation and return to the select tool (Esc / V / Cancel button). */
   function cancelOperation() {
-    penDraft = []; draftPathId = null; seamFirstEdge = null; seamMultiEdges = []; arcClicks = [];
+    penDraft = []; draftPathId = null; seamFirstEdge = null; seamMultiEdges = []; arcClicks = []; measureFrom = null;
     selectedTool.set('select');
     render();
   }
@@ -1650,6 +1631,7 @@
       case 'arc-center': return ['Click to set the centre of the arc', 'Click to set the radius / start', 'Click to set the end of the arc'][arcClicks.length] ?? '';
       case 'arc-3pt': return ['Click the first point of the arc', 'Click a point on the arc', 'Click the last point of the arc'][arcClicks.length] ?? '';
       case 'arc': return 'Arc/circle tools';
+      case 'measure': return measureFrom ? 'Click the second point to save the measurement · Esc to cancel' : 'Click two points to measure — saved measurements stay on the canvas';
       default: return null;
     }
   });
@@ -1752,6 +1734,130 @@
     seamMultiEdges = []; render();
   }
 
+  // ---- Measure tool: persistent point-to-point measurements --------------------------------------
+  /** Within this tolerance of the target a measurement label reads green, otherwise red. */
+  const MEASURE_TOL_MM = 1;
+  let selectedMeasurementId = $state<string | null>(null);
+
+  /** mm → the pattern's display unit. */
+  const mmToUnit = (mm: number) =>
+    currentPattern.lengthUnit === 'inch' ? mm / 25.4 : currentPattern.lengthUnit === 'cm' ? mm / 10 : mm;
+  /** the pattern's display unit → mm. */
+  const unitToMm = (v: number) =>
+    currentPattern.lengthUnit === 'inch' ? v * 25.4 : currentPattern.lengthUnit === 'cm' ? v * 10 : v;
+
+  /** Measure tool click: first click arms the start point, second click saves a measurement. */
+  function measureClick(pos: Vec2) {
+    const hit = hitTestPoint(pos.x, pos.y);
+    if (!hit) { measureFrom = null; render(); return; }
+    if (measureFrom && hit !== measureFrom) {
+      const p = $state.snapshot(currentPattern) as Pattern;
+      const m: Measurement = {
+        id: uid('Measurement'),
+        name: `Measure ${(p.measurements ?? []).length + 1}`,
+        fromPointId: measureFrom,
+        toPointId: hit,
+        targetMm: null
+      };
+      onchange({ ...p, measurements: [...(p.measurements ?? []), m], hasChanged: true }, 'Add measurement');
+      selectedMeasurementId = m.id;
+      measureFrom = null;
+    } else {
+      measureFrom = hit;
+    }
+    render();
+  }
+
+  /** Current world endpoints of a measurement, or null when an endpoint no longer exists. */
+  function measurementEndpoints(m: Measurement): { a: Vec2; b: Vec2 } | null {
+    const placed = placedPoints(currentPattern, indexPoints(currentPattern));
+    const a = placed.find((p) => p.pointId === m.fromPointId)?.world;
+    const b = placed.find((p) => p.pointId === m.toPointId)?.world;
+    return a && b ? { a, b } : null;
+  }
+  const measuredMm = (m: Measurement): number | null => {
+    const e = measurementEndpoints(m);
+    return e ? Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y) : null;
+  };
+
+  function updateMeasurement(id: string, patch: Partial<Measurement>, label = 'Edit measurement') {
+    const p = $state.snapshot(currentPattern) as Pattern;
+    onchange({ ...p, measurements: (p.measurements ?? []).map((m) => (m.id === id ? { ...m, ...patch } : m)), hasChanged: true }, label);
+  }
+  function deleteMeasurement(id: string) {
+    const p = $state.snapshot(currentPattern) as Pattern;
+    onchange({ ...p, measurements: (p.measurements ?? []).filter((m) => m.id !== id), hasChanged: true }, 'Delete measurement');
+    if (selectedMeasurementId === id) selectedMeasurementId = null;
+  }
+
+  /** Centre + zoom the 2D view on a measurement (the source's zoomToMeasurement). */
+  function zoomToMeasurement(m: Measurement) {
+    const e = measurementEndpoints(m);
+    if (!e) return;
+    selectedMeasurementId = m.id;
+    viewOffset = { x: (e.a.x + e.b.x) / 2, y: (e.a.y + e.b.y) / 2 };
+    const dist = Math.max(20, Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y));
+    zoom.set(Math.max(0.05, Math.min(20, (Math.min(canvasW, canvasH) * 0.6) / (dist * currentPattern.graphicsScale))));
+    panOffset.set({ x: 0, y: 0 });
+    render();
+  }
+
+  /** Saved measurement lines + labels, plus the measure tool's live rubber-band preview. */
+  function drawMeasurements(c: CanvasRenderingContext2D, points: Map<string, import('$lib/types/pattern').ConstrainablePoint>) {
+    const list = currentPattern.measurements ?? [];
+    const toolActive = $selectedTool === 'measure';
+    const show = currentPattern.showMeasurements !== false || toolActive;
+    if (!show || (list.length === 0 && !measureFrom)) return;
+    const placed = placedPoints(currentPattern, points);
+    const byId = new Map(placed.map((p) => [p.pointId, p.world]));
+    const u = currentPattern.lengthUnit;
+    c.save();
+    c.font = 'bold 11px sans-serif';
+    c.textAlign = 'left';
+    for (const m of list) {
+      const a = byId.get(m.fromPointId), b = byId.get(m.toPointId);
+      if (!a || !b) continue; // an endpoint was deleted
+      const ca = toCanvas(a), cb = toCanvas(b);
+      const selected = m.id === selectedMeasurementId;
+      c.strokeStyle = '#f97316';
+      c.lineWidth = selected ? 2.25 : 1.25;
+      c.setLineDash([5, 3]);
+      c.beginPath(); c.moveTo(ca.x, ca.y); c.lineTo(cb.x, cb.y); c.stroke();
+      c.setLineDash([]);
+      c.fillStyle = '#f97316';
+      for (const p of [ca, cb]) { c.beginPath(); c.arc(p.x, p.y, 2.5, 0, Math.PI * 2); c.fill(); }
+      const dmm = Math.hypot(b.x - a.x, b.y - a.y);
+      const err = m.targetMm != null ? dmm - m.targetMm : 0;
+      const label = `${m.name}: ${mmToUnit(dmm).toFixed(2)} ${u}` +
+        (m.targetMm != null ? ` (${err >= 0 ? '+' : ''}${mmToUnit(err).toFixed(2)})` : '');
+      const mx = (ca.x + cb.x) / 2 + 6, my = (ca.y + cb.y) / 2 - 6;
+      const tw = c.measureText(label).width;
+      c.fillStyle = isDark ? 'rgba(15,23,42,0.85)' : 'rgba(255,255,255,0.85)';
+      c.fillRect(mx - 3, my - 11, tw + 6, 14);
+      c.fillStyle = m.targetMm != null ? (Math.abs(err) <= MEASURE_TOL_MM ? '#16a34a' : '#dc2626') : '#f97316';
+      c.fillText(label, mx, my);
+    }
+    // live rubber-band from the armed start point to the hovered point / cursor
+    if (toolActive && measureFrom) {
+      const a = byId.get(measureFrom);
+      const b = hoveredPointId ? byId.get(hoveredPointId) : undefined;
+      if (a) {
+        const ca = toCanvas(a);
+        const cb = b ? toCanvas(b) : cursorPos;
+        c.strokeStyle = '#f97316';
+        c.setLineDash([4, 3]);
+        c.beginPath(); c.moveTo(ca.x, ca.y); c.lineTo(cb.x, cb.y); c.stroke();
+        c.setLineDash([]);
+        if (b) {
+          c.fillStyle = '#f97316';
+          c.font = 'bold 12px sans-serif';
+          c.fillText(`${mmToUnit(Math.hypot(b.x - a.x, b.y - a.y)).toFixed(2)} ${u}`, (ca.x + cb.x) / 2 + 6, (ca.y + cb.y) / 2 - 6);
+        }
+      }
+    }
+    c.restore();
+  }
+
   /** Snap a drafting-space coordinate to the grid and/or other points' guides. */
   function snapDraft(d: Vec2, excludeId?: string): Vec2 {
     let x = d.x, y = d.y;
@@ -1775,7 +1881,7 @@
     dragStartX = pos.x; dragStartY = pos.y;
     const tool = $selectedTool;
     if (tool === 'pan' || e.button === 1 || e.metaKey || e.ctrlKey || e.altKey) { isPanning = true; return; }
-    if (tool === 'measure') { measureFrom = hitTestPoint(pos.x, pos.y); return; }
+    if (tool === 'measure') { measureClick(pos); return; }
     if (tool === 'point') { const r = withNewPoint($state.snapshot(currentPattern) as Pattern, toPattern(pos.x, pos.y)); onchange({ ...r.p, hasChanged: true }); return; }
     if (tool === 'pen' || tool === 'piece' || tool === 'internal') {
       penOrPieceClick(pos);
@@ -2036,6 +2142,65 @@
       </div>
     {:else}
       <p class="opacity-50 leading-tight">Trace over a reference photo/sketch or an HPGL/.plt plotter file. Not saved with the pattern.</p>
+    {/if}
+  </div>
+{/if}
+
+{#if $selectedTool === 'measure'}
+  <!-- Measurements panel: saved Measure-tool annotations with live values, targets and zoom-to -->
+  <div class="absolute top-10 right-14 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-72">
+    <div class="flex items-center justify-between">
+      <span class="font-bold">Measurements</span>
+      <label class="flex items-center gap-1 cursor-pointer" title="Show measurements on the canvas">
+        <input
+          type="checkbox"
+          class="checkbox checkbox-xs"
+          checked={currentPattern.showMeasurements !== false}
+          onchange={() => onchange({ ...($state.snapshot(currentPattern) as Pattern), showMeasurements: currentPattern.showMeasurements === false, hasChanged: true }, 'Toggle measurements')}
+        />
+        <span>Show</span>
+      </label>
+    </div>
+    {#if (currentPattern.measurements ?? []).length === 0}
+      <p class="opacity-50 leading-tight">Click two points to save a measurement. Set a target to track a length while you edit (green = within ±{mmToUnit(MEASURE_TOL_MM).toFixed(2)} {currentPattern.lengthUnit}).</p>
+    {:else}
+      <div class="max-h-64 overflow-y-auto space-y-1">
+        {#each currentPattern.measurements ?? [] as m (m.id)}
+          {@const actual = measuredMm(m)}
+          <div class="rounded border p-1 space-y-1 {m.id === selectedMeasurementId ? 'border-warning' : 'border-base-300'}">
+            <div class="flex items-center gap-1">
+              <input
+                class="input input-bordered input-xs flex-1 min-w-0"
+                value={m.name}
+                onchange={(e) => updateMeasurement(m.id, { name: e.currentTarget.value }, 'Rename measurement')}
+              />
+              <button class="btn btn-ghost btn-xs px-1" title="Zoom to measurement" aria-label="Zoom to measurement" onclick={() => zoomToMeasurement(m)}>
+                <span class="material-symbols-rounded notranslate" style="font-size:14px">center_focus_strong</span>
+              </button>
+              <button class="btn btn-ghost btn-xs px-1 text-error" title="Delete measurement" aria-label="Delete measurement" onclick={() => deleteMeasurement(m.id)}>✕</button>
+            </div>
+            <div class="flex items-center gap-1">
+              <span class="tabular-nums {actual != null && m.targetMm != null ? (Math.abs(actual - m.targetMm) <= MEASURE_TOL_MM ? 'text-success' : 'text-error') : ''}">
+                {actual != null ? `${mmToUnit(actual).toFixed(2)} ${currentPattern.lengthUnit}` : 'point missing'}
+              </span>
+              <span class="flex-1"></span>
+              <label class="flex items-center gap-1">
+                <span class="opacity-60">target</span>
+                <input
+                  type="number"
+                  step="0.1"
+                  class="input input-bordered input-xs w-16"
+                  value={m.targetMm != null ? Number(mmToUnit(m.targetMm).toFixed(2)) : ''}
+                  onchange={(e) => {
+                    const v = parseFloat(e.currentTarget.value);
+                    updateMeasurement(m.id, { targetMm: Number.isFinite(v) ? unitToMm(v) : null }, 'Set measurement target');
+                  }}
+                />
+              </label>
+            </div>
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 {/if}
