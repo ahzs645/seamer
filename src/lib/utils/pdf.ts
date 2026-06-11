@@ -115,6 +115,23 @@ export interface PdfLayoutOpts {
   title?: string;
   overlapMm?: number; // tile overlap, default 0
   cropMarks?: boolean; // default true when tiling
+  /** output scale factor (1 = true scale). Applied to the content before tiling. */
+  scale?: number;
+}
+
+/** How many tiles a content box needs for a given printable area (shared by PDF + tiled print). */
+export function tilePageCount(
+  contentWmm: number,
+  contentHmm: number,
+  opts: { pageWmm: number; pageHmm: number; marginMm?: number; overlapMm?: number }
+): { cols: number; rows: number; total: number } {
+  const margin = opts.marginMm ?? 10;
+  const overlap = opts.overlapMm ?? 0;
+  const usableW = Math.max(10, opts.pageWmm - margin * 2);
+  const usableH = Math.max(10, opts.pageHmm - margin * 2);
+  const cols = Math.max(1, Math.ceil((contentWmm - overlap) / (usableW - overlap)));
+  const rows = Math.max(1, Math.ceil((contentHmm - overlap) / (usableH - overlap)));
+  return { cols, rows, total: cols * rows };
 }
 
 /** Render mm-space polylines (y up) into a (tiled) PDF, returning bytes. */
@@ -125,6 +142,13 @@ export function polylinesToPDF(polys: MmPoly[], texts: MmText[], opts: PdfLayout
   const overlap = opts.overlapMm ?? 0;
   const tile = opts.tile ?? true;
 
+  // output scale (1 = true scale): applied to the content geometry before tiling
+  const sc = opts.scale ?? 1;
+  if (sc !== 1) {
+    polys = polys.map((p) => ({ ...p, pts: p.pts.map((v) => ({ x: v.x * sc, y: v.y * sc })) }));
+    texts = texts.map((t) => ({ ...t, x: t.x * sc, y: t.y * sc, sizeMm: t.sizeMm * sc }));
+  }
+
   // content bbox (mm)
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of polys) for (const v of p.pts) { minX = Math.min(minX, v.x); minY = Math.min(minY, v.y); maxX = Math.max(maxX, v.x); maxY = Math.max(maxY, v.y); }
@@ -133,8 +157,9 @@ export function polylinesToPDF(polys: MmPoly[], texts: MmText[], opts: PdfLayout
   const contentW = maxX - minX, contentH = maxY - minY;
 
   const usableW = pw - margin * 2, usableH = ph - margin * 2;
-  const pagesWide = tile ? Math.max(1, Math.ceil((contentW - overlap) / (usableW - overlap))) : 1;
-  const pagesHigh = tile ? Math.max(1, Math.ceil((contentH - overlap) / (usableH - overlap))) : 1;
+  const counted = tilePageCount(contentW, contentH, { pageWmm: pw, pageHmm: ph, marginMm: margin, overlapMm: overlap });
+  const pagesWide = tile ? counted.cols : 1;
+  const pagesHigh = tile ? counted.rows : 1;
 
   // when not tiling, scale to fit one page
   const fit = !tile ? Math.min(usableW / Math.max(contentW, 1e-3), usableH / Math.max(contentH, 1e-3), 1) : 1;

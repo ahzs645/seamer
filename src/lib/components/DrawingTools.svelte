@@ -35,7 +35,8 @@
       { id: 'seam-multi', label: 'Create multi seam', hotkey: 'Shift+S', svg: SEAM_MULTI }
     ] },
     { id: 'text', label: 'Insert text', hotkey: 'I', icon: 'text_fields', gap: true },
-    { id: 'image', label: 'Insert image (reference / logo)', hotkey: 'G', icon: 'image' }
+    { id: 'image', label: 'Insert image (reference / logo)', hotkey: 'G', icon: 'image' },
+    { id: 'trace', label: 'Trace piece', hotkey: 'R', icon: 'polyline' }
   ];
 
   const groupActive = (e: Entry) => !!e.sub?.some((s) => s.id === $selectedTool);
@@ -78,7 +79,7 @@
   </button>
 {/snippet}
 
-<div class="flex flex-col m-2 absolute right-0 top-0 z-10 items-end">
+<div class="flex flex-col m-2 absolute right-0 top-0 z-10 items-end" data-tour-id="tour-drawing-tools">
   {#each entries as e}
     {#if e.gap}<div class="h-4"></div>{/if}
     {#if e.sub}

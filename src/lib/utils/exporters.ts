@@ -5,6 +5,7 @@ import type { Pattern } from '$lib/types/pattern';
 import {
   indexPaths, indexPoints, pieceWorldOutline, pieceWorldInternalPolylines, pieceAllowancePolygon, pieceTransform, pieceShrinkageScale, type Vec2
 } from './patternGeometry';
+import { tilePageCount } from './pdf';
 
 export type Layer = 'pattern' | 'seam-allowance' | 'internal' | 'marker';
 export interface Poly { pts: Vec2[]; closed: boolean; layer: Layer }
@@ -56,6 +57,12 @@ function bounds(polys: Poly[]) {
   return { minX, minY, maxX, maxY };
 }
 
+/** Bounding box (mm) of the placed pattern geometry — used by the print dialog's page-count preview. */
+export function patternBoundsMm(pattern: Pattern): { minX: number; minY: number; maxX: number; maxY: number; width: number; height: number } {
+  const b = bounds(collectPolylines(pattern));
+  return { ...b, width: b.maxX - b.minX, height: b.maxY - b.minY };
+}
+
 export function patternToSVG(pattern: Pattern): string {
   const polys = collectPolylines(pattern);
   const b = bounds(polys);
@@ -84,6 +91,71 @@ export function patternToSVG(pattern: Pattern): string {
 <svg xmlns="http://www.w3.org/2000/svg" width="${w.toFixed(1)}mm" height="${h.toFixed(1)}mm" viewBox="0 0 ${w.toFixed(1)} ${h.toFixed(1)}">
 ${paths}
 ${texts}
+</svg>`;
+}
+
+/**
+ * "SVG 2 (Beta)": structured SVG export. One `<g>` per piece (id + data-name), with separate
+ * cut / seam / internal / labels sub-groups (classed) so downstream tools can toggle layers.
+ * Real-world units: width/height in mm with a matching 1-unit-per-mm viewBox. The `cut` layer is
+ * the seam-allowance outline when the piece has an allowance, otherwise the stitch outline; the
+ * `seam` layer is always the stitch outline.
+ */
+export function patternToSVG2(pattern: Pattern): string {
+  const paths = indexPaths(pattern);
+  const points = indexPoints(pattern);
+  const polys = collectPolylines(pattern);
+  const b = bounds(polys);
+  const pad = 20;
+  const w = b.maxX - b.minX + pad * 2, h = b.maxY - b.minY + pad * 2;
+  // SVG y is down; pattern y is up → flip y about maxY
+  const X = (x: number) => (x - b.minX + pad).toFixed(2);
+  const Y = (y: number) => (b.maxY - y + pad).toFixed(2);
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const d = (pts: Vec2[], closed: boolean) => pts.map((v, i) => `${i === 0 ? 'M' : 'L'}${X(v.x)},${Y(v.y)}`).join(' ') + (closed ? ' Z' : '');
+  const pathEl = (pts: Vec2[], closed: boolean) => `      <path d="${d(pts, closed)}" fill="none"/>`;
+  const layerGroup = (cls: string, els: string[]) => (els.length ? `    <g class="${cls}">\n${els.join('\n')}\n    </g>` : '');
+
+  const STYLE = `  <style>
+    .cut path { stroke: #000; stroke-width: 0.5; }
+    .seam path { stroke: #888; stroke-width: 0.4; stroke-dasharray: 3,2; }
+    .internal path { stroke: #444; stroke-width: 0.35; stroke-dasharray: 2,2; }
+    .labels text { fill: #000; font-family: sans-serif; }
+  </style>`;
+
+  const groups: string[] = [];
+  for (const piece of pattern.pieces) {
+    const outline = pieceWorldOutline(pattern, piece, paths, points, 2);
+    if (outline.length < 2) continue;
+    const sa = piece.seamAllowance ?? pattern.seamAllowance ?? 0;
+    let allow: Vec2[] = [];
+    if (sa > 0.05 && outline.length >= 3) {
+      allow = pieceAllowancePolygon(pattern, piece, piece.seamAllowanceInside ? -sa : sa, paths, points, 2);
+    }
+    const cut = [pathEl(allow.length >= 3 ? allow : outline, true)];
+    const seam = allow.length >= 3 ? [pathEl(outline, true)] : [];
+    const internal = pieceWorldInternalPolylines(pattern, piece, paths, points, 2)
+      .filter((ip) => ip.length >= 2)
+      .map((ip) => pathEl(ip, false));
+    const cx = outline.reduce((s, v) => s + v.x, 0) / outline.length;
+    const cy = outline.reduce((s, v) => s + v.y, 0) / outline.length;
+    const labels = [`      <text x="${X(cx)}" y="${Y(cy)}" font-size="8" text-anchor="middle" dominant-baseline="middle">${esc(piece.name)}</text>`];
+    const layers = [layerGroup('cut', cut), layerGroup('seam', seam), layerGroup('internal', internal), layerGroup('labels', labels)].filter(Boolean);
+    groups.push(`  <g id="${esc(piece.id)}" data-name="${esc(piece.name)}">\n${layers.join('\n')}\n  </g>`);
+  }
+
+  // pattern-level text annotations as a top-level labels layer
+  const texts = (pattern.texts ?? []).filter((t) => t.value).map((t) => {
+    const anchor = t.align === 'left' ? 'start' : t.align === 'right' ? 'end' : 'middle';
+    const rot = t.rotation ? ` transform="rotate(${(-t.rotation).toFixed(2)} ${X(t.x)} ${Y(t.y)})"` : '';
+    return `    <text x="${X(t.x)}" y="${Y(t.y)}" font-size="${(t.fontSize ?? 15).toFixed(1)}" fill="${t.color ?? '#000'}" text-anchor="${anchor}" dominant-baseline="middle"${rot}>${esc(t.value)}</text>`;
+  });
+  if (texts.length) groups.push(`  <g class="labels">\n${texts.join('\n')}\n  </g>`);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${w.toFixed(1)}mm" height="${h.toFixed(1)}mm" viewBox="0 0 ${w.toFixed(1)} ${h.toFixed(1)}">
+${STYLE}
+${groups.join('\n')}
 </svg>`;
 }
 
@@ -237,19 +309,22 @@ export interface TileOpts {
   pageHmm?: number; // 297 = A4, 279 = Letter
   marginMm?: number;
   overlapMm?: number; // shared band between adjacent tiles for gluing
+  /** output scale factor (1 = true scale) */
+  scale?: number;
   title?: string;
 }
+
+/** Default tiled-print overlap (mm) — the glue band shared between adjacent pages. */
+export const TILE_OVERLAP_MM = 6;
 interface TileItem { pts: Vec2[]; closed: boolean; dashed: boolean }
 
 /** Build a printable multi-page HTML where the content is tiled at 1:1 scale across pages. */
 function tiledPagesHTML(items: TileItem[], b: { minX: number; minY: number; maxX: number; maxY: number }, yUp: boolean, opts: TileOpts): string {
   const pageW = opts.pageWmm ?? 210, pageH = opts.pageHmm ?? 297;
-  const margin = opts.marginMm ?? 8, overlap = opts.overlapMm ?? 6;
+  const margin = opts.marginMm ?? 8, overlap = opts.overlapMm ?? TILE_OVERLAP_MM;
   const pw = pageW - margin * 2, ph = pageH - margin * 2;
+  const { cols, rows } = tilePageCount(Math.max(1, b.maxX - b.minX), Math.max(1, b.maxY - b.minY), { pageWmm: pageW, pageHmm: pageH, marginMm: margin, overlapMm: overlap });
   const strideX = Math.max(10, pw - overlap), strideY = Math.max(10, ph - overlap);
-  const contentW = Math.max(1, b.maxX - b.minX), contentH = Math.max(1, b.maxY - b.minY);
-  const cols = Math.max(1, Math.ceil(contentW / strideX));
-  const rows = Math.max(1, Math.ceil(contentH / strideY));
 
   const pages: string[] = [];
   for (let r = 0; r < rows; r++) {
@@ -293,10 +368,12 @@ function openPrintDoc(html: string) {
   w.document.close();
 }
 
-/** Tiled multi-page print of the flat pattern at true (1:1) scale. */
+/** Tiled multi-page print of the flat pattern (1:1 by default; `opts.scale` rescales the output). */
 export function printPatternTiled(pattern: Pattern, opts: TileOpts = {}) {
-  const polys = collectPolylines(pattern);
+  let polys = collectPolylines(pattern);
   if (!polys.length) return;
+  const sc = opts.scale ?? 1;
+  if (sc !== 1) polys = polys.map((p) => ({ ...p, pts: p.pts.map((v) => ({ x: v.x * sc, y: v.y * sc })) }));
   const b = bounds(polys);
   const items: TileItem[] = polys.map((p) => ({ pts: p.pts, closed: p.closed, dashed: p.layer !== 'pattern' }));
   openPrintDoc(tiledPagesHTML(items, b, true, { ...opts, title: opts.title ?? 'Pattern (tiled)' }));

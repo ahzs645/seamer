@@ -6,7 +6,7 @@
   import DrawingTools from '$lib/components/DrawingTools.svelte';
   import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
   import { toast } from '$lib/stores/toast';
-  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, cursorMm } from '$lib/stores/pattern';
+  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, cursorMm, interactionMode, frozenSnapshotOpacity } from '$lib/stores/pattern';
   import {
     indexPoints,
     indexPaths,
@@ -31,11 +31,12 @@
   import { deletePiece as deletePieceCascade } from '$lib/utils/patternMutations';
   import * as ops from '$lib/utils/pathPointOps';
   import { breakoutPiece, type BreakoutMode } from '$lib/utils/breakout';
+  import { traceFromHPGL, traceImageRegion } from '$lib/utils/autoTrace';
   import { pieceAddPath } from '$lib/commands/piece';
 
   interface Props {
     currentPattern: Pattern;
-    onchange: (p: Pattern) => void;
+    onchange: (p: Pattern, label?: string) => void;
   }
 
   let { currentPattern, onchange }: Props = $props();
@@ -96,6 +97,58 @@
     render();
   }
   function clearHpgl() { hpglPolys = null; render(); }
+
+  // Frozen snapshot — a saved copy of the geometry (points/paths/pieces) rendered as a
+  // non-interactive ghost under the live pattern, for before/after reference while editing.
+  // Stored on the pattern (pattern.frozenSnapshot) so it survives reload and is undoable;
+  // the ghost opacity is a persisted view setting.
+  type FrozenGeometry = { points: Pattern['points']; paths: Pattern['paths']; pieces: Pattern['pieces'] };
+  let showSnapshotControls = $state(false);
+  const frozenGeometry = $derived.by<FrozenGeometry | null>(() => {
+    const fs = currentPattern.frozenSnapshot as Partial<FrozenGeometry> | null;
+    if (!fs || !Array.isArray(fs.points)) return null;
+    return { points: fs.points, paths: fs.paths ?? [], pieces: fs.pieces ?? [] };
+  });
+  function freezeSnapshot() {
+    const p = $state.snapshot(currentPattern) as Pattern;
+    onchange({ ...p, frozenSnapshot: { points: p.points, paths: p.paths, pieces: p.pieces }, hasChanged: true }, 'Freeze snapshot');
+    toast('Snapshot frozen as reference.', 'success');
+  }
+  function removeFrozenSnapshot() {
+    onchange({ ...($state.snapshot(currentPattern) as Pattern), frozenSnapshot: null, hasChanged: true }, 'Remove frozen snapshot');
+    toast('Removed frozen snapshot');
+  }
+  /** Ghost of the frozen snapshot, drawn under the live pattern (never hit-tested). */
+  function drawFrozenSnapshot(c: CanvasRenderingContext2D) {
+    const fs = frozenGeometry;
+    if (!fs) return;
+    const ghost = { ...currentPattern, points: fs.points, paths: fs.paths, pieces: fs.pieces } as Pattern;
+    const gPaths = indexPaths(ghost);
+    const gPoints = indexPoints(ghost);
+    c.save();
+    c.globalAlpha = Math.max(0, Math.min(1, $frozenSnapshotOpacity));
+    c.strokeStyle = isDark ? '#94a3b8' : '#64748b';
+    c.lineWidth = 1.5;
+    c.setLineDash([]);
+    const drawn = new Set<string>();
+    for (const piece of ghost.pieces) {
+      const outline = pieceWorldOutline(ghost, piece, gPaths, gPoints, 4);
+      if (outline.length < 2) continue;
+      tracePoly(c, outline, true);
+      c.stroke();
+      c.setLineDash([4, 3]);
+      for (const ip of pieceWorldInternalPolylines(ghost, piece, gPaths, gPoints, 4)) { tracePoly(c, ip, false); c.stroke(); }
+      c.setLineDash([]);
+      for (const pp of [...piece.mainPaths, ...piece.internalPaths]) drawn.add(pp.path);
+    }
+    for (const path of ghost.paths) {
+      if (drawn.has(path.id)) continue;
+      tracePoly(c, pathPolyline(path, gPoints, 4), false);
+      c.stroke();
+    }
+    c.restore();
+  }
+
   const isSeamToolActive = () => $selectedTool === 'seam' || $selectedTool === 'seam-single' || $selectedTool === 'seam-multi';
   // pen / create-piece in-progress point ids
   let penDraft = $state<string[]>([]);
@@ -547,6 +600,9 @@
       }
     }
 
+    // frozen snapshot ghost — a non-interactive reference under the live pattern
+    drawFrozenSnapshot(c);
+
     const paths = indexPaths(currentPattern);
     const points = indexPoints(currentPattern);
     const placed = placedPoints(currentPattern, points);
@@ -935,6 +991,42 @@
       c.strokeRect(x, y, w, h);
       c.setLineDash([]);
     }
+
+    // compass — a small orientation widget in the top-right corner showing the canvas axes
+    // (pattern +y is up = N, +x is right = E)
+    if (currentPattern.showCompass) drawCompass(c);
+  }
+
+  function drawCompass(c: CanvasRenderingContext2D) {
+    const cx = canvasW - 44, cy = 44, r = 24;
+    c.save();
+    c.globalAlpha = 0.9;
+    c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2);
+    c.fillStyle = isDark ? 'rgba(21,25,30,0.75)' : 'rgba(255,255,255,0.8)';
+    c.fill();
+    c.strokeStyle = isDark ? '#3b4452' : '#cbd5e1';
+    c.lineWidth = 1;
+    c.stroke();
+    // E–W axis
+    c.strokeStyle = isDark ? '#64748b' : '#94a3b8';
+    c.beginPath(); c.moveTo(cx - r + 9, cy); c.lineTo(cx + r - 9, cy); c.stroke();
+    // N–S grainline arrow (north = pattern +y, which renders upward)
+    c.strokeStyle = GRAIN_MAGENTA;
+    c.lineWidth = 1.5;
+    c.beginPath(); c.moveTo(cx, cy + r - 9); c.lineTo(cx, cy - r + 9); c.stroke();
+    c.beginPath();
+    c.moveTo(cx, cy - r + 9); c.lineTo(cx - 3.5, cy - r + 15);
+    c.moveTo(cx, cy - r + 9); c.lineTo(cx + 3.5, cy - r + 15);
+    c.stroke();
+    c.font = '600 8px sans-serif';
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillStyle = isDark ? '#cbd5e1' : '#475569';
+    c.fillText('N', cx, cy - r + 4.5);
+    c.fillText('S', cx, cy + r - 4.5);
+    c.fillText('E', cx + r - 4.5, cy);
+    c.fillText('W', cx - r + 4.5, cy);
+    c.restore();
   }
 
   function pieceOwnerOf(ppId: string): { piece: Piece; pp: import('$lib/types/pattern').PiecePath } | null {
@@ -1457,7 +1549,82 @@
 
   function cancelDraft() { penDraft = []; draftPathId = null; render(); }
 
-  const DRAWING_TOOLS = new Set(['pen', 'piece', 'internal', 'point', 'text', 'image', 'seam', 'seam-single', 'seam-multi', 'circle', 'arc', 'arc-center', 'arc-3pt']);
+  // ---- trace tool (auto-trace a piece from the HPGL overlay / background image) ----
+  /** Materialise a traced outline (world mm) as a new piece of straight edges. */
+  function createTracedPiece(outline: Vec2[]) {
+    // ensure a counter-clockwise loop
+    let area = 0;
+    for (let i = 0, j = outline.length - 1; i < outline.length; j = i++) area += outline[j].x * outline[i].y - outline[i].x * outline[j].y;
+    const loopPts = area < 0 ? outline.slice().reverse() : outline;
+    let p: Pattern = $state.snapshot(currentPattern) as Pattern;
+    const ids: string[] = [];
+    for (const w of loopPts) { const r = withNewPoint(p, w); p = r.p; ids.push(r.id); }
+    const newPaths: import('$lib/types/pattern').ConstrainablePath[] = [];
+    const mainPaths: import('$lib/types/pattern').PiecePath[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      const from = ids[i], to = ids[(i + 1) % ids.length];
+      const path = lineThrough([from, to]);
+      path.name = edgeName(p, from, to);
+      newPaths.push(path);
+      mainPaths.push({ id: uid('PiecePath'), name: edgeName(p, from, to), path: path.id, from, to, reversed: false, notches: [] });
+    }
+    const n = p.pieces.filter((pc) => /^Traced piece \d+$/.test(pc.name)).length + 1;
+    const originPoint = ids[0];
+    const op = p.points.find((q) => q.id === originPoint)!;
+    const piece: Piece = {
+      id: uid('Piece'), name: `Traced piece ${n}`, type: 'dynamic',
+      materialId: p.materials[0]?.id ?? '', origin: { id: uid('Point'), name: '', x: 0, y: 0 },
+      originPoint, position: { x: op.x, y: op.y }, rotation: 0,
+      grainVector: { id: uid('Point'), name: '', x: 0, y: 1 }, text: null,
+      rightPieces: 0, leftPieces: 0, mirrorLeftPiecesAxis: 'X', mirrorX: false, mirrorY: false,
+      seamAllowanceInside: false, mainPaths, internalPaths: [],
+      settings3d: {
+        arrangement: { mode: 'flat', cylinderName: '', uDegrees: 0, v: 0.5, uOffsetMm: 0, vOffsetMm: 0, radialOffsetMm: 0, use2DPosition: true, positionChanged: false, matrixWorld: [], position: [] },
+        enable3d: true, frozen: false, flipNormals: false, filterExternalCollisionsByClothNormal: false, collisionLayer: 0, savedPositions: []
+      }
+    };
+    onchange({ ...p, paths: [...p.paths, ...newPaths], pieces: [...p.pieces, piece], hasChanged: true }, 'Trace piece');
+    selectedPieceIds.set(new Set([piece.id]));
+    toast(`Traced "${piece.name}" (${ids.length} points)`, 'success');
+    selectedTool.set('select');
+    render();
+  }
+
+  /** Trace-tool click: prefer a closed HPGL loop near the click, else the background image region. */
+  function traceClick(pos: Vec2) {
+    const world = toPattern(pos.x, pos.y);
+    if (hpglPolys?.length) {
+      // HPGL polylines are drawn offset by (bgX, bgY)
+      const click = { x: world.x - bgX, y: world.y - bgY };
+      const outline = traceFromHPGL(hpglPolys, click, { gapToleranceMm: 2, simplifyToleranceMm: 0.5, maxDistanceMm: 30 });
+      if (outline) { createTracedPiece(outline.map((q) => ({ x: q.x + bgX, y: q.y + bgY }))); return; }
+    }
+    if (bgImage && bgImage.naturalWidth > 0) {
+      const W = bgImage.naturalWidth, H = bgImage.naturalHeight;
+      const s = bgWidthMm / W; // mm per pixel
+      const px = (world.x - bgX) / s + W / 2;
+      const py = H / 2 - (world.y - bgY) / s;
+      if (px >= 0 && py >= 0 && px < W && py < H) {
+        const off = document.createElement('canvas');
+        off.width = W; off.height = H;
+        const c2 = off.getContext('2d');
+        if (c2) {
+          c2.drawImage(bgImage, 0, 0);
+          const boundary = traceImageRegion(c2.getImageData(0, 0, W, H), px, py, { simplifyTolerancePx: Math.max(1, 0.5 / s) });
+          if (boundary && boundary.length >= 3) {
+            createTracedPiece(boundary.map((q) => ({ x: bgX + (q.x - W / 2) * s, y: bgY + (H / 2 - q.y) * s })));
+            return;
+          }
+        }
+        toast('Could not trace a shape here — click inside the outline you want to trace.', 'error');
+        return;
+      }
+    }
+    if (!hpglPolys?.length && !bgImage) toast('Load a background image or HPGL overlay first (Trace panel, top left).', 'error');
+    else toast('Could not trace a shape here — click inside a closed outline.', 'error');
+  }
+
+  const DRAWING_TOOLS = new Set(['pen', 'piece', 'internal', 'point', 'text', 'image', 'trace', 'seam', 'seam-single', 'seam-multi', 'circle', 'arc', 'arc-center', 'arc-3pt']);
   function isDrawingTool(t: string) { return DRAWING_TOOLS.has(t); }
 
   /** Reset any in-progress operation and return to the select tool (Esc / V / Cancel button). */
@@ -1472,6 +1639,7 @@
     switch ($selectedTool) {
       case 'text': return 'Click to place text';
       case 'image': return 'Click to place an image, then choose a file';
+      case 'trace': return hpglPolys?.length || bgImage ? 'Click inside a closed outline on the HPGL overlay or background image to trace a piece' : 'Load a background image or HPGL overlay (Trace panel), then click inside a shape to trace it';
       case 'point': return 'Click to add a point';
       case 'pen': return penDraft.length ? 'Click to add points · Enter to finish · Esc to cancel' : 'Click to start a path';
       case 'piece': return penDraft.length ? 'Click points to outline the piece · click the first point to close' : 'Click points to outline a new piece';
@@ -1617,6 +1785,7 @@
     }
     if (tool === 'text') { insertTextAt(pos); return; }
     if (tool === 'image') { insertImageAt(pos); return; }
+    if (tool === 'trace') { traceClick(pos); return; }
     if (tool === 'seam' || tool === 'seam-single') { seamClick(pos); return; }
     if (tool === 'seam-multi') { seamMultiClick(pos); return; }
     if (tool === 'circle' || tool === 'arc-center' || tool === 'arc-3pt') { arcClick(pos); return; }
@@ -1629,15 +1798,19 @@
     const hit = hitTestPlaced(pos.x, pos.y);
     if (hit) {
       const cur = new Set($selectedPointIds);
+      const wasSelected = cur.has(hit.pointId);
       if (e.shiftKey) {
         // shift-click toggles the point in the selection
         if (cur.has(hit.pointId)) cur.delete(hit.pointId); else cur.add(hit.pointId);
         selectedPointIds.set(cur);
-      } else if (!cur.has(hit.pointId)) {
+      } else if (!wasSelected) {
         selectedPointIds.set(new Set([hit.pointId]));
         selectedPathIds.set(new Set());
         selectedPieceIds.set(new Set());
       }
+      // Safe (select first) mode: a drag starting on an unselected point only selects it —
+      // moving requires starting the drag on an already-selected point.
+      if ($interactionMode === 'safe' && !wasSelected) { render(); return; }
       // begin dragging (single or the whole selected set)
       dragPointId = hit.pointId;
       dragInvert = hit.invert;
@@ -1816,7 +1989,24 @@
   >Construction</button>
   <button class="btn btn-xs btn-ghost" title="Fit pieces to view" onclick={() => { fitView(); render(); }}>Fit</button>
   <button class="btn btn-xs" class:btn-active={!!bgImage || !!hpglPolys || showBgControls} title="Trace over a reference image or HPGL file" onclick={() => (showBgControls = !showBgControls)}>Trace</button>
+  <button class="btn btn-xs" class:btn-active={!!frozenGeometry || showSnapshotControls} title="Freeze a snapshot of the current geometry as a ghost reference" onclick={() => (showSnapshotControls = !showSnapshotControls)}>Snapshot</button>
 </div>
+
+{#if showSnapshotControls}
+  <div class="absolute top-10 left-56 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-52">
+    <div class="flex items-center justify-between"><span class="font-bold">Frozen snapshot</span>
+      <button class="btn btn-ghost btn-xs btn-circle" aria-label="Close" onclick={() => (showSnapshotControls = false)}>✕</button>
+    </div>
+    <button class="btn btn-xs w-full" onclick={freezeSnapshot}>Freeze snapshot</button>
+    {#if frozenGeometry}
+      <label class="flex flex-col gap-0.5"><span class="flex justify-between"><span>Frozen snapshot opacity</span><span class="opacity-60">{$frozenSnapshotOpacity.toFixed(2)}</span></span>
+        <input type="range" class="range range-xs" min="0.05" max="1" step="0.05" value={$frozenSnapshotOpacity} oninput={(e) => { frozenSnapshotOpacity.set(parseFloat(e.currentTarget.value)); render(); }} /></label>
+      <button class="btn btn-xs btn-ghost w-full" onclick={removeFrozenSnapshot}>Remove frozen snapshot</button>
+    {:else}
+      <p class="opacity-50 leading-tight">Freeze the current pieces as a ghost reference under the live pattern while you edit.</p>
+    {/if}
+  </div>
+{/if}
 
 {#if showBgControls}
   <div class="absolute top-10 left-2 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-52">

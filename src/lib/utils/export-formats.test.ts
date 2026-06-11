@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { buildPdf, polylinesToPDF, PAGE_SIZES_MM, type MmPoly } from './pdf';
+import { buildPdf, polylinesToPDF, tilePageCount, PAGE_SIZES_MM, type MmPoly } from './pdf';
 import { toHPGL } from './hpgl';
+import { patternToSVG2 } from './exporters';
+import { dxfToPattern } from './patternImport';
 
 const decode = (bytes: Uint8Array) => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return s; };
 
@@ -48,6 +50,85 @@ describe('PDF writer', () => {
 
   it('A0 is larger than A4', () => {
     expect(PAGE_SIZES_MM.A0[0] * PAGE_SIZES_MM.A0[1]).toBeGreaterThan(PAGE_SIZES_MM.A4[0] * PAGE_SIZES_MM.A4[1]);
+  });
+});
+
+describe('tilePageCount', () => {
+  it('matches the tiled PDF page count', () => {
+    const polys: MmPoly[] = [{ pts: [{ x: 0, y: 0 }, { x: 1000, y: 600 }], closed: false, style: {} }];
+    const s = decode(polylinesToPDF(polys, [], { page: 'A4', tile: true, marginMm: 10 }));
+    const pages = (s.match(/\/Type \/Page[^s]/g) || []).length;
+    expect(tilePageCount(1000, 600, { pageWmm: 210, pageHmm: 297, marginMm: 10 }).total).toBe(pages);
+  });
+  it('small content needs one page; overlap increases the count', () => {
+    expect(tilePageCount(100, 100, { pageWmm: 210, pageHmm: 297, marginMm: 10 }).total).toBe(1);
+    const noOv = tilePageCount(1000, 100, { pageWmm: 210, pageHmm: 297, marginMm: 10 });
+    const ov = tilePageCount(1000, 100, { pageWmm: 210, pageHmm: 297, marginMm: 10, overlapMm: 50 });
+    expect(ov.total).toBeGreaterThan(noOv.total);
+  });
+});
+
+describe('PDF scale option', () => {
+  it('scale 0.5 halves the tiled page count of wide content', () => {
+    const polys: MmPoly[] = [{ pts: [{ x: 0, y: 0 }, { x: 1000, y: 0 }], closed: false, style: {} }];
+    const full = (decode(polylinesToPDF(polys, [], { page: 'A4', tile: true })).match(/\/Type \/Page[^s]/g) || []).length;
+    const half = (decode(polylinesToPDF(polys, [], { page: 'A4', tile: true, scale: 0.5 })).match(/\/Type \/Page[^s]/g) || []).length;
+    expect(half).toBeLessThan(full);
+  });
+});
+
+// a 100×50mm closed rect (→ piece) with one internal line inside it, via the DXF importer
+function svg2Fixture() {
+  const dxf = [
+    0, 'SECTION', 2, 'ENTITIES',
+    0, 'LWPOLYLINE', 8, 'cut', 90, 4, 70, 1, 10, 0, 20, 0, 10, 100, 20, 0, 10, 100, 20, 50, 10, 0, 20, 50,
+    0, 'LINE', 8, 'internal', 10, 10, 20, 10, 11, 90, 21, 40,
+    0, 'ENDSEC', 0, 'EOF'
+  ].join('\n');
+  const p = dxfToPattern(dxf, 'svg2 fixture', { classify: {} });
+  p.seamAllowance = 10;
+  return p;
+}
+
+describe('patternToSVG2 (Beta)', () => {
+  const svg = patternToSVG2(svg2Fixture());
+
+  it('uses real-world mm units with a matching viewBox', () => {
+    expect(svg).toMatch(/<svg [^>]*width="[\d.]+mm" height="[\d.]+mm" viewBox="0 0 [\d.]+ [\d.]+"/);
+    const m = svg.match(/width="([\d.]+)mm".*viewBox="0 0 ([\d.]+)/s)!;
+    expect(parseFloat(m[1])).toBeCloseTo(parseFloat(m[2]));
+  });
+
+  it('emits one <g> per piece with id and data-name', () => {
+    expect(svg).toMatch(/<g id="Piece_[^"]+" data-name="Piece 1">/);
+  });
+
+  it('has cut / seam / internal / labels sub-groups', () => {
+    for (const cls of ['cut', 'seam', 'internal', 'labels']) {
+      expect(svg).toContain(`<g class="${cls}">`);
+    }
+  });
+
+  it('cut layer is the seam-allowance outline (larger than the stitch outline)', () => {
+    const grab = (cls: string) => {
+      const g = svg.match(new RegExp(`<g class="${cls}">([\\s\\S]*?)</g>`))![1];
+      const nums = [...g.matchAll(/[ML]([\d.]+),/g)].map((m) => parseFloat(m[1]));
+      return { min: Math.min(...nums), max: Math.max(...nums) };
+    };
+    const cut = grab('cut'), seam = grab('seam');
+    expect(cut.max - cut.min).toBeGreaterThan(seam.max - seam.min);
+  });
+
+  it('labels the piece by name', () => {
+    expect(svg).toContain('>Piece 1</text>');
+  });
+
+  it('omits the seam group when the pattern has no allowance', () => {
+    const p = svg2Fixture();
+    p.seamAllowance = 0;
+    const s = patternToSVG2(p);
+    expect(s).toContain('<g class="cut">');
+    expect(s).not.toContain('<g class="seam">');
   });
 });
 

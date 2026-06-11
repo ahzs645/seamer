@@ -5,6 +5,8 @@
     { href: '/', label: 'Home' },
     { href: '/software', label: 'Software' },
     { href: '/docs', label: 'Docs' },
+    { href: '/pricing', label: 'Pricing' },
+    { href: '/faq', label: 'FAQ' },
     { href: '/support-seamer', label: 'Support Us' },
     { href: '/about', label: 'About' }
   ];

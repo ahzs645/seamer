@@ -971,6 +971,7 @@
               <hr class="border-base-200" />
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.showGrid} onchange={(e) => updatePattern({ showGrid: e.currentTarget.checked })} /> Show grid</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.snapToGrid} onchange={(e) => updatePattern({ snapToGrid: e.currentTarget.checked })} /> Snap to grid</label>
+              <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.showCompass} onchange={(e) => updatePattern({ showCompass: e.currentTarget.checked })} /> Show compass</label>
               <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={currentPattern.showPieceNames} onchange={(e) => updatePattern({ showPieceNames: e.currentTarget.checked })} /> Show piece names</label>
 
             {:else if s.id === '3d'}

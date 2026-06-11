@@ -2,8 +2,9 @@
   // Preferences — theme, grid/snap, interaction quality, autosave cadence and the 3D stats overlay.
   // The original buried these across menus; here they live in one panel. All bind to live stores /
   // utilities so changes take effect immediately and persist (localStorage / theme attribute).
-  import { showGrid, snapToGrid, interactionMode, autoSaveSeconds, show3dStats } from '$lib/stores/pattern';
+  import { showGrid, snapToGrid, interactionMode, autoSaveSeconds, show3dStats, showCoordinates } from '$lib/stores/pattern';
   import { isDarkTheme, toggleTheme } from '$lib/utils/theme';
+  import { mcpSessionId, enableMcpSession, disableMcpSession, copyMcpSessionId } from '$lib/stores/mcpSession';
 
   let { onclose }: { onclose: () => void } = $props();
   let dark = $state(isDarkTheme());
@@ -37,9 +38,13 @@
       <label class="flex items-center justify-between"><span>Snap to grid</span>
         <input type="checkbox" class="toggle toggle-sm" checked={$snapToGrid} onchange={(e) => snapToGrid.set(e.currentTarget.checked)} /></label>
 
-      <label class="flex items-center justify-between"><span>Interaction quality</span>
-        <select class="select select-bordered select-sm" value={$interactionMode} onchange={(e) => interactionMode.set(e.currentTarget.value as 'fast' | 'accurate')}>
-          <option value="fast">Fast</option><option value="accurate">Accurate</option>
+      <label class="flex items-center justify-between"><span>Show coordinates</span>
+        <input type="checkbox" class="toggle toggle-sm" checked={$showCoordinates} onchange={(e) => showCoordinates.set(e.currentTarget.checked)} /></label>
+
+      <span class="text-xs font-semibold opacity-70 block pt-1">Interaction</span>
+      <label class="flex items-center justify-between"><span>Interaction mode</span>
+        <select class="select select-bordered select-sm" value={$interactionMode} onchange={(e) => interactionMode.set(e.currentTarget.value as 'fast' | 'safe')}>
+          <option value="safe">Safe (select first)</option><option value="fast">Fast (direct drag)</option>
         </select></label>
 
       <label class="flex items-center justify-between"><span>3D stats overlay (FPS)</span>
@@ -51,6 +56,17 @@
             oninput={(e) => autoSaveSeconds.set(Math.max(2, Math.min(120, parseInt(e.currentTarget.value) || 5)))} />
           <span class="text-base-content/60">s</span>
         </span></label>
+
+      <span class="text-xs font-semibold opacity-70 block pt-1">MCP</span>
+      <label class="flex items-center justify-between"><span>Enable MCP session</span>
+        <input type="checkbox" class="toggle toggle-sm" checked={$mcpSessionId !== null} onchange={(e) => e.currentTarget.checked ? enableMcpSession() : disableMcpSession()} /></label>
+      {#if $mcpSessionId}
+        <div class="flex items-center justify-between gap-2">
+          <code class="text-[11px] truncate text-base-content/60" title={$mcpSessionId}>{$mcpSessionId}</code>
+          <button class="btn btn-ghost btn-xs shrink-0" onclick={copyMcpSessionId}>Copy MCP session ID</button>
+        </div>
+        <p class="text-[11px] text-base-content/50">External agents can read and edit this pattern via <code>/api/mcp-session/&lt;id&gt;</code>.</p>
+      {/if}
     </div>
 
     <p class="text-[11px] text-base-content/50">Preferences are saved on this device.</p>

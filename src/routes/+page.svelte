@@ -64,7 +64,7 @@
             <h3 class="card-title text-lg">{p.name}</h3>
             <p class="text-sm opacity-70">{p.description || 'No description'}</p>
             <div class="card-actions justify-end mt-2">
-              <a href="/studio?id={p.id}" class="btn btn-sm btn-accent">Open</a>
+              <a href="/studio/{p.id}" class="btn btn-sm btn-accent">Open</a>
             </div>
           </div>
         </div>

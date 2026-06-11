@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
+  import { replaceState } from '$app/navigation';
   import PatternCanvas2D from '$lib/components/PatternCanvas2D.svelte';
   import PatternScene3D from '$lib/components/PatternScene3D.svelte';
   import StudioToolbar from '$lib/components/StudioToolbar.svelte';
@@ -20,14 +21,21 @@
   import GradingOverlay from '$lib/components/GradingOverlay.svelte';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { confirm } from '$lib/stores/confirm';
-  import { patternToSVG, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printPatternTiled, printMarkerTiled, patternToPDF, patternToHPGL } from '$lib/utils/exporters';
+  import { patternToSVG, patternToSVG2, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printMarkerTiled, patternToHPGL } from '$lib/utils/exporters';
   import { nestPieces, markerToSVG, type CutOffType } from '$lib/utils/markerLayout';
-  import { dxfToPattern, svgToPattern } from '$lib/utils/patternImport';
+  import { dxfToPattern, svgToPattern, type DxfImportOptions } from '$lib/utils/patternImport';
+  import { parseRul, applyRulToPattern, type RulTable } from '$lib/utils/rulImport';
+  import PrintDialog from '$lib/components/PrintDialog.svelte';
+  import DxfImportDialog from '$lib/components/DxfImportDialog.svelte';
+  import SizesDialog from '$lib/components/SizesDialog.svelte';
   import { cutToPattern } from '$lib/utils/cutImport';
   import { seamlyToPattern } from '$lib/utils/seamlyImport';
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
   import WelcomeModal from '$lib/components/WelcomeModal.svelte';
+  import StudioTour from '$lib/components/StudioTour.svelte';
+  import WhatsNewModal from '$lib/components/WhatsNewModal.svelte';
+  import ReviewPromptDialog from '$lib/components/ReviewPromptDialog.svelte';
   import { redraft, hasConstraints, makeParametric, solvePoints, resolveVariables, captureAlterationDelta } from '$lib/solver/solve';
   import AlterationsPanel from '$lib/components/AlterationsPanel.svelte';
   import type { AlterationTrack, BezierHandle } from '$lib/types/pattern';
@@ -38,15 +46,24 @@
   import SettingsModal from '$lib/components/SettingsModal.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
   import HistoryMenu from '$lib/components/HistoryMenu.svelte';
-  import { installCommandApi, type ExecuteHost } from '$lib/commands';
+  import { installCommandApi, executeCommand, type ExecuteHost } from '$lib/commands';
+  import { configureMcpSession } from '$lib/stores/mcpSession';
   import { get } from 'svelte/store';
   import { autoSaveSeconds } from '$lib/stores/pattern';
 
   let showCommandPalette = $state(false);
   let showBugReport = $state(false);
+  let showPrintDialog = $state(false);
+  /** pending .dxf file text + name while the DXF import options dialog is open */
+  let dxfPending = $state<{ text: string; name: string } | null>(null);
+  /** RUL grade-rule dialog: table parsed from a picked .rul file, or null for "pick a file" mode */
+  let rulDialog = $state<{ table: RulTable | null } | null>(null);
   let showCuttingRoom = $state(false);
   let showVersions = $state(false);
   let showSettings = $state(false);
+  let showTour = $state(false);
+  /** successful saves this session — drives the review prompt */
+  let saveCount = $state(0);
 
   let currentPattern = $state<Pattern>(structuredClone(EMPTY_PATTERN));
   let saved = $state(true);
@@ -179,15 +196,32 @@
 
   onMount(() => {
     const disposeCommandApi = installCommandApi(commandHost);
+    // MCP pattern session: external agents read the snapshot we push on each /sync and queue ops —
+    // full-pattern replacements land in the undo history as 'External edit', command ops run through
+    // the same command bus as the palette / window.seamscape.
+    const disposeMcpSession = configureMcpSession({
+      getPattern: commandHost.getPattern,
+      applyPattern: (next) => handlePatternUpdate(next, 'External edit'),
+      executeCommand: (name, payload) => executeCommand(commandHost, name, payload)
+    });
     (async () => {
-      const id = $page.url.searchParams.get('id');
+      // Pattern id lives in the URL path (/studio/<id>), with ?id= kept for older links.
+      const id = $page.params.slug?.split('/')[0] || $page.url.searchParams.get('id');
       if (id) {
-        const loaded = await loadPattern(id);
+        let loaded = await loadPattern(id);
+        if (!loaded) {
+          try {
+            const res = await fetch(`/api/patterns/${id}`);
+            if (res.ok) loaded = await res.json();
+          } catch { /* offline — fall through to blank editor */ }
+        }
         if (loaded) {
           currentPattern = loaded; patternName = loaded.name;
           // restore this pattern's persisted undo/redo so Ctrl+Z survives reload; seed a baseline only if none.
           const restored = await restoreHistory(id);
           if (!restored) pushUndo(structuredClone(loaded), 'Open pattern');
+        } else {
+          toastError('Pattern not found');
         }
         pattern.set(currentPattern);
       } else {
@@ -207,7 +241,7 @@
     const handler = (e: BeforeUnloadEvent) => { if (!saved) e.preventDefault(); };
     window.addEventListener('beforeunload', handler);
 
-    return () => { clearInterval(autoSaveTimer); unsubAutosave(); window.removeEventListener('beforeunload', handler); disposeCommandApi(); };
+    return () => { clearInterval(autoSaveTimer); unsubAutosave(); window.removeEventListener('beforeunload', handler); disposeCommandApi(); disposeMcpSession(); };
   });
 
   function handlePatternUpdate(updated: Pattern, label = 'Edit') {
@@ -243,7 +277,9 @@
 
   async function handleSave() {
     currentPattern = { ...currentPattern, name: patternName };
-    await saveToDB(currentPattern); saved = true;
+    await saveToDB(currentPattern); saved = true; saveCount += 1;
+    // keep the pattern id in the URL so a reload reopens this pattern
+    if ($page.params.slug?.split('/')[0] !== currentPattern.id) replaceState(`/studio/${currentPattern.id}`, {});
     toastSuccess('Pattern saved');
   }
 
@@ -253,12 +289,13 @@
     a.href = url; a.download = `${patternName.replace(/\s+/g, '_')}.seamer.json`; a.click(); URL.revokeObjectURL(url);
   }
 
-  function exportAs(fmt: 'svg' | 'dxf' | 'csv') {
+  function exportAs(fmt: 'svg' | 'svg2' | 'dxf' | 'csv') {
     const base = patternName.replace(/\s+/g, '_') || 'pattern';
     if (fmt === 'svg') downloadText(`${base}.svg`, patternToSVG(currentPattern), 'image/svg+xml');
+    else if (fmt === 'svg2') downloadText(`${base}.svg`, patternToSVG2(currentPattern), 'image/svg+xml');
     else if (fmt === 'dxf') downloadText(`${base}.dxf`, patternToDXF(currentPattern), 'application/dxf');
     else downloadText(`${base}.csv`, patternToCSV(currentPattern), 'text/csv');
-    toastSuccess(`Exported ${fmt.toUpperCase()}`);
+    toastSuccess(`Exported ${fmt === 'svg2' ? 'SVG 2' : fmt.toUpperCase()}`);
   }
 
   async function exportPNG() {
@@ -267,15 +304,6 @@
     if (!blob) { toastError('Nothing to export'); return; }
     downloadBlob(`${base}.png`, blob);
     toastSuccess('Exported PNG');
-  }
-  async function exportPDF() {
-    const base = patternName.replace(/\s+/g, '_') || 'pattern';
-    const sizeStr = (prompt('PDF page size? A4 / A3 / A2 / A1 / A0 / Letter (tiled at true scale)', 'A4') || 'A4').trim();
-    const page = (['A4','A3','A2','A1','A0','Letter'].find((s) => s.toLowerCase() === sizeStr.toLowerCase()) ?? 'A4') as 'A4';
-    try {
-      downloadBlob(`${base}.pdf`, await patternToPDF(currentPattern, { page, tile: true }));
-      toastSuccess(`Exported PDF (${page}, tiled)`);
-    } catch (e) { toastError('PDF export failed'); }
   }
   async function exportHPGL() {
     const base = patternName.replace(/\s+/g, '_') || 'pattern';
@@ -286,7 +314,6 @@
   }
 
   function doPrint() { printPattern(currentPattern, patternName || 'Pattern'); }
-  function doPrintTiled() { printPatternTiled(currentPattern, { title: patternName || 'Pattern' }); }
   function exportMarker() {
     const base = patternName.replace(/\s+/g, '_') || 'pattern';
     const widthStr = prompt('Fabric width (mm)?', '1400');
@@ -324,15 +351,36 @@
   }
 
   function handleImport() {
-    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.dxf,.svg,.cut,.val,.sm2d,.xml';
+    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.seamer.json,.dxf,.svg,.cut,.val,.sm2d,.xml,.rul';
     input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0]; if (!file) return;
       const ext = file.name.split('.').pop()?.toLowerCase();
       try {
-        applyImported(parseImport(await file.text(), ext, file.name.replace(/\.(dxf|svg|cut|val|sm2d|xml|json|seamer\.json)$/i, '')));
+        const text = await file.text();
+        const name = file.name.replace(/\.(dxf|svg|cut|val|sm2d|xml|json|rul|seamer\.json)$/i, '');
+        if (ext === 'dxf') { dxfPending = { text, name }; return; } // import options dialog first
+        if (ext === 'rul') { rulDialog = { table: parseRul(text) }; return; } // pick a size, then apply
+        applyImported(parseImport(text, ext, name));
       } catch (err) { toastError((err as Error)?.message || 'Could not import file'); }
     };
     input.click();
+  }
+
+  function importDxfWithOptions(options: DxfImportOptions) {
+    if (!dxfPending) return;
+    try {
+      applyImported(dxfToPattern(dxfPending.text, dxfPending.name, options));
+    } catch (err) { toastError((err as Error)?.message || 'Could not import file'); }
+    dxfPending = null;
+  }
+
+  function applyRul(table: RulTable, size: string) {
+    try {
+      const next = applyRulToPattern(structuredClone($state.snapshot(currentPattern)) as Pattern, table, { chosenSize: size });
+      handlePatternUpdate(next, 'Apply grade rules');
+      toastSuccess(`Applied grade rules "${table.name}" — ${table.sizes.length} sizes, base ${size}`);
+    } catch (err) { toastError((err as Error)?.message || 'Could not apply grade rules'); }
+    rulDialog = null;
   }
 
   // Bundled DXF/SVG fixtures (served from /samples) for one-click import testing.
@@ -529,7 +577,7 @@
           {/each}
         </ul>
       </div>
-      <div class="join join-horizontal">
+      <div class="join join-horizontal" data-tour-id="tour-view-mode">
         <button class="join-item btn btn-xs" class:btn-active={viewMode === '2d'} onclick={() => viewMode = '2d'}>2D</button>
         <button class="join-item btn btn-xs" class:btn-active={viewMode === 'both'} onclick={() => viewMode = 'both'}>Both</button>
         <button class="join-item btn btn-xs" class:btn-active={viewMode === '3d'} onclick={() => viewMode = '3d'}>3D</button>
@@ -542,6 +590,7 @@
         <div role="button" tabindex="0" class="btn btn-ghost btn-xs">Import</div>
         <ul class="dropdown-content menu bg-base-200 rounded-box z-50 w-52 p-2 shadow text-sm">
           <li><button onclick={handleImport}>From file… (JSON/DXF/SVG/CUT/Seamly)</button></li>
+          <li><button onclick={() => (rulDialog = { table: null })}>RUL grade rules…</button></li>
           <li class="menu-title pt-2">Samples</li>
           {#each importSamples as s}
             <li><button onclick={() => importSample(s.file)}>{s.label}</button></li>
@@ -553,8 +602,9 @@
         <ul class="dropdown-content menu bg-base-200 rounded-box z-50 w-44 p-2 shadow text-sm">
           <li><button onclick={handleExport}>JSON (.seamer.json)</button></li>
           <li><button onclick={() => exportAs('svg')}>SVG</button></li>
+          <li><button onclick={() => exportAs('svg2')}>Export SVG 2 (Beta)</button></li>
           <li><button onclick={() => exportAs('dxf')}>DXF</button></li>
-          <li><button onclick={exportPDF}>PDF (vector, tiled)</button></li>
+          <li><button onclick={() => (showPrintDialog = true)}>PDF (vector, tiled)</button></li>
           <li><button onclick={exportHPGL}>HPGL (plotter)</button></li>
           <li><button onclick={exportPNG}>PNG</button></li>
           <li><button onclick={() => exportAs('csv')}>CSV (points)</button></li>
@@ -562,12 +612,12 @@
           <li><button onclick={() => (showCuttingRoom = true)}>Cutting room…</button></li>
           <li><button onclick={exportMarker}>Marker / nest (SVG)</button></li>
           <li><button onclick={doPrintMarker}>Print marker (tiled)…</button></li>
-          <li><button onclick={doPrintTiled}>Print pattern (tiled)…</button></li>
+          <li><button onclick={() => (showPrintDialog = true)}>Print pattern (tiled)…</button></li>
           <li><button onclick={doPrint}>Print (single page)…</button></li>
         </ul>
       </div>
       <button class="btn btn-ghost btn-xs" onclick={handleNew}>New</button>
-      <button class="btn btn-xs" class:btn-accent={!saved} class:btn-ghost={saved} onclick={handleSave}>{saved ? 'Saved' : 'Save'}</button>
+      <button class="btn btn-xs" class:btn-accent={!saved} class:btn-ghost={saved} onclick={handleSave} data-tour-id="tour-save">{saved ? 'Saved' : 'Save'}</button>
       <button class="btn btn-ghost btn-xs" onclick={() => showLeftPanel = !showLeftPanel} title="Toggle left panel">&#x2630;</button>
       <button class="btn btn-ghost btn-xs" onclick={() => showRightPanel = !showRightPanel} title="Toggle right panel">&#x25B6;</button>
       <button class="btn btn-xs" class:btn-active={showObjectBrowser} onclick={() => showObjectBrowser = !showObjectBrowser} title="Toggle object browser">
@@ -584,6 +634,9 @@
       <button class="btn btn-ghost btn-xs" onclick={() => showCommandPalette = true} title="Command palette (⌘K)" aria-label="Command palette">
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">terminal</span>
       </button>
+      <button class="btn btn-ghost btn-xs" onclick={() => showTour = true} title="Take tour" aria-label="Take tour">
+        <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">tour</span>
+      </button>
       <button class="btn btn-ghost btn-xs" onclick={() => showBugReport = true} title="Send feedback" aria-label="Send feedback">
         <span class="material-symbols-rounded notranslate align-middle" style="font-size:18px">feedback</span>
       </button>
@@ -595,7 +648,7 @@
 
   <div class="flex-1 flex overflow-hidden">
     {#if showLeftPanel}
-      <div class="w-56 border-r bg-base-100 flex flex-col shrink-0 overflow-hidden">
+      <div class="w-56 border-r bg-base-100 flex flex-col shrink-0 overflow-hidden" data-tour-id="tour-left-panel">
         <div class="tabs tabs-boxed tabs-xs bg-base-200 px-1 pt-1">
           <button class="tab" class:tab-active={leftTab === 'layers'} onclick={() => leftTab = 'layers'}>Layers</button>
           <button class="tab" class:tab-active={leftTab === 'body'} onclick={() => leftTab = 'body'}>Body</button>
@@ -614,12 +667,12 @@
 
     <div class="flex-1 flex overflow-hidden">
       {#if viewMode === 'both'}
-        <div class="w-1/2 border-r relative"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
-        <div class="w-1/2 relative"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
+        <div class="w-1/2 border-r relative" data-tour-id="tour-canvas-2d"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
+        <div class="w-1/2 relative" data-tour-id="tour-canvas-3d"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
       {:else if viewMode === '2d'}
-        <div class="flex-1 relative"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
+        <div class="flex-1 relative" data-tour-id="tour-canvas-2d"><PatternCanvas2D {currentPattern} onchange={handlePatternUpdate} /></div>
       {:else}
-        <div class="flex-1 relative"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
+        <div class="flex-1 relative" data-tour-id="tour-canvas-3d"><PatternScene3D {currentPattern} selectedPieceId={[...$selectedPieceIds][0] ?? null} onpieceselect={handlePieceSelect} ondrapesettled={handleDrapeSettled} {labelDisplay} /></div>
       {/if}
     </div>
 
@@ -628,7 +681,7 @@
     {/if}
   </div>
 
-  <div class="h-10 border-t bg-base-200 shrink-0">
+  <div class="h-10 border-t bg-base-200 shrink-0" data-tour-id="tour-toolbar">
     <StudioToolbar {currentPattern} onchange={handlePatternUpdate} />
   </div>
 
@@ -640,12 +693,18 @@
 </div>
 
 <KeyboardShortcuts bind:open={showShortcuts} />
-<WelcomeModal onshowshortcuts={() => (showShortcuts = true)} />
+<WelcomeModal onshowshortcuts={() => (showShortcuts = true)} onstarttour={() => (showTour = true)} />
+{#if showTour}<StudioTour onclose={() => (showTour = false)} />{/if}
+<WhatsNewModal />
+<ReviewPromptDialog {saveCount} />
 {#if showCommandPalette}<CommandPalette host={commandHost} onclose={() => (showCommandPalette = false)} />{/if}
 {#if showBugReport}<BugReportModal {currentPattern} onclose={() => (showBugReport = false)} />{/if}
 {#if showCuttingRoom}<CuttingRoomModal {currentPattern} onchange={handlePatternUpdate} onclose={() => (showCuttingRoom = false)} />{/if}
 {#if showVersions}<VersionsModal {currentPattern} onrestore={applyImported} onchange={handlePatternUpdate} onclose={() => (showVersions = false)} />{/if}
 {#if showSettings}<SettingsModal onclose={() => (showSettings = false)} />{/if}
+{#if showPrintDialog}<PrintDialog pattern={currentPattern} {patternName} onclose={() => (showPrintDialog = false)} />{/if}
+{#if dxfPending}<DxfImportDialog filename={dxfPending.name} onapply={importDxfWithOptions} oncancel={() => (dxfPending = null)} />{/if}
+{#if rulDialog}<SizesDialog table={rulDialog.table} onapply={applyRul} oncancel={() => (rulDialog = null)} />{/if}
 
 <Toaster />
 <ConfirmDialog />

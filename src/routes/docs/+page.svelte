@@ -4,6 +4,27 @@
 <div class="px-4 py-8 max-w-4xl mx-auto">
   <h1 class="text-3xl font-bold font-lexend mb-6">Documentation</h1>
   <div class="prose max-w-none">
+    <h2 class="text-2xl font-bold mt-6">Guides</h2>
+    <ul class="list-disc pl-6 space-y-2">
+      <li><a href="/docs/seamer-in-action" class="link link-primary">Seamer in Action</a> — drafting a skirt from blank canvas to cut file</li>
+    </ul>
+
+    <h2 class="text-2xl font-bold mt-6">Drawing</h2>
+    <ul class="list-disc pl-6 space-y-2">
+      <li><a href="/docs/drawing/tools" class="link link-primary">Drawing Tools</a> — the toolbar and hotkeys</li>
+      <li><a href="/docs/drawing/coordinate-system" class="link link-primary">Coordinate System</a> — units, spaces, and the canvas view</li>
+      <li><a href="/docs/drawing/constraints" class="link link-primary">Constraints</a> — parametric point constructions</li>
+      <li><a href="/docs/drawing/formulas" class="link link-primary">Formulas</a> — expression syntax and tokens</li>
+      <li><a href="/docs/drawing/variables" class="link link-primary">Variables</a> — named knobs and grading overrides</li>
+    </ul>
+
+    <h2 class="text-2xl font-bold mt-6">Elements</h2>
+    <ul class="list-disc pl-6 space-y-2">
+      <li><a href="/docs/elements" class="link link-primary">Elements Overview</a> — points, paths, pieces, seams, materials</li>
+      <li><a href="/docs/elements/points" class="link link-primary">Points</a> — fixed and constrained positions</li>
+      <li><a href="/docs/elements/paths" class="link link-primary">Paths</a> — lines, curves, handles, and spans</li>
+    </ul>
+
     <h2 class="text-2xl font-bold mt-6">Pattern Data Format</h2>
     <p>
       Seamer patterns are stored as JSON with a <code>.seamer.json</code> extension.

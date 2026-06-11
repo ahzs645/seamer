@@ -21,7 +21,9 @@ interface Vtx {
   /** incoming control offset (from the previous vertex) */
   in?: Vec2;
 }
-interface Loop { points: Vtx[]; closed: boolean; }
+/** What an imported entity is, in garment terms (cut = piece boundary; seam = stitch line). */
+export type DxfLineClass = 'cut' | 'seam' | 'internal';
+interface Loop { points: Vtx[]; closed: boolean; cls?: DxfLineClass; }
 
 const uid = (prefix: string) => `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 9)}`;
 const ZERO_FORMULA = (): Formula => ({ formula: '', unit: 'mm' });
@@ -93,24 +95,28 @@ function patternFromLoops(loops: Loop[], name: string): Pattern {
     };
   }
 
+  /** A loose multi-point ConstrainablePath through all vertices (closed loops repeat the first id). */
+  function loosePath(pts: Vtx[], ids: string[], closed: boolean, name = ''): ConstrainablePath {
+    const curve = pts.some(hasTangent);
+    const pathPoints: PathPoint[] = pts.map((v, i) => (curve ? { id: ids[i], handle: makeHandle(v) } : { id: ids[i] }));
+    if (closed && ids.length >= 3) pathPoints.push(curve ? { id: ids[0], handle: makeHandle(pts[0]) } : { id: ids[0] });
+    return { id: uid('ConstrainablePath'), name, pathType: curve ? 'curve' : 'line', pathPoints, version: 1 };
+  }
+
+  const loopBounds = (pts: Vtx[]) => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const v of pts) { minX = Math.min(minX, v.x); minY = Math.min(minY, v.y); maxX = Math.max(maxX, v.x); maxY = Math.max(maxY, v.y); }
+    return { minX, minY, maxX, maxY };
+  };
+  const pieceBoxes: { piece: Piece; box: ReturnType<typeof loopBounds> }[] = [];
+
+  // pass 1: closed cut loops → pieces (one edge per segment)
+  const rest: { loop: Loop; pts: Vtx[] }[] = [];
   for (const loop of loops) {
     const pts = cleanLoop(loop.points);
     if (pts.length < 2) continue;
+    if (!loop.closed || pts.length < 3 || (loop.cls && loop.cls !== 'cut')) { rest.push({ loop, pts }); continue; }
     const ids = pts.map(addPoint);
-
-    if (!loop.closed || ids.length < 3) {
-      // open polyline → a single loose ConstrainablePath (curve if any vertex has a tangent)
-      const curve = pts.some(hasTangent);
-      const path: ConstrainablePath = {
-        id: uid('ConstrainablePath'), name: '', pathType: curve ? 'curve' : 'line',
-        pathPoints: pts.map((v, i) => (curve ? { id: ids[i], handle: makeHandle(v) } : { id: ids[i] })),
-        version: 1
-      };
-      p.paths.push(path);
-      continue;
-    }
-
-    // closed loop → a piece with one edge per segment
     const newPaths: ConstrainablePath[] = [];
     const mainPaths: PiecePath[] = [];
     for (let i = 0; i < ids.length; i++) {
@@ -134,6 +140,26 @@ function patternFromLoops(loops: Loop[], name: string): Pattern {
       }
     };
     p.pieces.push(piece);
+    pieceBoxes.push({ piece, box: loopBounds(pts) });
+  }
+
+  // pass 2: everything else → loose paths; classified internals nest into a containing piece
+  for (const { loop, pts } of rest) {
+    const ids = pts.map(addPoint);
+    const path = loosePath(pts, ids, loop.closed, loop.cls === 'seam' ? 'Seam' : '');
+    p.paths.push(path);
+    if (loop.cls === 'internal' && pieceBoxes.length) {
+      const b = loopBounds(pts);
+      const eps = 0.5;
+      const host = pieceBoxes.find(({ box }) =>
+        b.minX >= box.minX - eps && b.maxX <= box.maxX + eps && b.minY >= box.minY - eps && b.maxY <= box.maxY + eps);
+      if (host) {
+        host.piece.internalPaths.push({
+          id: uid('PiecePath'), name: path.name || 'Internal', path: path.id,
+          from: ids[0], to: ids[ids.length - 1], reversed: false, notches: []
+        });
+      }
+    }
   }
   p.hasChanged = true;
   return p;
@@ -161,8 +187,47 @@ function bulgeToTangents(ax: number, ay: number, bx: number, by: number, bulge: 
   return { out: { x: tAx * len, y: tAy * len }, in: { x: -tBx * len, y: -tBy * len } };
 }
 
-/** Parse a DXF (R12 ASCII) into loops. Handles LWPOLYLINE (with bulges), POLYLINE/VERTEX, and LINE. */
-export function dxfToPattern(text: string, name = 'Imported DXF'): Pattern {
+export interface DxfClassifyOptions {
+  /** import cut lines (piece boundaries). Default true. */
+  importCut?: boolean;
+  /** import seam (stitch) lines. Default true. */
+  importSeam?: boolean;
+  /** import internal lines (darts, fold lines…). Default true. */
+  importInternal?: boolean;
+  /** DXF color index (group code 62) → line class; takes precedence over layer-name heuristics. */
+  colorMap?: Record<number, DxfLineClass>;
+}
+
+export interface DxfImportOptions {
+  /**
+   * Source-unit override. Plain `dxfToPattern(text)` keeps the historic behavior of reading
+   * coordinates as millimetres; 'auto' honours the header's $INSUNITS variable instead, and
+   * 'mm' / 'cm' / 'inch' force a unit regardless of the header.
+   */
+  unitsOverride?: 'auto' | 'mm' | 'cm' | 'inch';
+  /** Entity → cut/seam/internal classification by color index / layer. Off when omitted. */
+  classify?: DxfClassifyOptions;
+}
+
+/** mm per drawing unit for a DXF $INSUNITS code (unknown codes → 1, i.e. treated as mm). */
+const INSUNITS_TO_MM: Record<number, number> = { 0: 1, 1: 25.4, 2: 304.8, 4: 1, 5: 10, 6: 1000 };
+
+/** Classify one entity by color index (preferred) then layer name; default by topology. */
+function classifyEntity(layer: string, color: number | null, closed: boolean, opts: DxfClassifyOptions): DxfLineClass {
+  if (color !== null && opts.colorMap && opts.colorMap[color]) return opts.colorMap[color];
+  const l = layer.toLowerCase();
+  if (/seam|sew|stitch/.test(l) || layer === '14') return 'seam';
+  if (/cut|boundary|outline/.test(l) || layer === '1') return 'cut';
+  if (/intern|drill|fold|dart/.test(l) || layer === '8') return 'internal';
+  return closed ? 'cut' : 'internal';
+}
+
+/**
+ * Parse a DXF (R12 ASCII) into loops. Handles LWPOLYLINE (with bulges), POLYLINE/VERTEX, and LINE.
+ * Without `options`, all coordinates are read as mm and every closed loop becomes a piece (historic
+ * behavior). With options, $INSUNITS scaling and color/layer line classification apply.
+ */
+export function dxfToPattern(text: string, name = 'Imported DXF', options: DxfImportOptions = {}): Pattern {
   const raw = text.split(/\r\n|\r|\n/);
   const toks: { code: number; val: string }[] = [];
   for (let i = 0; i + 1 < raw.length; i += 2) {
@@ -171,7 +236,16 @@ export function dxfToPattern(text: string, name = 'Imported DXF'): Pattern {
     toks.push({ code, val: raw[i + 1].trim() });
   }
 
-  const loops: Loop[] = [];
+  // header $INSUNITS (group 9 '$INSUNITS' followed by its 70 value)
+  let insunits: number | null = null;
+  for (let k = 0; k + 1 < toks.length; k++) {
+    if (toks[k].code === 9 && toks[k].val.toUpperCase() === '$INSUNITS' && toks[k + 1].code === 70) {
+      insunits = parseInt(toks[k + 1].val, 10);
+      break;
+    }
+  }
+
+  const loops: (Loop & { layer: string; color: number | null })[] = [];
   let i = 0;
   const isEntityStart = (t: { code: number }) => t.code === 0;
   while (i < toks.length) {
@@ -185,19 +259,25 @@ export function dxfToPattern(text: string, name = 'Imported DXF'): Pattern {
       let closed = false;
       let cx: number | null = null;
       let pendingBulge = 0;
+      let layer = '', color: number | null = null;
       for (; i < toks.length && !isEntityStart(toks[i]); i++) {
         const { code, val } = toks[i];
         if (code === 70) closed = (parseInt(val, 10) & 1) === 1;
+        else if (code === 8) layer = val;
+        else if (code === 62) color = parseInt(val, 10);
         else if (code === 42) { if (verts.length) verts[verts.length - 1].bulge = parseFloat(val); else pendingBulge = parseFloat(val); }
         else if (code === 10) cx = parseFloat(val);
         else if (code === 20 && cx !== null) { verts.push({ x: cx, y: parseFloat(val), bulge: 0 }); cx = null; }
       }
       if (pendingBulge && verts.length) verts[0].bulge = pendingBulge;
-      loops.push({ points: bulgeVertsToLoop(verts, closed), closed });
+      loops.push({ points: bulgeVertsToLoop(verts, closed), closed, layer, color });
     } else if (type === 'POLYLINE') {
       let closed = false;
+      let layer = '', color: number | null = null;
       for (; i < toks.length && !isEntityStart(toks[i]); i++) {
         if (toks[i].code === 70) closed = (parseInt(toks[i].val, 10) & 1) === 1;
+        else if (toks[i].code === 8) layer = toks[i].val;
+        else if (toks[i].code === 62) color = parseInt(toks[i].val, 10);
       }
       const verts: { x: number; y: number; bulge: number }[] = [];
       while (i < toks.length && toks[i].code === 0 && toks[i].val === 'VERTEX') {
@@ -211,20 +291,49 @@ export function dxfToPattern(text: string, name = 'Imported DXF'): Pattern {
         verts.push({ x: vx, y: vy, bulge });
       }
       if (toks[i] && toks[i].val === 'SEQEND') i++;
-      loops.push({ points: bulgeVertsToLoop(verts, closed), closed });
+      loops.push({ points: bulgeVertsToLoop(verts, closed), closed, layer, color });
     } else if (type === 'LINE') {
       let x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+      let layer = '', color: number | null = null;
       for (; i < toks.length && !isEntityStart(toks[i]); i++) {
         const { code, val } = toks[i];
         if (code === 10) x1 = parseFloat(val);
         else if (code === 20) y1 = parseFloat(val);
         else if (code === 11) x2 = parseFloat(val);
         else if (code === 21) y2 = parseFloat(val);
+        else if (code === 8) layer = val;
+        else if (code === 62) color = parseInt(val, 10);
       }
-      loops.push({ points: [{ x: x1, y: y1 }, { x: x2, y: y2 }], closed: false });
+      loops.push({ points: [{ x: x1, y: y1 }, { x: x2, y: y2 }], closed: false, layer, color });
     }
   }
-  return patternFromLoops(loops, name);
+
+  // units: explicit override wins; 'auto' reads $INSUNITS; default (no options) keeps mm
+  const scale = options.unitsOverride === 'inch' ? 25.4
+    : options.unitsOverride === 'cm' ? 10
+    : options.unitsOverride === 'mm' ? 1
+    : options.unitsOverride === 'auto' ? (INSUNITS_TO_MM[insunits ?? 4] ?? 1)
+    : 1;
+  if (scale !== 1) {
+    for (const loop of loops) for (const v of loop.points) {
+      v.x *= scale; v.y *= scale;
+      if (v.out) { v.out.x *= scale; v.out.y *= scale; }
+      if (v.in) { v.in.x *= scale; v.in.y *= scale; }
+    }
+  }
+
+  // line classification (only when requested — keeps the plain call path untouched)
+  let imported: Loop[] = loops;
+  if (options.classify) {
+    const c = options.classify;
+    imported = loops
+      .map((loop) => ({ ...loop, cls: classifyEntity(loop.layer, loop.color, loop.closed, c) }))
+      .filter((loop) =>
+        loop.cls === 'cut' ? (c.importCut ?? true)
+        : loop.cls === 'seam' ? (c.importSeam ?? true)
+        : (c.importInternal ?? true));
+  }
+  return patternFromLoops(imported, name);
 }
 
 /** Convert bulge-bearing DXF vertices into tangent-bearing loop vertices. */

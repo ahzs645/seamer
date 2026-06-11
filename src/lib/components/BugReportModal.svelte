@@ -26,9 +26,11 @@
     return lines.join('\n');
   }
 
+  const kindLabel = $derived(kind === 'bug' ? 'File bug report' : 'Feature request');
+
   function compose(): string {
     const header = `[${kind === 'bug' ? 'Bug Report' : 'Feature Request'}] ${title || '(no title)'}`;
-    const parts = [header, '', body || '(no description)'];
+    const parts = [header, `type: ${kind}`, '', body || '(no description)'];
     if (includeDiagnostics) parts.push('', '--- diagnostics ---', diagnostics());
     return parts.join('\n');
   }
@@ -62,14 +64,15 @@
 >
   <div class="bg-base-100 w-[min(560px,92vw)] rounded-lg shadow-2xl p-4" role="dialog" aria-label="Send feedback">
     <div class="flex items-center justify-between mb-3">
-      <h2 class="font-bold text-lg">Send feedback</h2>
+      <h2 class="font-bold text-lg">{kindLabel}</h2>
       <button class="btn btn-ghost btn-sm btn-square" onclick={onclose} aria-label="Close">✕</button>
     </div>
 
-    <div role="tablist" class="tabs tabs-boxed mb-3">
-      <button role="tab" class="tab" class:tab-active={kind === 'bug'} onclick={() => (kind = 'bug')}>Bug Report</button>
-      <button role="tab" class="tab" class:tab-active={kind === 'feature'} onclick={() => (kind = 'feature')}>Feature Request</button>
-    </div>
+    <label class="block text-sm font-medium mb-1" for="fb-type">Type</label>
+    <select id="fb-type" class="select select-sm select-bordered w-full mb-3" bind:value={kind}>
+      <option value="bug">File bug report</option>
+      <option value="feature">Feature request</option>
+    </select>
 
     <label class="block text-sm font-medium mb-1" for="fb-title">Title</label>
     <input id="fb-title" bind:value={title} class="input input-sm input-bordered w-full mb-3"

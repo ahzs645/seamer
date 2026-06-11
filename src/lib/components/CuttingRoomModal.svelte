@@ -8,7 +8,9 @@
     nestPieces, nestPiecesTrueShape, markerToSVG, type MarkerLayout, type CutOffType
   } from '$lib/utils/markerLayout';
   import { printMarkerTiled, downloadText, downloadBlob, markerToPDF, markerToHPGL } from '$lib/utils/exporters';
-  import { toastSuccess, toastError } from '$lib/stores/toast';
+  import { toast, toastSuccess, toastError } from '$lib/stores/toast';
+  import { machines, selectedMachineId, addMachine, updateMachine, removeMachine, type CuttingMachine } from '$lib/stores/machines';
+  import { markerToCutFile, machineUsableWidthMm, printPieceLabels } from '$lib/utils/cutfile';
 
   let { currentPattern, onchange, onclose }:
     { currentPattern: Pattern; onchange: (p: Pattern, label?: string) => void; onclose: () => void } = $props();
@@ -110,6 +112,55 @@
     } catch { toastError('HPGL export failed'); }
   }
 
+  // --- Machines (local cutting-room integration) -----------------------------------------------
+  let manageMachines = $state(false);
+  const machine = $derived($machines.find((m) => m.id === $selectedMachineId) ?? $machines[0] ?? null);
+
+  function patchMachine(id: string, patch: Partial<Omit<CuttingMachine, 'id'>>) { updateMachine(id, patch); }
+  function addNewMachine() {
+    const m = addMachine({ name: `Machine ${$machines.length + 1}` });
+    $selectedMachineId = m.id;
+    manageMachines = true;
+  }
+  function deleteMachine(id: string) {
+    removeMachine(id);
+    if ($selectedMachineId === id) $selectedMachineId = $machines[0]?.id ?? '';
+  }
+
+  /** Nest at the machine's usable bed width (its bed minus margins), reusing the normal nest flow. */
+  async function nestForMachine() {
+    if (!machine) return;
+    fabricWidthMm = machineUsableWidthMm(machine);
+    await nest();
+  }
+
+  /** Generate + download the machine's cut file(s) for the current marker — the local equivalent of
+   *  the production "Send to cutting room". Marks every piece cut on success. */
+  async function sendToCuttingRoom() {
+    if (!machine) { toastError('No machine selected'); return; }
+    if (!layout || layout.fabricWidthMm !== machineUsableWidthMm(machine)) await nestForMachine();
+    if (!layout || !layout.placements.length) { toastError('No pieces to nest'); return; }
+    try {
+      toast(`Sending to ${machine.name}…`);
+      const res = markerToCutFile(layout, machine);
+      for (const warning of res.warnings) toast(warning, 'info', 5000);
+      const base = (currentPattern.name || 'pattern').replace(/\s+/g, '_');
+      const slug = machine.name.replace(/\s+/g, '_');
+      res.files.forEach((f, i) => {
+        const part = res.files.length > 1 ? `_part${i + 1}` : '';
+        downloadText(`${base}_${slug}${part}.${res.extension}`, f.text, res.mime);
+      });
+      markAllCut();
+      toastSuccess('All materials have been cut');
+    } catch { toastError('Cut file generation failed'); }
+  }
+
+  function printLabels() {
+    if (!layout) return;
+    try { printPieceLabels(layout, currentPattern.name || 'Pattern', currentPattern); }
+    catch { toastError('Error printing label'); }
+  }
+
   // initial nest on open
   $effect(() => { if (!layout) nest(); });
 </script>
@@ -162,6 +213,60 @@
         <button class="btn btn-primary btn-sm w-full" onclick={nest} disabled={busy}>
           {#if busy}<span class="loading loading-spinner loading-xs"></span> Nesting…{:else}Nest pieces{/if}
         </button>
+
+        <!-- Machines: pick/manage a cutting machine, nest at its bed width, send the cut file -->
+        <div class="border-t border-base-300 pt-2 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-semibold uppercase opacity-60">Machines</span>
+            <button class="btn btn-ghost btn-xs" onclick={() => (manageMachines = !manageMachines)}>{manageMachines ? 'Done' : 'Manage'}</button>
+          </div>
+          <select class="select select-bordered select-sm w-full" bind:value={$selectedMachineId} aria-label="Cutting machine">
+            {#each $machines as m (m.id)}<option value={m.id}>{m.name}</option>{/each}
+          </select>
+          {#if machine}
+            <div class="text-xs opacity-70">
+              {machine.format.toUpperCase()} · bed {machine.bedWidthMm}×{machine.bedLengthMm} mm · margin {machine.marginMm} mm
+              {#if machine.speed} · {machine.speed} cm/s{/if}
+            </div>
+          {/if}
+          {#if manageMachines}
+            {#if machine}
+              <div class="space-y-1 rounded bg-base-200 p-2">
+                <label class="flex flex-col gap-1 text-xs">Name
+                  <input class="input input-bordered input-xs" value={machine.name}
+                    onchange={(e) => patchMachine(machine.id, { name: e.currentTarget.value })} /></label>
+                <label class="flex flex-col gap-1 text-xs">Format
+                  <select class="select select-bordered select-xs" value={machine.format}
+                    onchange={(e) => patchMachine(machine.id, { format: e.currentTarget.value as CuttingMachine['format'] })}>
+                    <option value="hpgl">HPGL</option>
+                    <option value="cut">CUT</option>
+                    <option value="svg">SVG</option>
+                  </select>
+                </label>
+                <div class="grid grid-cols-2 gap-1">
+                  <label class="flex flex-col gap-1 text-xs">Bed width (mm)
+                    <input type="number" min="100" step="10" class="input input-bordered input-xs" value={machine.bedWidthMm}
+                      onchange={(e) => patchMachine(machine.id, { bedWidthMm: Number(e.currentTarget.value) || 100 })} /></label>
+                  <label class="flex flex-col gap-1 text-xs">Bed length (mm)
+                    <input type="number" min="100" step="10" class="input input-bordered input-xs" value={machine.bedLengthMm}
+                      onchange={(e) => patchMachine(machine.id, { bedLengthMm: Number(e.currentTarget.value) || 100 })} /></label>
+                  <label class="flex flex-col gap-1 text-xs">Margin (mm)
+                    <input type="number" min="0" step="1" class="input input-bordered input-xs" value={machine.marginMm}
+                      onchange={(e) => patchMachine(machine.id, { marginMm: Math.max(0, Number(e.currentTarget.value) || 0) })} /></label>
+                  <label class="flex flex-col gap-1 text-xs">Speed (cm/s)
+                    <input type="number" min="0" step="1" class="input input-bordered input-xs" value={machine.speed ?? ''}
+                      onchange={(e) => patchMachine(machine.id, { speed: Number(e.currentTarget.value) || undefined })} /></label>
+                </div>
+                <button class="btn btn-ghost btn-xs w-full text-error" onclick={() => deleteMachine(machine.id)}>Remove machine</button>
+              </div>
+            {/if}
+            <button class="btn btn-ghost btn-xs w-full" onclick={addNewMachine}>+ Add machine</button>
+          {/if}
+          <button class="btn btn-secondary btn-sm w-full" onclick={sendToCuttingRoom} disabled={busy || !machine}>
+            <span class="material-symbols-rounded text-base">send</span> Send to cutting room
+          </button>
+          <button class="btn btn-ghost btn-xs w-full" onclick={printLabels} disabled={!layout || !layout.placements.length}>Print labels…</button>
+        </div>
 
         {#if layout}
           <div class="border-t border-base-300 pt-2 text-xs space-y-1">

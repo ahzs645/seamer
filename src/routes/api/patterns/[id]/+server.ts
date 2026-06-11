@@ -2,22 +2,21 @@ export const prerender = false;
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import type { Pattern } from '$lib/types/pattern';
-
-const patterns = new Map<string, Pattern>();
+import { deletePattern, getPattern, putPattern } from '$lib/server/patternStore';
 
 export const GET: RequestHandler = async ({ params }) => {
-  const pattern = patterns.get(params.id);
+  const pattern = getPattern(params.id);
   if (!pattern) return json({ error: 'Not found' }, { status: 404 });
   return json(pattern);
 };
 
 export const PUT: RequestHandler = async ({ params, request }) => {
   const pattern: Pattern = await request.json();
-  patterns.set(params.id, pattern);
+  putPattern({ ...pattern, id: params.id });
   return json(pattern);
 };
 
 export const DELETE: RequestHandler = async ({ params }) => {
-  patterns.delete(params.id);
+  deletePattern(params.id);
   return json({ success: true });
 };

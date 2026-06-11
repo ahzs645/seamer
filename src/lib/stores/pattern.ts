@@ -22,14 +22,12 @@ export const showGrid = writable<boolean>(true);
 
 export const snapToGrid = writable<boolean>(false);
 
-export const interactionMode = writable<'fast' | 'accurate'>('fast');
-
 /** Live cursor position in drafting millimetres (set by the 2D canvas), for the status bar. Null when
  *  the pointer is outside the canvas. */
 export const cursorMm = writable<{ x: number; y: number } | null>(null);
 
-/** Autosave cadence in seconds (user-configurable in Settings; persisted to localStorage). */
-function persisted<T>(key: string, initial: T) {
+/** Writable store mirrored to localStorage (browser only) — shared persistence helper. */
+export function persisted<T>(key: string, initial: T) {
   let start = initial;
   // Browser-only: guard with SvelteKit's `browser` AND a try/catch, since some SSR runtimes expose a
   // `localStorage` global whose methods throw.
@@ -42,6 +40,13 @@ function persisted<T>(key: string, initial: T) {
 }
 export const autoSaveSeconds = persisted<number>('seamer.autosaveSeconds', 5);
 export const show3dStats = persisted<boolean>('seamer.show3dStats', false);
+/** Pointer interaction mode: 'safe' = a drag only moves already-selected items (click selects first);
+ *  'fast' = dragging an element moves it immediately. */
+export const interactionMode = persisted<'fast' | 'safe'>('seamer.interactionMode', 'fast');
+/** Opacity of the frozen-snapshot ghost rendered under the live pattern in the 2D canvas. */
+export const frozenSnapshotOpacity = persisted<number>('seamer.frozenSnapshotOpacity', 0.35);
+/** Show the live cursor / selection coordinate readout in the status bar. */
+export const showCoordinates = persisted<boolean>('seamer.showCoordinates', true);
 
 // --- Labeled undo/redo history ------------------------------------------------
 // Faithful in spirit to the original application's named editor.execute() commands: each
