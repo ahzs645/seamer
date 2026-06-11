@@ -11,7 +11,7 @@
   import MaterialPanel from '$lib/components/MaterialPanel.svelte';
   import SeamPanel from '$lib/components/SeamPanel.svelte';
   import ObjectBrowser from '$lib/components/ObjectBrowser.svelte';
-  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel, restoreHistory } from '$lib/stores/pattern';
+  import { pattern, selectedPointIds, selectedPathIds, selectedPieceIds, pushUndo, undo, redo, undoLabel, redoLabel, restoreHistory, pendingPaste } from '$lib/stores/pattern';
   import { loadPattern, savePattern as saveToDB } from '$lib/stores/localDB';
   import { EMPTY_PATTERN, type Pattern, type Piece, type ConstrainablePoint } from '$lib/types/pattern';
   import { isSimpleFormat, convertSimplePattern } from '$lib/utils/importSimplePattern';
@@ -19,7 +19,7 @@
   import Toaster from '$lib/components/Toaster.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import GradingOverlay from '$lib/components/GradingOverlay.svelte';
-  import { toastSuccess, toastError } from '$lib/stores/toast';
+  import { toast, toastSuccess, toastError } from '$lib/stores/toast';
   import { confirm } from '$lib/stores/confirm';
   import { patternToSVG, patternToSVG2, patternToDXF, patternToCSV, downloadText, patternToPNG, downloadBlob, printPattern, printMarkerTiled, patternToHPGL } from '$lib/utils/exporters';
   import { nestPieces, markerToSVG, type CutOffType } from '$lib/utils/markerLayout';
@@ -31,6 +31,7 @@
   import { cutToPattern } from '$lib/utils/cutImport';
   import { seamlyToPattern } from '$lib/utils/seamlyImport';
   import { bodyToSeamlyMe } from '$lib/utils/seamlyExport';
+  import { syncLinkedPaths } from '$lib/utils/linkedPaths';
   import ErrorsPanel from '$lib/components/ErrorsPanel.svelte';
   import KeyboardShortcuts from '$lib/components/KeyboardShortcuts.svelte';
   import WelcomeModal from '$lib/components/WelcomeModal.svelte';
@@ -255,6 +256,8 @@
         updated = solved;
       }
     }
+    // linked paths follow their source's shape (cheap no-op when the pattern has none)
+    if (!alterationEdit) updated = syncLinkedPaths(updated);
     currentPattern = updated; saved = false; pattern.set(updated);
   }
 
@@ -528,31 +531,12 @@
     }
   }
 
+  // Paste arms click-placement on the 2D canvas (the source's PasteTool): a ghost of the clipboard
+  // follows the cursor and a click commits the copies there. Esc cancels.
   function handlePaste() {
     if (!clipboard) return;
-    const p = $pattern;
-    if (clipboard.kind === 'pieces') {
-      const clones = clipboard.items.map(src => {
-        const c = structuredClone(src) as Piece;
-        c.id = uidFor('Piece');
-        c.name = `Copy of ${src.name}`;
-        c.position = { x: src.position.x + 50, y: src.position.y - 50 };
-        for (const pp of [...c.mainPaths, ...c.internalPaths]) pp.id = uidFor('PiecePath');
-        return c;
-      });
-      handlePatternUpdate({ ...p, pieces: [...p.pieces, ...clones], hasChanged: true }, 'Paste');
-      selectedPieceIds.set(new Set(clones.map(c => c.id)));
-      toastSuccess(`${plural(clones.length)} pasted`);
-    } else {
-      const prefix = p.pointPrefix || 'A';
-      let n = p.points.length;
-      const names = new Set(p.points.map(q => q.name));
-      const nextName = () => { while (names.has(`${prefix}${n}`)) n++; const nm = `${prefix}${n}`; names.add(nm); return nm; };
-      const clones = clipboard.items.map(src => ({ ...structuredClone(src), id: uidFor('ConstrainablePoint'), name: nextName(), x: src.x + 25, y: src.y + 25 }) as ConstrainablePoint);
-      handlePatternUpdate({ ...p, points: [...p.points, ...clones], hasChanged: true }, 'Paste');
-      selectedPointIds.set(new Set(clones.map(c => c.id)));
-      toastSuccess(`${plural(clones.length)} pasted`);
-    }
+    pendingPaste.set(structuredClone(clipboard));
+    toast('Select where you want to place the ' + (clipboard.items.length === 1 ? 'copy' : 'copies'));
   }
 
   function duplicateSelectedPiece() {

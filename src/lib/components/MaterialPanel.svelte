@@ -66,6 +66,42 @@
       backTexture: m.useSeparateBackSide ? m.backTexture : { ...(m.backTexture ?? defaultSlot(color)), color }
     }));
   }
+
+  // --- texture maps (diffuse / normal / opacity per slot; repeats every `scale` mm) ---------------
+  type Side = 'frontTexture' | 'backTexture';
+  const MAPS = [
+    { label: 'Texture', url: 'url', scale: 'scale' },
+    { label: 'Normal', url: 'normalUrl', scale: 'normalMapScale' },
+    { label: 'Opacity', url: 'opacityUrl', scale: 'opacityMapScale' }
+  ] as const;
+
+  function patchSlot(id: string, side: Side, upd: Partial<TextureSlot>) {
+    patch(id, (m) => ({ ...m, [side]: { ...(m[side] ?? defaultSlot(swatch(m))), ...upd } }));
+  }
+
+  /** Pick an image file and store it on the slot as a data URL (local-first, travels with the pattern). */
+  function chooseMap(id: string, side: Side, urlKey: 'url' | 'normalUrl' | 'opacityUrl') {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => patchSlot(id, side, { [urlKey]: String(reader.result) } as Partial<TextureSlot>);
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  }
+
+  function setSeparateBack(id: string, on: boolean) {
+    patch(id, (m) => ({
+      ...m,
+      useSeparateBackSide: on,
+      // when turning separate-back off, the back mirrors the front again
+      backTexture: on ? (m.backTexture ?? m.frontTexture ?? defaultSlot(swatch(m))) : m.frontTexture
+    }));
+  }
 </script>
 
 <div class="text-xs">
@@ -105,6 +141,60 @@
             <label>Vertical (%)
               <input type="number" step="0.1" class="input input-bordered input-xs w-full" value={mat.shrinkageVerticalPercentage ?? 0}
                 oninput={(e) => patch(mat.id, (m) => ({ ...m, shrinkageVerticalPercentage: +e.currentTarget.value }))} /></label>
+          </div>
+
+          <div class="font-semibold mt-1 opacity-70">Texture maps</div>
+          <label class="flex items-center gap-1">
+            <input type="checkbox" class="checkbox checkbox-xs" checked={mat.useSeparateBackSide}
+              onchange={(e) => setSeparateBack(mat.id, e.currentTarget.checked)} />
+            Separate back side
+          </label>
+          {#each (mat.useSeparateBackSide ? [['frontTexture', 'Front'], ['backTexture', 'Back']] : [['frontTexture', '']]) as [side, sideLabel]}
+            {@const slot = (side === 'backTexture' ? mat.backTexture : mat.frontTexture) ?? defaultSlot(swatch(mat))}
+            {#if sideLabel}<div class="opacity-60 mt-0.5">{sideLabel}</div>{/if}
+            {#each MAPS as map}
+              {@const url = slot[map.url]}
+              <div class="flex items-center gap-1">
+                <span class="w-12 shrink-0 opacity-70">{map.label}</span>
+                {#if url}
+                  <img src={url} alt="{map.label} map" class="w-5 h-5 rounded border border-base-300 object-cover shrink-0" />
+                {/if}
+                <button class="btn btn-xs btn-ghost px-1 flex-1 justify-start truncate" onclick={() => chooseMap(mat.id, side as Side, map.url)}>
+                  {url ? 'Replace…' : 'Choose image…'}
+                </button>
+                <label class="flex items-center gap-0.5 shrink-0" title="Repeat size — the image tiles every N mm of fabric">
+                  <input type="number" min="1" step="5" class="input input-bordered input-xs w-14" value={slot[map.scale]}
+                    onchange={(e) => patchSlot(mat.id, side as Side, { [map.scale]: Math.max(1, +e.currentTarget.value || 100) })} />
+                  <span class="opacity-50">mm</span>
+                </label>
+                {#if url}
+                  <button class="btn btn-xs btn-ghost px-0.5 text-error shrink-0" title="Clear {map.label.toLowerCase()} map"
+                    onclick={() => patchSlot(mat.id, side as Side, { [map.url]: '' } as Partial<TextureSlot>)}>&times;</button>
+                {/if}
+              </div>
+            {/each}
+          {/each}
+
+          <div class="font-semibold mt-1 opacity-70">Appearance (3D)</div>
+          <div class="grid grid-cols-2 gap-1">
+            <label>Roughness (0–1)
+              <input type="number" min="0" max="1" step="0.05" class="input input-bordered input-xs w-full" value={mat.roughness}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, roughness: +e.currentTarget.value }))} /></label>
+            <label>Metalness (0–1)
+              <input type="number" min="0" max="1" step="0.05" class="input input-bordered input-xs w-full" value={mat.metalness}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, metalness: +e.currentTarget.value }))} /></label>
+            <label>Specularity (0–1)
+              <input type="number" min="0" max="1" step="0.05" class="input input-bordered input-xs w-full" value={mat.specularIntensity}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, specularIntensity: +e.currentTarget.value }))} /></label>
+            <label>Opacity (0–1)
+              <input type="number" min="0" max="1" step="0.05" class="input input-bordered input-xs w-full" value={mat.opacity}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, opacity: +e.currentTarget.value }))} /></label>
+            <label>Normal scale
+              <input type="number" min="0" max="4" step="0.1" class="input input-bordered input-xs w-full" value={mat.normalScale}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, normalScale: +e.currentTarget.value }))} /></label>
+            <label>Alpha cutoff
+              <input type="number" min="0" max="1" step="0.05" class="input input-bordered input-xs w-full" value={mat.alphaCutoff}
+                oninput={(e) => patch(mat.id, (m) => ({ ...m, alphaCutoff: +e.currentTarget.value }))} /></label>
           </div>
           <button class="btn btn-xs btn-ghost w-full" onclick={() => (editingId = null)}>Done</button>
         </div>

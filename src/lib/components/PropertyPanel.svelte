@@ -9,6 +9,8 @@
   } from '$lib/stores/materialLibrary';
   import { MATERIAL_PRESETS, getPreset } from '$lib/data/materialPresets';
   import { variableReorder, variableSetOptions, imageUpdate } from '$lib/commands/structural';
+  import { rebakeArc, arcCenter } from '$lib/utils/arcParametric';
+  import { isLinkedPath, linkSourceCandidates, linkPath, unlinkPath, syncLinkedPaths } from '$lib/utils/linkedPaths';
 
   interface Props {
     currentPattern: Pattern;
@@ -68,6 +70,48 @@
     }
     const points = currentPattern.points.map((p) => (p.id === moveId ? { ...p, x: nx, y: ny } : p));
     onchange({ ...currentPattern, points, hasChanged: true });
+  }
+
+  // ---- Parametric arc (selected path carrying ArcParams from the arc/circle tools) ----------------
+  const editingArc = $derived.by<ConstrainablePath | null>(() => {
+    if ($selectedPathIds.size !== 1) return null;
+    const path = currentPattern.paths.find((p) => p.id === [...$selectedPathIds][0]);
+    return path?.arc ? path : null;
+  });
+  const rad2deg = (r: number) => (r * 180) / Math.PI;
+  const deg2rad = (d: number) => (d * Math.PI) / 180;
+  function patchArc(patch: Partial<NonNullable<ConstrainablePath['arc']>>) {
+    if (!editingArc?.arc) return;
+    const params = { ...editingArc.arc, ...patch };
+    const next = rebakeArc($state.snapshot(currentPattern) as Pattern, editingArc.id, params, uid);
+    if (next) onchange(next, 'Edit arc');
+  }
+  /** Flip the sweep direction (CW ↔ CCW) keeping the same start angle. */
+  function flipArcDirection() {
+    if (!editingArc?.arc) return;
+    const a = editingArc.arc;
+    const sweep = a.a1 - a.a0;
+    patchArc({ a1: a.a0 - sweep });
+  }
+
+  // ---- Linked path (EditLink): the selected path's shape follows a source path -------------------
+  const edgeIsLinked = $derived(editingEdge ? isLinkedPath(editingEdge.path) : false);
+  const linkCandidates = $derived(editingEdge ? linkSourceCandidates(currentPattern, editingEdge.path.id) : []);
+  function applyLink(sourceId: string) {
+    if (!editingEdge || !sourceId) return;
+    const next = linkPath($state.snapshot(currentPattern) as Pattern, editingEdge.path.id, sourceId, false);
+    if (next) { onchange(next, 'Link path'); toastSuccess('Path linked — it now follows the source shape'); }
+    else toastError('Linked path reference would be circular');
+  }
+  function setLinkFlip(flipped: boolean) {
+    if (!editingEdge) return;
+    const p = $state.snapshot(currentPattern) as Pattern;
+    const paths = p.paths.map((q) => (q.id === editingEdge!.path.id ? { ...q, mirrorX: flipped, version: (q.version ?? 0) + 1 } : q));
+    onchange(syncLinkedPaths({ ...p, paths, hasChanged: true }), 'Flip linked path');
+  }
+  function removeLink() {
+    if (!editingEdge) return;
+    onchange(unlinkPath($state.snapshot(currentPattern) as Pattern, editingEdge.path.id), 'Unlink path');
   }
 
   // ---- Curve-handle mirror constraints (per selected edge) — ports the original handle.update -----
@@ -605,6 +649,43 @@
     {/if}
   </div>
 
+  {#if editingArc?.arc}
+    {@const a = editingArc.arc}
+    <div class="bg-base-100 border-b-2 border-info p-3 space-y-2 text-sm">
+      <h4 class="font-semibold text-info flex items-center gap-1">
+        <span class="material-symbols-rounded text-base">radio_button_unchecked</span>
+        {a.kind === 'circle' ? 'Circle' : 'Arc'} (parametric)
+      </h4>
+      <p class="text-xs opacity-60">
+        {a.centerId ? 'Centred on a live point — move it to move the arc.' : 'Free arc (three-point).'}
+        Dragging an arc anchor detaches it.
+      </p>
+      <label class="flex items-center justify-between gap-2 text-xs">Radius ({edgeUnit})
+        <input type="number" min="0.1" step="0.5" class="input input-bordered input-xs w-24"
+          value={Number(edgeToDisp(a.r).toFixed(2))}
+          onchange={(e) => { const v = edgeToMm(parseFloat(e.currentTarget.value)); if (v > 0) patchArc({ r: v }); }} />
+      </label>
+      {#if a.kind !== 'circle'}
+        <div class="grid grid-cols-2 gap-1 text-xs">
+          <label class="flex flex-col gap-0.5">Start (°)
+            <input type="number" step="1" class="input input-bordered input-xs"
+              value={Number(rad2deg(a.a0).toFixed(1))}
+              onchange={(e) => { const d = parseFloat(e.currentTarget.value); if (Number.isFinite(d)) patchArc({ a0: deg2rad(d) }); }} /></label>
+          <label class="flex flex-col gap-0.5">End (°)
+            <input type="number" step="1" class="input input-bordered input-xs"
+              value={Number(rad2deg(a.a1).toFixed(1))}
+              onchange={(e) => { const d = parseFloat(e.currentTarget.value); if (Number.isFinite(d)) patchArc({ a1: deg2rad(d) }); }} /></label>
+        </div>
+        <button class="btn btn-xs w-full" onclick={flipArcDirection} title="Sweep the other way around the centre (counter clockwise ↔ clockwise)">
+          Counter clockwise: flip direction
+        </button>
+      {/if}
+      {#if !a.centerId}
+        <p class="text-[11px] opacity-50">Centre: {arcCenter(currentPattern, a).x.toFixed(1)}, {arcCenter(currentPattern, a).y.toFixed(1)} mm</p>
+      {/if}
+    </div>
+  {/if}
+
   {#if editingEdge}
     {@const ed = editingEdge}
     <div class="bg-base-100 border-b-2 border-accent p-3 space-y-2 text-sm">
@@ -658,6 +739,26 @@
           <p class="text-[11px] opacity-50">Drag the salmon handle dots in the 2D view; the opposite handle follows these mirror rules.</p>
         </div>
       {/if}
+
+      <div class="border-t border-base-200 pt-2 space-y-1">
+        <span class="text-xs font-semibold flex items-center gap-1"><span class="material-symbols-rounded text-sm">link</span>Linked path</span>
+        {#if edgeIsLinked}
+          {@const src = currentPattern.paths.find((q) => q.id === ed.path.referencedPath)}
+          <p class="text-[11px] opacity-60">Follows <b>{src?.name || src?.id.slice(0, 8) || 'missing path'}</b> — its shape is mapped between this edge's endpoints.</p>
+          <label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-xs" checked={ed.path.mirrorX === true} onchange={(e) => setLinkFlip(e.currentTarget.checked)} /> Flip across the chord</label>
+          <button class="btn btn-xs btn-block" onclick={removeLink}>Unlink (keep current shape)</button>
+        {:else if ed.path.pathType === 'referenced'}
+          <p class="text-[11px] opacity-50">This edge is a mirrored reference (see Mirror across an axis).</p>
+        {:else if linkCandidates.length === 0}
+          <p class="text-[11px] opacity-50">Draw another path to link this edge's shape to, then select this edge again.</p>
+        {:else}
+          <select class="select select-bordered select-xs w-full" onchange={(e) => { applyLink(e.currentTarget.value); e.currentTarget.value = ''; }}>
+            <option value="">Link shape to…</option>
+            {#each linkCandidates as cand}<option value={cand.id}>{cand.name || cand.id.slice(0, 8)}</option>{/each}
+          </select>
+          <p class="text-[11px] opacity-50">The edge keeps its endpoints but takes the source's shape — and follows when the source changes (matching seam edges, symmetric halves).</p>
+        {/if}
+      </div>
     </div>
   {/if}
 

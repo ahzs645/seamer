@@ -95,6 +95,22 @@ export interface ConstrainablePath {
   mirrorX?: boolean;
   mirrorY?: boolean;
   mirrorLine?: string;
+  // parametric-arc metadata kept by the arc/circle tools so radius/angles stay editable after the
+  // curve is baked. `centerId` (when set) ties the arc to a live construction point; re-baking
+  // rewrites this path's anchor positions/handles in place (point ids are preserved).
+  arc?: ArcParams;
+}
+
+/** Parametric definition of a baked arc/circle path (angles in radians, CCW positive). */
+export interface ArcParams {
+  kind: 'circle' | 'centerArc' | 'threePointArc';
+  centerId?: string | null;
+  cx: number;
+  cy: number;
+  r: number;
+  a0: number;
+  a1: number;
+  closed: boolean;
 }
 
 export type NotchType = 'single' | 'double' | 'slit' | 'tee';
@@ -264,13 +280,17 @@ export interface Seam {
   toPaths: SeamRef[];
 }
 
-/** A persistent point-to-point measurement annotation created with the 2D Measure tool. */
+/** A persistent measurement annotation created with the 2D Measure tool. */
 export interface Measurement {
   id: string;
   name: string;
+  /** 'distance' (default) measures fromPoint→toPoint; 'angle' measures the angle at viaPoint. */
+  kind?: 'distance' | 'angle';
   fromPointId: string;
+  /** Angle measurements only: the vertex point. */
+  viaPointId?: string;
   toPointId: string;
-  /** Target length in mm; when set, the canvas label shows the deviation (actual − target). */
+  /** Target value — mm for distance, degrees for angle. When set, the label shows the deviation. */
   targetMm: number | null;
 }
 

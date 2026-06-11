@@ -97,7 +97,7 @@ export function deletePoint(p: Pattern, pointId: string): Pattern {
 		paths,
 		pieces,
 		seams: pruneSeams(p.seams, removed),
-		measurements: (p.measurements ?? []).filter((m) => m.fromPointId !== pointId && m.toPointId !== pointId),
+		measurements: (p.measurements ?? []).filter((m) => m.fromPointId !== pointId && m.toPointId !== pointId && m.viaPointId !== pointId),
 		hasChanged: true
 	};
 }

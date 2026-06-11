@@ -6,7 +6,7 @@
   import DrawingTools from '$lib/components/DrawingTools.svelte';
   import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
   import { toast } from '$lib/stores/toast';
-  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, cursorMm, interactionMode, frozenSnapshotOpacity } from '$lib/stores/pattern';
+  import { selectedTool, zoom, panOffset, selectedPointIds, selectedPathIds, selectedPieceIds, cursorMm, interactionMode, frozenSnapshotOpacity, pendingPaste, type PendingPaste } from '$lib/stores/pattern';
   import {
     indexPoints,
     indexPaths,
@@ -33,6 +33,9 @@
   import { breakoutPiece, type BreakoutMode } from '$lib/utils/breakout';
   import { traceFromHPGL, traceImageRegion } from '$lib/utils/autoTrace';
   import { pieceAddPath } from '$lib/commands/piece';
+  import { draggablePanel } from '$lib/utils/draggablePanel';
+  import { rebakeArc, arcPathsCenteredOn, detachArcsTouchingAnchor } from '$lib/utils/arcParametric';
+  import { buildWarp, drawWarpedImage } from '$lib/utils/thinPlateSpline';
 
   interface Props {
     currentPattern: Pattern;
@@ -85,7 +88,135 @@
   function clearBgImage() {
     if (bgUrl) { URL.revokeObjectURL(bgUrl); bgUrl = null; }
     bgImage = null;
+    bgBrightness = 0; bgContrast = 0; bgGrayscale = false; bgThreshold = null;
+    matchPairs = []; warpEnabled = false; calibrating = null;
+    processedCacheKey = ''; warpedKey = '';
     render();
+  }
+
+  // ---- Scan digitization: image filters + match-point calibration (TPS warp) ---------------------
+  let bgBrightness = $state(0); // -100..100
+  let bgContrast = $state(0); // -100..100
+  let bgGrayscale = $state(false);
+  let bgThreshold = $state<number | null>(null); // null = off; else 0..255 luminance cut
+  /** match-point pairs: a feature on the scan (image px) and its true drafting location (world mm) */
+  let matchPairs = $state<{ srcPx: Vec2; dst: Vec2 }[]>([]);
+  let warpEnabled = $state(false);
+  /** armed calibration: first click marks the image feature, second its true world position */
+  let calibrating = $state<{ src: Vec2 | null } | null>(null);
+
+  const bgMmPerPx = () => (bgImage ? bgWidthMm / bgImage.naturalWidth : 1);
+  function imgPxToWorld(px: Vec2): Vec2 {
+    const s = bgMmPerPx(), W = bgImage!.naturalWidth, H = bgImage!.naturalHeight;
+    return { x: bgX + (px.x - W / 2) * s, y: bgY + (H / 2 - px.y) * s };
+  }
+  function worldToImgPx(w: Vec2): Vec2 {
+    const s = bgMmPerPx(), W = bgImage!.naturalWidth, H = bgImage!.naturalHeight;
+    return { x: (w.x - bgX) / s + W / 2, y: H / 2 - (w.y - bgY) / s };
+  }
+
+  // filtered copy of the scan (brightness/contrast/grayscale/threshold), rebuilt only on change
+  let processedCache: HTMLCanvasElement | null = null;
+  let processedCacheKey = '';
+  const hasBgFilters = () => bgBrightness !== 0 || bgContrast !== 0 || bgGrayscale || bgThreshold != null;
+  function processedImage(): HTMLCanvasElement | HTMLImageElement | null {
+    if (!bgImage || bgImage.naturalWidth === 0) return bgImage;
+    if (!hasBgFilters()) return bgImage;
+    const key = `${bgImage.src.length}:${bgImage.naturalWidth}:${bgBrightness}:${bgContrast}:${bgGrayscale}:${bgThreshold}`;
+    if (processedCache && processedCacheKey === key) return processedCache;
+    const W = bgImage.naturalWidth, H = bgImage.naturalHeight;
+    const off = document.createElement('canvas');
+    off.width = W; off.height = H;
+    const c2 = off.getContext('2d', { willReadFrequently: true });
+    if (!c2) return bgImage;
+    c2.drawImage(bgImage, 0, 0);
+    const data = c2.getImageData(0, 0, W, H);
+    const px = data.data;
+    const bright = bgBrightness * 1.275;
+    const cval = bgContrast * 2.55;
+    const cf = (259 * (cval + 255)) / (255 * (259 - cval));
+    for (let i = 0; i < px.length; i += 4) {
+      let r: number = px[i], g: number = px[i + 1], b: number = px[i + 2];
+      if (bright !== 0) { r += bright; g += bright; b += bright; }
+      if (bgContrast !== 0) { r = cf * (r - 128) + 128; g = cf * (g - 128) + 128; b = cf * (b - 128) + 128; }
+      if (bgGrayscale || bgThreshold != null) {
+        const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if (bgThreshold != null) { const v = lum < bgThreshold ? 0 : 255; r = v; g = v; b = v; }
+        else { r = lum; g = lum; b = lum; }
+      }
+      px[i] = r < 0 ? 0 : r > 255 ? 255 : r;
+      px[i + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
+      px[i + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+    }
+    c2.putImageData(data, 0, 0);
+    processedCache = off;
+    processedCacheKey = key;
+    return off;
+  }
+
+  // TPS-warped scan rendered to a world-space offscreen (drawn like a flat image afterwards)
+  let warpedCache: { canvas: HTMLCanvasElement; minX: number; maxY: number; pxPerMm: number } | null = null;
+  let warpedKey = '';
+  function ensureWarped(): typeof warpedCache {
+    if (!bgImage || bgImage.naturalWidth === 0 || matchPairs.length === 0) return null;
+    const key = JSON.stringify([matchPairs, bgX, bgY, bgWidthMm, bgBrightness, bgContrast, bgGrayscale, bgThreshold, bgImage.src.length]);
+    if (warpedCache && warpedKey === key) return warpedCache;
+    const warp = buildWarp(matchPairs.map((q) => ({ src: imgPxToWorld(q.srcPx), dst: q.dst })));
+    const W = bgImage.naturalWidth, H = bgImage.naturalHeight;
+    const grid = 24;
+    const mapWorld = (p: Vec2) => warp(imgPxToWorld(p));
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let gy = 0; gy <= grid; gy++) for (let gx = 0; gx <= grid; gx++) {
+      const w = mapWorld({ x: (gx / grid) * W, y: (gy / grid) * H });
+      minX = Math.min(minX, w.x); maxX = Math.max(maxX, w.x);
+      minY = Math.min(minY, w.y); maxY = Math.max(maxY, w.y);
+    }
+    const wMm = Math.max(1, maxX - minX), hMm = Math.max(1, maxY - minY);
+    const pxPerMm = Math.min(3, 3000 / Math.max(wMm, hMm));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.ceil(wMm * pxPerMm));
+    canvas.height = Math.max(1, Math.ceil(hMm * pxPerMm));
+    const c2 = canvas.getContext('2d', { willReadFrequently: true });
+    const src = processedImage() ?? bgImage;
+    if (c2 && src) {
+      drawWarpedImage(c2, src, W, H, (p) => {
+        const w = mapWorld(p);
+        return { x: (w.x - minX) * pxPerMm, y: (maxY - w.y) * pxPerMm };
+      }, grid);
+    }
+    warpedCache = { canvas, minX, maxY, pxPerMm };
+    warpedKey = key;
+    return warpedCache;
+  }
+
+  /** Calibration pins: image feature (red dot) → true position (green cross), dashed connector. */
+  function drawMatchPins(c: CanvasRenderingContext2D) {
+    if (!bgImage || (!showBgControls && !calibrating)) return;
+    c.save();
+    for (const pair of matchPairs) {
+      const a = toCanvas(imgPxToWorld(pair.srcPx));
+      const b = toCanvas(pair.dst);
+      c.strokeStyle = '#94a3b8';
+      c.setLineDash([4, 3]);
+      c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(b.x, b.y); c.stroke();
+      c.setLineDash([]);
+      c.fillStyle = '#dc2626';
+      c.beginPath(); c.arc(a.x, a.y, 4, 0, Math.PI * 2); c.fill();
+      c.strokeStyle = '#16a34a';
+      c.lineWidth = 2;
+      c.beginPath(); c.moveTo(b.x - 5, b.y); c.lineTo(b.x + 5, b.y); c.moveTo(b.x, b.y - 5); c.lineTo(b.x, b.y + 5); c.stroke();
+      c.lineWidth = 1;
+    }
+    if (calibrating?.src) {
+      const a = toCanvas(imgPxToWorld(calibrating.src));
+      c.fillStyle = '#dc2626';
+      c.beginPath(); c.arc(a.x, a.y, 4, 0, Math.PI * 2); c.fill();
+      c.strokeStyle = '#dc2626';
+      c.setLineDash([4, 3]);
+      c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(cursorPos.x, cursorPos.y); c.stroke();
+      c.setLineDash([]);
+    }
+    c.restore();
   }
   // HPGL (plotter) vector overlay — parsed to polylines (mm), drawn offset by (bgX, bgY).
   let hpglPolys = $state<Vec2[][] | null>(null);
@@ -404,7 +535,9 @@
         if (penDraft.length > 0) { e.preventDefault(); finishDraft(); }
         else if (seamMultiEdges.length > 0) { e.preventDefault(); finishMultiSeam(); }
       } else if (e.key === 'Escape') {
-        if (penDraft.length || seamFirstEdge || seamMultiEdges.length || measureFrom || drawing) { e.preventDefault(); cancelOperation(); }
+        if (calibrating) { e.preventDefault(); calibrating = null; render(); return; }
+        if ($pendingPaste) { e.preventDefault(); pendingPaste.set(null); render(); return; }
+        if (penDraft.length || seamFirstEdge || seamMultiEdges.length || measureFrom || measureChain.length || drawing) { e.preventDefault(); cancelOperation(); }
       } else if ((e.key === 'v' || e.key === 'V') && drawing && !e.metaKey && !e.ctrlKey) {
         // 'V' returns to select and cancels the in-progress operation (like the source)
         e.preventDefault(); cancelOperation();
@@ -541,16 +674,26 @@
     c.fillStyle = isDark ? '#15191e' : '#fafafa';
     c.fillRect(0, 0, canvasW, canvasH);
 
-    // background reference image (trace-over), behind the grid + pattern
+    // background reference image (trace-over), behind the grid + pattern. Filters apply via the
+    // processed copy; with match points + warp on, the TPS-warped world-space offscreen is drawn
+    // instead (calibration mode shows the unwarped image so pins land on true image features).
     if (bgImage && bgImage.naturalWidth > 0) {
-      const wPx = bgWidthMm * baseScale();
-      const hPx = wPx * (bgImage.naturalHeight / bgImage.naturalWidth);
-      const cc = toCanvas({ x: bgX, y: bgY });
       c.save();
       c.globalAlpha = bgOpacity;
       c.imageSmoothingEnabled = true;
-      c.drawImage(bgImage, cc.x - wPx / 2, cc.y - hPx / 2, wPx, hPx);
+      const warped = warpEnabled && matchPairs.length > 0 && !calibrating ? ensureWarped() : null;
+      if (warped) {
+        const tl = toCanvas({ x: warped.minX, y: warped.maxY });
+        c.drawImage(warped.canvas, tl.x, tl.y, (warped.canvas.width / warped.pxPerMm) * baseScale(), (warped.canvas.height / warped.pxPerMm) * baseScale());
+      } else {
+        const img = processedImage() ?? bgImage;
+        const wPx = bgWidthMm * baseScale();
+        const hPx = wPx * (bgImage.naturalHeight / bgImage.naturalWidth);
+        const cc = toCanvas({ x: bgX, y: bgY });
+        c.drawImage(img, cc.x - wPx / 2, cc.y - hPx / 2, wPx, hPx);
+      }
       c.restore();
+      drawMatchPins(c);
     }
     // placed image elements (reference photos / logos), behind the pattern geometry
     for (const im of currentPattern.images) {
@@ -891,6 +1034,8 @@
     }
 
     drawMeasurements(c, points);
+    drawSelectionGizmo(c);
+    drawPasteGhost(c);
 
     // live drag readout (dX / dY / dL), like the source
     if (isDragging && dragStartWorld) {
@@ -1403,7 +1548,7 @@
   }
 
   /** Materialise anchors into ConstrainablePoints + a curve ConstrainablePath. */
-  function addCurveFromAnchors(anchors: Anchor[], closed: boolean) {
+  function addCurveFromAnchors(anchors: Anchor[], closed: boolean, arc?: import('$lib/types/pattern').ArcParams) {
     let p = $state.snapshot(currentPattern) as Pattern;
     const ids: string[] = [];
     const newPoints = anchors.map((a, i) => {
@@ -1411,9 +1556,16 @@
       ids.push(id);
       return { id, name: `${p.pointPrefix || 'A'}${p.points.length + i}`, x: a.pos.x, y: a.pos.y };
     });
+    // circle/center-arc: also place a live centre construction point that drives the parametric arc
+    let arcMeta = arc;
+    if (arc && (arc.kind === 'circle' || arc.kind === 'centerArc')) {
+      const centerId = uid('ConstrainablePoint');
+      newPoints.push({ id: centerId, name: `${p.pointPrefix || 'A'}${p.points.length + anchors.length}`, x: arc.cx, y: arc.cy });
+      arcMeta = { ...arc, centerId };
+    }
     const pathPoints = anchors.map((a, i) => ({ id: ids[i], handle: mkHandle(a.v1, a.v2) }));
     if (closed) pathPoints.push({ id: ids[0], handle: mkHandle(anchors[0].v1, anchors[0].v2) });
-    const path = { id: uid('ConstrainablePath'), name: '', pathType: 'curve', pathPoints, version: 1 } as import('$lib/types/pattern').ConstrainablePath;
+    const path = { id: uid('ConstrainablePath'), name: '', pathType: 'curve', pathPoints, version: 1, ...(arcMeta ? { arc: arcMeta } : {}) } as import('$lib/types/pattern').ConstrainablePath;
     onchange({ ...p, points: [...p.points, ...newPoints], paths: [...p.paths, path], hasChanged: true });
   }
 
@@ -1434,7 +1586,8 @@
     if (tool === 'circle') {
       if (clicks.length < 2) { arcClicks = clicks; render(); return; }
       const r = Math.hypot(clicks[1].x - clicks[0].x, clicks[1].y - clicks[0].y);
-      addCurveFromAnchors(arcAnchors(clicks[0], r, 0, Math.PI * 2), true);
+      addCurveFromAnchors(arcAnchors(clicks[0], r, 0, Math.PI * 2), true,
+        { kind: 'circle', cx: clicks[0].x, cy: clicks[0].y, r, a0: 0, a1: Math.PI * 2, closed: true });
       arcClicks = []; toast('Added circle', 'success');
     } else if (tool === 'arc-center') {
       if (clicks.length < 3) { arcClicks = clicks; render(); return; }
@@ -1443,7 +1596,8 @@
       let a0 = Math.atan2(clicks[1].y - c0.y, clicks[1].x - c0.x);
       let a1 = Math.atan2(clicks[2].y - c0.y, clicks[2].x - c0.x);
       if (a1 <= a0) a1 += Math.PI * 2;
-      addCurveFromAnchors(arcAnchors(c0, r, a0, a1), false);
+      addCurveFromAnchors(arcAnchors(c0, r, a0, a1), false,
+        { kind: 'centerArc', cx: c0.x, cy: c0.y, r, a0, a1, closed: false });
       arcClicks = []; toast('Added arc', 'success');
     } else if (tool === 'arc-3pt') {
       if (clicks.length < 3) { arcClicks = clicks; render(); return; }
@@ -1454,8 +1608,9 @@
         // choose the CCW direction a0→a1 that passes through the middle point
         const norm = (x: number) => { while (x < 0) x += Math.PI * 2; while (x >= Math.PI * 2) x -= Math.PI * 2; return x; };
         const dm = norm(am - a0), d1 = norm(a1 - a0);
-        if (dm <= d1) addCurveFromAnchors(arcAnchors(cc.c, cc.r, a0, a0 + d1), false);
-        else addCurveFromAnchors(arcAnchors(cc.c, cc.r, a0, a0 + d1 - Math.PI * 2), false);
+        const end = dm <= d1 ? a0 + d1 : a0 + d1 - Math.PI * 2;
+        addCurveFromAnchors(arcAnchors(cc.c, cc.r, a0, end), false,
+          { kind: 'threePointArc', centerId: null, cx: cc.c.x, cy: cc.c.y, r: cc.r, a0, a1: end, closed: false });
         toast('Added arc', 'success');
       }
       arcClicks = [];
@@ -1581,6 +1736,24 @@
       if (outline) { createTracedPiece(outline.map((q) => ({ x: q.x + bgX, y: q.y + bgY }))); return; }
     }
     if (bgImage && bgImage.naturalWidth > 0) {
+      // calibrated scan: trace on the TPS-warped world-space bitmap so traced pieces are true-scale
+      const warped = warpEnabled && matchPairs.length > 0 ? ensureWarped() : null;
+      if (warped) {
+        const px = (world.x - warped.minX) * warped.pxPerMm;
+        const py = (warped.maxY - world.y) * warped.pxPerMm;
+        if (px >= 0 && py >= 0 && px < warped.canvas.width && py < warped.canvas.height) {
+          const c2 = warped.canvas.getContext('2d', { willReadFrequently: true });
+          if (c2) {
+            const boundary = traceImageRegion(c2.getImageData(0, 0, warped.canvas.width, warped.canvas.height), px, py, { simplifyTolerancePx: Math.max(1, 0.5 * warped.pxPerMm) });
+            if (boundary && boundary.length >= 3) {
+              createTracedPiece(boundary.map((q) => ({ x: warped.minX + q.x / warped.pxPerMm, y: warped.maxY - q.y / warped.pxPerMm })));
+              return;
+            }
+          }
+          toast('Could not trace a shape here — click inside the outline you want to trace.', 'error');
+          return;
+        }
+      }
       const W = bgImage.naturalWidth, H = bgImage.naturalHeight;
       const s = bgWidthMm / W; // mm per pixel
       const px = (world.x - bgX) / s + W / 2;
@@ -1590,7 +1763,7 @@
         off.width = W; off.height = H;
         const c2 = off.getContext('2d');
         if (c2) {
-          c2.drawImage(bgImage, 0, 0);
+          c2.drawImage(processedImage() ?? bgImage, 0, 0); // trace the filtered scan (threshold helps)
           const boundary = traceImageRegion(c2.getImageData(0, 0, W, H), px, py, { simplifyTolerancePx: Math.max(1, 0.5 / s) });
           if (boundary && boundary.length >= 3) {
             createTracedPiece(boundary.map((q) => ({ x: bgX + (q.x - W / 2) * s, y: bgY + (H / 2 - q.y) * s })));
@@ -1610,13 +1783,16 @@
 
   /** Reset any in-progress operation and return to the select tool (Esc / V / Cancel button). */
   function cancelOperation() {
-    penDraft = []; draftPathId = null; seamFirstEdge = null; seamMultiEdges = []; arcClicks = []; measureFrom = null;
+    penDraft = []; draftPathId = null; seamFirstEdge = null; seamMultiEdges = []; arcClicks = []; measureFrom = null; measureChain = [];
+    pendingPaste.set(null);
     selectedTool.set('select');
     render();
   }
 
   /** Bottom status-bar instruction for the active tool/operation (null = no bar). */
   const toolStatus = $derived.by(() => {
+    if (calibrating) return calibrating.src ? 'Calibrate: click the TRUE drafting position for the marked image feature · Esc to cancel' : 'Calibrate: click a known feature on the scanned image · Esc to cancel';
+    if ($pendingPaste) return `Select where you want to place the ${$pendingPaste.items.length === 1 ? 'copy' : 'copies'} · Esc to cancel`;
     switch ($selectedTool) {
       case 'text': return 'Click to place text';
       case 'image': return 'Click to place an image, then choose a file';
@@ -1631,7 +1807,9 @@
       case 'arc-center': return ['Click to set the centre of the arc', 'Click to set the radius / start', 'Click to set the end of the arc'][arcClicks.length] ?? '';
       case 'arc-3pt': return ['Click the first point of the arc', 'Click a point on the arc', 'Click the last point of the arc'][arcClicks.length] ?? '';
       case 'arc': return 'Arc/circle tools';
-      case 'measure': return measureFrom ? 'Click the second point to save the measurement · Esc to cancel' : 'Click two points to measure — saved measurements stay on the canvas';
+      case 'measure': return measureMode === 'angle'
+        ? (measureChain.length === 0 ? 'Angle: click the first arm point' : measureChain.length === 1 ? 'Angle: click the vertex point' : 'Angle: click the second arm point to save · Esc to cancel')
+        : (measureFrom ? 'Click the second point to save the measurement · Esc to cancel' : 'Click two points to measure — saved measurements stay on the canvas');
       default: return null;
     }
   });
@@ -1734,10 +1912,14 @@
     seamMultiEdges = []; render();
   }
 
-  // ---- Measure tool: persistent point-to-point measurements --------------------------------------
+  // ---- Measure tool: persistent distance + angle measurements ------------------------------------
   /** Within this tolerance of the target a measurement label reads green, otherwise red. */
   const MEASURE_TOL_MM = 1;
+  const MEASURE_TOL_DEG = 0.5;
   let selectedMeasurementId = $state<string | null>(null);
+  /** distance: click two points; angle: click A, then the vertex, then B */
+  let measureMode = $state<'distance' | 'angle'>('distance');
+  let measureChain = $state<string[]>([]);
 
   /** mm → the pattern's display unit. */
   const mmToUnit = (mm: number) =>
@@ -1746,21 +1928,31 @@
   const unitToMm = (v: number) =>
     currentPattern.lengthUnit === 'inch' ? v * 25.4 : currentPattern.lengthUnit === 'cm' ? v * 10 : v;
 
-  /** Measure tool click: first click arms the start point, second click saves a measurement. */
+  function saveMeasurement(m: Omit<Measurement, 'id' | 'name'>) {
+    const p = $state.snapshot(currentPattern) as Pattern;
+    const full: Measurement = { id: uid('Measurement'), name: `Measure ${(p.measurements ?? []).length + 1}`, ...m };
+    onchange({ ...p, measurements: [...(p.measurements ?? []), full], hasChanged: true }, 'Add measurement');
+    selectedMeasurementId = full.id;
+  }
+
+  /** Measure tool click: distance arms one point then saves on the second; angle chains A → vertex → B. */
   function measureClick(pos: Vec2) {
     const hit = hitTestPoint(pos.x, pos.y);
-    if (!hit) { measureFrom = null; render(); return; }
+    if (!hit) { measureFrom = null; measureChain = []; render(); return; }
+    if (measureMode === 'angle') {
+      if (measureChain.includes(hit)) { render(); return; }
+      const chain = [...measureChain, hit];
+      if (chain.length === 3) {
+        saveMeasurement({ kind: 'angle', fromPointId: chain[0], viaPointId: chain[1], toPointId: chain[2], targetMm: null });
+        measureChain = [];
+      } else {
+        measureChain = chain;
+      }
+      render();
+      return;
+    }
     if (measureFrom && hit !== measureFrom) {
-      const p = $state.snapshot(currentPattern) as Pattern;
-      const m: Measurement = {
-        id: uid('Measurement'),
-        name: `Measure ${(p.measurements ?? []).length + 1}`,
-        fromPointId: measureFrom,
-        toPointId: hit,
-        targetMm: null
-      };
-      onchange({ ...p, measurements: [...(p.measurements ?? []), m], hasChanged: true }, 'Add measurement');
-      selectedMeasurementId = m.id;
+      saveMeasurement({ kind: 'distance', fromPointId: measureFrom, toPointId: hit, targetMm: null });
       measureFrom = null;
     } else {
       measureFrom = hit;
@@ -1768,17 +1960,31 @@
     render();
   }
 
+  /** Inner angle (degrees, 0..180) at `v` between rays v→a and v→b. */
+  function angleAtDeg(a: Vec2, v: Vec2, b: Vec2): number {
+    const a1 = Math.atan2(a.y - v.y, a.x - v.x);
+    const a2 = Math.atan2(b.y - v.y, b.x - v.x);
+    let d = Math.abs(a1 - a2) * (180 / Math.PI);
+    if (d > 180) d = 360 - d;
+    return d;
+  }
+
   /** Current world endpoints of a measurement, or null when an endpoint no longer exists. */
-  function measurementEndpoints(m: Measurement): { a: Vec2; b: Vec2 } | null {
+  function measurementEndpoints(m: Measurement): { a: Vec2; v: Vec2 | null; b: Vec2 } | null {
     const placed = placedPoints(currentPattern, indexPoints(currentPattern));
     const a = placed.find((p) => p.pointId === m.fromPointId)?.world;
     const b = placed.find((p) => p.pointId === m.toPointId)?.world;
-    return a && b ? { a, b } : null;
+    const v = m.viaPointId ? placed.find((p) => p.pointId === m.viaPointId)?.world ?? null : null;
+    if (!a || !b || (m.kind === 'angle' && !v)) return null;
+    return { a, v, b };
   }
-  const measuredMm = (m: Measurement): number | null => {
+  /** Measured value: mm for distance measurements, degrees for angle measurements. */
+  const measuredValue = (m: Measurement): number | null => {
     const e = measurementEndpoints(m);
-    return e ? Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y) : null;
+    if (!e) return null;
+    return m.kind === 'angle' ? angleAtDeg(e.a, e.v!, e.b) : Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y);
   };
+  const measureTol = (m: Measurement) => (m.kind === 'angle' ? MEASURE_TOL_DEG : MEASURE_TOL_MM);
 
   function updateMeasurement(id: string, patch: Partial<Measurement>, label = 'Edit measurement') {
     const p = $state.snapshot(currentPattern) as Pattern;
@@ -1795,8 +2001,11 @@
     const e = measurementEndpoints(m);
     if (!e) return;
     selectedMeasurementId = m.id;
-    viewOffset = { x: (e.a.x + e.b.x) / 2, y: (e.a.y + e.b.y) / 2 };
-    const dist = Math.max(20, Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y));
+    const pts = e.v ? [e.a, e.v, e.b] : [e.a, e.b];
+    const minX = Math.min(...pts.map((q) => q.x)), maxX = Math.max(...pts.map((q) => q.x));
+    const minY = Math.min(...pts.map((q) => q.y)), maxY = Math.max(...pts.map((q) => q.y));
+    viewOffset = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+    const dist = Math.max(20, maxX - minX, maxY - minY);
     zoom.set(Math.max(0.05, Math.min(20, (Math.min(canvasW, canvasH) * 0.6) / (dist * currentPattern.graphicsScale))));
     panOffset.set({ x: 0, y: 0 });
     render();
@@ -1807,38 +2016,62 @@
     const list = currentPattern.measurements ?? [];
     const toolActive = $selectedTool === 'measure';
     const show = currentPattern.showMeasurements !== false || toolActive;
-    if (!show || (list.length === 0 && !measureFrom)) return;
+    if (!show || (list.length === 0 && !measureFrom && measureChain.length === 0)) return;
     const placed = placedPoints(currentPattern, points);
     const byId = new Map(placed.map((p) => [p.pointId, p.world]));
     const u = currentPattern.lengthUnit;
     c.save();
     c.font = 'bold 11px sans-serif';
     c.textAlign = 'left';
+    const drawLabel = (label: string, mx: number, my: number, color: string) => {
+      const tw = c.measureText(label).width;
+      c.fillStyle = isDark ? 'rgba(15,23,42,0.85)' : 'rgba(255,255,255,0.85)';
+      c.fillRect(mx - 3, my - 11, tw + 6, 14);
+      c.fillStyle = color;
+      c.fillText(label, mx, my);
+    };
     for (const m of list) {
-      const a = byId.get(m.fromPointId), b = byId.get(m.toPointId);
-      if (!a || !b) continue; // an endpoint was deleted
-      const ca = toCanvas(a), cb = toCanvas(b);
+      const e = measurementEndpoints(m);
+      if (!e) continue; // an endpoint was deleted
       const selected = m.id === selectedMeasurementId;
       c.strokeStyle = '#f97316';
       c.lineWidth = selected ? 2.25 : 1.25;
+      if (m.kind === 'angle' && e.v) {
+        const cv = toCanvas(e.v), ca = toCanvas(e.a), cb = toCanvas(e.b);
+        c.setLineDash([5, 3]);
+        c.beginPath(); c.moveTo(cv.x, cv.y); c.lineTo(ca.x, ca.y); c.stroke();
+        c.beginPath(); c.moveTo(cv.x, cv.y); c.lineTo(cb.x, cb.y); c.stroke();
+        c.setLineDash([]);
+        // arc at the vertex spanning the inner angle (canvas y is flipped, so negate angles)
+        const r = Math.min(28, Math.hypot(ca.x - cv.x, ca.y - cv.y) * 0.5, Math.hypot(cb.x - cv.x, cb.y - cv.y) * 0.5);
+        let t1 = Math.atan2(ca.y - cv.y, ca.x - cv.x);
+        let t2 = Math.atan2(cb.y - cv.y, cb.x - cv.x);
+        let sweep = t2 - t1;
+        while (sweep > Math.PI) sweep -= Math.PI * 2;
+        while (sweep < -Math.PI) sweep += Math.PI * 2;
+        c.beginPath(); c.arc(cv.x, cv.y, r, t1, t1 + sweep, sweep < 0); c.stroke();
+        c.fillStyle = '#f97316';
+        for (const p of [ca, cv, cb]) { c.beginPath(); c.arc(p.x, p.y, 2.5, 0, Math.PI * 2); c.fill(); }
+        const deg = angleAtDeg(e.a, e.v, e.b);
+        const err = m.targetMm != null ? deg - m.targetMm : 0;
+        const label = `${m.name}: ${deg.toFixed(1)}°` + (m.targetMm != null ? ` (${err >= 0 ? '+' : ''}${err.toFixed(1)}°)` : '');
+        drawLabel(label, cv.x + r + 6, cv.y - 6, m.targetMm != null ? (Math.abs(err) <= MEASURE_TOL_DEG ? '#16a34a' : '#dc2626') : '#f97316');
+        continue;
+      }
+      const ca = toCanvas(e.a), cb = toCanvas(e.b);
       c.setLineDash([5, 3]);
       c.beginPath(); c.moveTo(ca.x, ca.y); c.lineTo(cb.x, cb.y); c.stroke();
       c.setLineDash([]);
       c.fillStyle = '#f97316';
       for (const p of [ca, cb]) { c.beginPath(); c.arc(p.x, p.y, 2.5, 0, Math.PI * 2); c.fill(); }
-      const dmm = Math.hypot(b.x - a.x, b.y - a.y);
+      const dmm = Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y);
       const err = m.targetMm != null ? dmm - m.targetMm : 0;
       const label = `${m.name}: ${mmToUnit(dmm).toFixed(2)} ${u}` +
         (m.targetMm != null ? ` (${err >= 0 ? '+' : ''}${mmToUnit(err).toFixed(2)})` : '');
-      const mx = (ca.x + cb.x) / 2 + 6, my = (ca.y + cb.y) / 2 - 6;
-      const tw = c.measureText(label).width;
-      c.fillStyle = isDark ? 'rgba(15,23,42,0.85)' : 'rgba(255,255,255,0.85)';
-      c.fillRect(mx - 3, my - 11, tw + 6, 14);
-      c.fillStyle = m.targetMm != null ? (Math.abs(err) <= MEASURE_TOL_MM ? '#16a34a' : '#dc2626') : '#f97316';
-      c.fillText(label, mx, my);
+      drawLabel(label, (ca.x + cb.x) / 2 + 6, (ca.y + cb.y) / 2 - 6, m.targetMm != null ? (Math.abs(err) <= MEASURE_TOL_MM ? '#16a34a' : '#dc2626') : '#f97316');
     }
-    // live rubber-band from the armed start point to the hovered point / cursor
-    if (toolActive && measureFrom) {
+    // live preview: distance rubber-band, or the angle chain so far
+    if (toolActive && measureMode === 'distance' && measureFrom) {
       const a = byId.get(measureFrom);
       const b = hoveredPointId ? byId.get(hoveredPointId) : undefined;
       if (a) {
@@ -1855,7 +2088,235 @@
         }
       }
     }
+    if (toolActive && measureMode === 'angle' && measureChain.length > 0) {
+      const pts = measureChain.map((id) => byId.get(id)).filter(Boolean) as Vec2[];
+      c.strokeStyle = '#f97316';
+      c.setLineDash([4, 3]);
+      c.beginPath();
+      const p0 = toCanvas(pts[0]);
+      c.moveTo(p0.x, p0.y);
+      for (let i = 1; i < pts.length; i++) { const q = toCanvas(pts[i]); c.lineTo(q.x, q.y); }
+      c.lineTo(cursorPos.x, cursorPos.y);
+      c.stroke();
+      c.setLineDash([]);
+      c.fillStyle = '#f97316';
+      for (const p of pts) { const q = toCanvas(p); c.beginPath(); c.arc(q.x, q.y, 2.5, 0, Math.PI * 2); c.fill(); }
+    }
     c.restore();
+  }
+
+  // ---- Auto-scroll: pan the view while a drag approaches the canvas edge --------------------------
+  const AUTO_EDGE = 28; // px band at each edge that triggers scrolling
+  const AUTO_SPEED = 14; // max px/frame at the very edge
+  let autoScrollVec: Vec2 | null = null;
+  let autoScrollRaf = 0;
+
+  function updateAutoScroll(pos: Vec2) {
+    const active = isDragging || isMarquee || penDragging || !!gizmoDrag || !!$pendingPaste;
+    let vx = 0, vy = 0;
+    if (active) {
+      if (pos.x < AUTO_EDGE) vx = -(AUTO_EDGE - pos.x) / AUTO_EDGE;
+      else if (pos.x > canvasW - AUTO_EDGE) vx = (pos.x - (canvasW - AUTO_EDGE)) / AUTO_EDGE;
+      if (pos.y < AUTO_EDGE) vy = -(AUTO_EDGE - pos.y) / AUTO_EDGE;
+      else if (pos.y > canvasH - AUTO_EDGE) vy = (pos.y - (canvasH - AUTO_EDGE)) / AUTO_EDGE;
+    }
+    if (vx === 0 && vy === 0) { autoScrollVec = null; return; }
+    autoScrollVec = { x: vx, y: vy };
+    if (!autoScrollRaf) autoScrollRaf = requestAnimationFrame(autoScrollTick);
+  }
+  function autoScrollTick() {
+    autoScrollRaf = 0;
+    if (!autoScrollVec) return;
+    // pan so the content under the cursor scrolls into view (content moves opposite the push)
+    panOffset.set({ x: currentPanX - autoScrollVec.x * AUTO_SPEED, y: currentPanY - autoScrollVec.y * AUTO_SPEED });
+    autoScrollRaf = requestAnimationFrame(autoScrollTick);
+  }
+  function stopAutoScroll() {
+    autoScrollVec = null;
+    if (autoScrollRaf) { cancelAnimationFrame(autoScrollRaf); autoScrollRaf = 0; }
+  }
+
+  // ---- Selection transform gizmo: rotate + scale handles on the multi-point selection bbox --------
+  let gizmoDrag: {
+    kind: 'rotate' | 'scale';
+    center: Vec2; // centroid of the points' raw drafting coords (selectionRotate semantics)
+    startAngle: number;
+    startDist: number;
+    orig: { id: string; x: number; y: number }[];
+  } | null = null;
+
+  /** Canvas-space gizmo geometry for the current multi-point selection (null = no gizmo). */
+  function selectionGizmo(): { min: Vec2; max: Vec2; rotate: Vec2; scale: Vec2 } | null {
+    if ($selectedTool !== 'select' || $selectedPointIds.size < 2) return null;
+    const sel = $selectedPointIds;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let n = 0;
+    for (const pp of placedPoints(currentPattern)) {
+      if (!sel.has(pp.pointId)) continue;
+      const cp = toCanvas(pp.world);
+      minX = Math.min(minX, cp.x); maxX = Math.max(maxX, cp.x);
+      minY = Math.min(minY, cp.y); maxY = Math.max(maxY, cp.y);
+      n++;
+    }
+    if (n < 2) return null;
+    const pad = 12;
+    const min = { x: minX - pad, y: minY - pad }, max = { x: maxX + pad, y: maxY + pad };
+    return { min, max, rotate: { x: (min.x + max.x) / 2, y: min.y - 22 }, scale: { x: max.x, y: max.y } };
+  }
+
+  /** Begin a gizmo drag if the press hit the rotate/scale handle. */
+  function gizmoMouseDown(pos: Vec2): boolean {
+    const g = selectionGizmo();
+    if (!g) return false;
+    const near = (h: Vec2) => Math.hypot(pos.x - h.x, pos.y - h.y) < 10;
+    const kind = near(g.rotate) ? 'rotate' : near(g.scale) ? 'scale' : null;
+    if (!kind) return false;
+    const orig = currentPattern.points
+      .filter((q) => $selectedPointIds.has(q.id))
+      .map((q) => ({ id: q.id, x: q.x, y: q.y }));
+    const center = {
+      x: orig.reduce((s, q) => s + q.x, 0) / orig.length,
+      y: orig.reduce((s, q) => s + q.y, 0) / orig.length
+    };
+    const cur = toPattern(pos.x, pos.y);
+    gizmoDrag = {
+      kind,
+      center,
+      startAngle: Math.atan2(cur.y - center.y, cur.x - center.x),
+      startDist: Math.max(1e-6, Math.hypot(cur.x - center.x, cur.y - center.y)),
+      orig
+    };
+    return true;
+  }
+
+  /** Apply the live gizmo transform for the current cursor position. */
+  function gizmoMouseMove(pos: Vec2, shift: boolean) {
+    if (!gizmoDrag) return;
+    const { kind, center, orig } = gizmoDrag;
+    const cur = toPattern(pos.x, pos.y);
+    let map: Map<string, Vec2>;
+    if (kind === 'rotate') {
+      let ang = Math.atan2(cur.y - center.y, cur.x - center.x) - gizmoDrag.startAngle;
+      if (shift) ang = Math.round(ang / (Math.PI / 12)) * (Math.PI / 12); // 15° steps
+      const cos = Math.cos(ang), sin = Math.sin(ang);
+      map = new Map(orig.map((q) => [q.id, {
+        x: center.x + (q.x - center.x) * cos - (q.y - center.y) * sin,
+        y: center.y + (q.x - center.x) * sin + (q.y - center.y) * cos
+      }]));
+    } else {
+      let f = Math.hypot(cur.x - center.x, cur.y - center.y) / gizmoDrag.startDist;
+      f = Math.max(0.05, Math.min(20, f));
+      if (shift) f = Math.round(f * 20) / 20; // 5% steps
+      map = new Map(orig.map((q) => [q.id, { x: center.x + (q.x - center.x) * f, y: center.y + (q.y - center.y) * f }]));
+    }
+    const points = currentPattern.points.map((p) => (map.has(p.id) ? { ...p, ...map.get(p.id)! } : p));
+    onchange({ ...currentPattern, points, hasChanged: true });
+  }
+
+  /** Dashed selection bbox + rotate/scale handles (select tool, ≥2 points). */
+  function drawSelectionGizmo(c: CanvasRenderingContext2D) {
+    const g = selectionGizmo();
+    if (!g) return;
+    c.save();
+    c.strokeStyle = '#2563eb';
+    c.lineWidth = 1;
+    c.setLineDash([4, 3]);
+    c.strokeRect(g.min.x, g.min.y, g.max.x - g.min.x, g.max.y - g.min.y);
+    c.setLineDash([]);
+    // rotate handle: stem + circle above the top edge
+    c.beginPath(); c.moveTo((g.min.x + g.max.x) / 2, g.min.y); c.lineTo(g.rotate.x, g.rotate.y + 6); c.stroke();
+    c.beginPath(); c.arc(g.rotate.x, g.rotate.y, 6, 0, Math.PI * 2);
+    c.fillStyle = '#fff'; c.fill(); c.stroke();
+    c.beginPath(); c.arc(g.rotate.x, g.rotate.y, 2.4, 0, Math.PI * 2); c.fillStyle = '#2563eb'; c.fill();
+    // scale handle: square at the bottom-right corner
+    c.fillStyle = '#fff';
+    c.fillRect(g.scale.x - 5, g.scale.y - 5, 10, 10);
+    c.strokeRect(g.scale.x - 5, g.scale.y - 5, 10, 10);
+    c.restore();
+  }
+
+  // ---- Paste with click placement (the source's PasteTool) ----------------------------------------
+  function pasteAnchor(pp: PendingPaste): Vec2 {
+    const pts = pp.kind === 'pieces' ? pp.items.map((i) => i.position) : pp.items.map((i) => ({ x: i.x, y: i.y }));
+    return { x: pts.reduce((s, q) => s + q.x, 0) / pts.length, y: pts.reduce((s, q) => s + q.y, 0) / pts.length };
+  }
+
+  /** Commit the armed clipboard at the clicked world position (selection moves to the copies). */
+  function commitPaste(world: Vec2) {
+    const pp = $pendingPaste;
+    if (!pp || pp.items.length === 0) return;
+    const anchor = pasteAnchor(pp);
+    const dx = world.x - anchor.x, dy = world.y - anchor.y;
+    const p = $state.snapshot(currentPattern) as Pattern;
+    if (pp.kind === 'pieces') {
+      const clones = pp.items.map((src) => {
+        const c = structuredClone(src) as Piece;
+        c.id = uid('Piece');
+        c.name = `Copy of ${src.name}`;
+        c.position = { x: src.position.x + dx, y: src.position.y + dy };
+        for (const e of [...c.mainPaths, ...c.internalPaths]) e.id = uid('PiecePath');
+        return c;
+      });
+      onchange({ ...p, pieces: [...p.pieces, ...clones], hasChanged: true }, 'Paste');
+      selectedPieceIds.set(new Set(clones.map((c) => c.id)));
+    } else {
+      const prefix = p.pointPrefix || 'A';
+      let n = p.points.length;
+      const names = new Set(p.points.map((q) => q.name));
+      const nextName = () => { while (names.has(`${prefix}${n}`)) n++; const nm = `${prefix}${n}`; names.add(nm); return nm; };
+      const clones = pp.items.map((src) => ({ ...structuredClone(src), id: uid('ConstrainablePoint'), name: nextName(), x: src.x + dx, y: src.y + dy }));
+      onchange({ ...p, points: [...p.points, ...clones], hasChanged: true }, 'Paste');
+      selectedPointIds.set(new Set(clones.map((c) => c.id)));
+    }
+    pendingPaste.set(null);
+    toast(`Pasted ${pp.items.length === 1 ? '1 item' : `${pp.items.length} items`}`, 'success');
+    render();
+  }
+
+  /** Translucent preview of the armed clipboard under the cursor. */
+  function drawPasteGhost(c: CanvasRenderingContext2D) {
+    const pp = $pendingPaste;
+    if (!pp || pp.items.length === 0) return;
+    const world = toPattern(cursorPos.x, cursorPos.y);
+    const anchor = pasteAnchor(pp);
+    const dx = world.x - anchor.x, dy = world.y - anchor.y;
+    c.save();
+    c.globalAlpha = 0.55;
+    c.strokeStyle = '#2563eb';
+    c.setLineDash([5, 4]);
+    c.lineWidth = 1.5;
+    if (pp.kind === 'pieces') {
+      const paths = indexPaths(currentPattern);
+      const points = indexPoints(currentPattern);
+      for (const item of pp.items) {
+        const ghost = { ...item, position: { x: item.position.x + dx, y: item.position.y + dy } } as Piece;
+        const outline = pieceWorldOutline(currentPattern, ghost, paths, points, 4);
+        if (outline.length >= 2) { tracePoly(c, outline, true); c.stroke(); }
+      }
+    } else {
+      c.setLineDash([]);
+      c.fillStyle = '#2563eb';
+      for (const item of pp.items) {
+        const q = toCanvas({ x: item.x + dx, y: item.y + dy });
+        c.beginPath(); c.arc(q.x, q.y, 3.5, 0, Math.PI * 2); c.fill();
+      }
+    }
+    c.restore();
+  }
+
+  /** Parametric-arc upkeep after points moved: an arc follows its centre point; dragging one of an
+   *  arc's own anchors detaches the metadata (the path is hand-edited from then on). */
+  function afterPointsMoved(next: Pattern, movedIds: string[]): Pattern {
+    let out = next;
+    for (const id of movedIds) {
+      out = detachArcsTouchingAnchor(out, id);
+      for (const ap of arcPathsCenteredOn(out, id)) {
+        if (!ap.arc) continue;
+        const rb = rebakeArc(out, ap.id, ap.arc, uid);
+        if (rb) out = rb;
+      }
+    }
+    return out;
   }
 
   /** Snap a drafting-space coordinate to the grid and/or other points' guides. */
@@ -1879,6 +2340,25 @@
   function handleMouseDown(e: MouseEvent) {
     const pos = getPos(e);
     dragStartX = pos.x; dragStartY = pos.y;
+    if ($pendingPaste && e.button === 0) { commitPaste(toPattern(pos.x, pos.y)); return; }
+    if (calibrating && bgImage && e.button === 0) {
+      const world = toPattern(pos.x, pos.y);
+      if (!calibrating.src) {
+        const px = worldToImgPx(world);
+        if (px.x < 0 || px.y < 0 || px.x > bgImage.naturalWidth || px.y > bgImage.naturalHeight) {
+          toast('Click a feature on the scanned image first', 'error');
+          return;
+        }
+        calibrating = { src: px };
+      } else {
+        matchPairs = [...matchPairs, { srcPx: calibrating.src, dst: world }];
+        calibrating = null;
+        if (matchPairs.length >= 1) warpEnabled = true;
+        toast('Match point added', 'success');
+      }
+      render();
+      return;
+    }
     const tool = $selectedTool;
     if (tool === 'pan' || e.button === 1 || e.metaKey || e.ctrlKey || e.altKey) { isPanning = true; return; }
     if (tool === 'measure') { measureClick(pos); return; }
@@ -1896,6 +2376,9 @@
     if (tool === 'seam-multi') { seamMultiClick(pos); return; }
     if (tool === 'circle' || tool === 'arc-center' || tool === 'arc-3pt') { arcClick(pos); return; }
     if (tool === 'arc') return;
+
+    // gizmo handles (rotate/scale on the multi-selection bbox) win over everything below
+    if (gizmoMouseDown(pos)) { isDragging = true; return; }
 
     // bezier-handle drag takes priority over anchor selection (handles sit on top of anchors)
     const hHit = hitTestHandle(pos.x, pos.y);
@@ -1968,6 +2451,9 @@
     const pos = getPos(e);
     cursorPos = pos;
     cursorMm.set(toPattern(pos.x, pos.y)); // live drafting-mm readout for the status bar
+    updateAutoScroll(pos);
+    if ($pendingPaste) { render(); return; } // ghost follows the cursor
+    if (gizmoDrag) { gizmoMouseMove(pos, e.shiftKey); return; }
     if (isPanning) {
       panOffset.set({ x: currentPanX + (pos.x - dragStartX), y: currentPanY + (pos.y - dragStartY) });
       dragStartX = pos.x; dragStartY = pos.y;
@@ -2011,10 +2497,10 @@
         const dx = draft.x - dragDraftStart.x, dy = draft.y - dragDraftStart.y;
         const moved = new Map(multiDrag.map((m) => [m.id, { x: m.x + dx, y: m.y + dy }]));
         const points = currentPattern.points.map((p) => (moved.has(p.id) ? { ...p, ...moved.get(p.id)! } : p));
-        onchange({ ...currentPattern, points, hasChanged: true });
+        onchange(afterPointsMoved({ ...currentPattern, points, hasChanged: true }, [...moved.keys()]));
       } else {
         const points = currentPattern.points.map((p) => (p.id === dragPointId ? { ...p, x: draft.x, y: draft.y } : p));
-        onchange({ ...currentPattern, points, hasChanged: true });
+        onchange(afterPointsMoved({ ...currentPattern, points, hasChanged: true }, [dragPointId]));
       }
       return;
     }
@@ -2047,6 +2533,8 @@
     penDragging = false;
     penDragPointId = null;
     isPanning = false;
+    gizmoDrag = null;
+    stopAutoScroll();
     render();
   }
 
@@ -2099,8 +2587,8 @@
 </div>
 
 {#if showSnapshotControls}
-  <div class="absolute top-10 left-56 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-52">
-    <div class="flex items-center justify-between"><span class="font-bold">Frozen snapshot</span>
+  <div class="absolute top-10 left-56 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-52" use:draggablePanel={{ handle: '[data-drag-handle]' }}>
+    <div class="flex items-center justify-between" data-drag-handle><span class="font-bold">Frozen snapshot</span>
       <button class="btn btn-ghost btn-xs btn-circle" aria-label="Close" onclick={() => (showSnapshotControls = false)}>✕</button>
     </div>
     <button class="btn btn-xs w-full" onclick={freezeSnapshot}>Freeze snapshot</button>
@@ -2115,8 +2603,8 @@
 {/if}
 
 {#if showBgControls}
-  <div class="absolute top-10 left-2 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-52">
-    <div class="flex items-center justify-between"><span class="font-bold">Trace overlay</span>
+  <div class="absolute top-10 left-2 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-52" use:draggablePanel={{ handle: '[data-drag-handle]' }}>
+    <div class="flex items-center justify-between" data-drag-handle><span class="font-bold">Trace overlay</span>
       <button class="btn btn-ghost btn-xs btn-circle" aria-label="Close" onclick={() => (showBgControls = false)}>✕</button>
     </div>
     <div class="flex gap-1">
@@ -2136,6 +2624,48 @@
         <label class="flex items-center gap-1">X<input type="number" step="5" class="input input-bordered input-xs w-full" value={bgX} oninput={(e) => { bgX = parseFloat(e.currentTarget.value) || 0; render(); }} /></label>
         <label class="flex items-center gap-1">Y<input type="number" step="5" class="input input-bordered input-xs w-full" value={bgY} oninput={(e) => { bgY = parseFloat(e.currentTarget.value) || 0; render(); }} /></label>
       </div>
+
+      {#if bgImage}
+        <div class="border-t border-base-300 pt-1 space-y-1">
+          <span class="font-semibold opacity-70">Filters</span>
+          <label class="flex flex-col gap-0.5"><span class="flex justify-between"><span>Brightness</span><span class="opacity-60">{bgBrightness}</span></span>
+            <input type="range" class="range range-xs" min="-100" max="100" step="1" value={bgBrightness} oninput={(e) => { bgBrightness = parseInt(e.currentTarget.value); render(); }} /></label>
+          <label class="flex flex-col gap-0.5"><span class="flex justify-between"><span>Contrast</span><span class="opacity-60">{bgContrast}</span></span>
+            <input type="range" class="range range-xs" min="-100" max="100" step="1" value={bgContrast} oninput={(e) => { bgContrast = parseInt(e.currentTarget.value); render(); }} /></label>
+          <div class="flex items-center gap-2">
+            <label class="flex items-center gap-1"><input type="checkbox" class="checkbox checkbox-xs" checked={bgGrayscale} onchange={(e) => { bgGrayscale = e.currentTarget.checked; render(); }} /> Grayscale</label>
+            <label class="flex items-center gap-1"><input type="checkbox" class="checkbox checkbox-xs" checked={bgThreshold != null} onchange={(e) => { bgThreshold = e.currentTarget.checked ? 128 : null; render(); }} /> Threshold</label>
+          </div>
+          {#if bgThreshold != null}
+            <label class="flex flex-col gap-0.5"><span class="flex justify-between"><span>Threshold level</span><span class="opacity-60">{bgThreshold}</span></span>
+              <input type="range" class="range range-xs" min="0" max="255" step="1" value={bgThreshold} oninput={(e) => { bgThreshold = parseInt(e.currentTarget.value); render(); }} /></label>
+          {/if}
+          {#if bgBrightness !== 0 || bgContrast !== 0 || bgGrayscale || bgThreshold != null}
+            <button class="btn btn-xs btn-ghost w-full" onclick={() => { bgBrightness = 0; bgContrast = 0; bgGrayscale = false; bgThreshold = null; render(); }}>Reset filters</button>
+          {/if}
+        </div>
+
+        <div class="border-t border-base-300 pt-1 space-y-1">
+          <span class="font-semibold opacity-70" title="Mark known features on the scan and their true drafting positions; the image is warped (thin-plate spline) to match — dewarps and true-scales scanned paper patterns.">Calibrate (match points)</span>
+          <button class="btn btn-xs w-full" class:btn-accent={!!calibrating} onclick={() => { calibrating = calibrating ? null : { src: null }; render(); }}>
+            {calibrating ? (calibrating.src ? 'Now click the TRUE position…' : 'Click a feature on the image…') : '+ Add match point'}
+          </button>
+          {#if matchPairs.length > 0}
+            <label class="flex items-center gap-1"><input type="checkbox" class="checkbox checkbox-xs" checked={warpEnabled} onchange={(e) => { warpEnabled = e.currentTarget.checked; render(); }} /> Apply warp ({matchPairs.length} point{matchPairs.length === 1 ? '' : 's'})</label>
+            <div class="max-h-24 overflow-y-auto space-y-0.5">
+              {#each matchPairs as pair, i (i)}
+                <div class="flex items-center gap-1 text-[11px]">
+                  <span class="flex-1 truncate opacity-70">#{i + 1} → {pair.dst.x.toFixed(0)}, {pair.dst.y.toFixed(0)} mm</span>
+                  <button class="btn btn-ghost btn-xs px-0.5 text-error" title="Remove match point" onclick={() => { matchPairs = matchPairs.filter((_, j) => j !== i); render(); }}>&times;</button>
+                </div>
+              {/each}
+            </div>
+            <button class="btn btn-xs btn-ghost w-full" onclick={() => { matchPairs = []; warpEnabled = false; render(); }}>Clear match points</button>
+            <p class="opacity-50 leading-tight">1 point moves, 2 scale + rotate, 3+ dewarp (thin-plate spline). Tracing uses the calibrated image.</p>
+          {/if}
+        </div>
+      {/if}
+
       <div class="flex gap-1">
         {#if bgImage}<button class="btn btn-xs btn-ghost flex-1" onclick={clearBgImage}>Remove image</button>{/if}
         {#if hpglPolys}<button class="btn btn-xs btn-ghost flex-1" onclick={clearHpgl}>Remove HPGL</button>{/if}
@@ -2148,8 +2678,8 @@
 
 {#if $selectedTool === 'measure'}
   <!-- Measurements panel: saved Measure-tool annotations with live values, targets and zoom-to -->
-  <div class="absolute top-10 right-14 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-72">
-    <div class="flex items-center justify-between">
+  <div class="absolute top-10 right-14 z-10 bg-base-100/95 backdrop-blur rounded-lg shadow-lg border border-base-300 p-2 text-xs space-y-1 w-72" use:draggablePanel={{ handle: '[data-drag-handle]' }}>
+    <div class="flex items-center justify-between" data-drag-handle>
       <span class="font-bold">Measurements</span>
       <label class="flex items-center gap-1 cursor-pointer" title="Show measurements on the canvas">
         <input
@@ -2161,14 +2691,24 @@
         <span>Show</span>
       </label>
     </div>
+    <div class="join w-full">
+      <button class="join-item btn btn-xs flex-1" class:btn-active={measureMode === 'distance'} onclick={() => { measureMode = 'distance'; measureChain = []; render(); }}>Distance</button>
+      <button class="join-item btn btn-xs flex-1" class:btn-active={measureMode === 'angle'} onclick={() => { measureMode = 'angle'; measureFrom = null; render(); }}>Angle</button>
+    </div>
     {#if (currentPattern.measurements ?? []).length === 0}
-      <p class="opacity-50 leading-tight">Click two points to save a measurement. Set a target to track a length while you edit (green = within ±{mmToUnit(MEASURE_TOL_MM).toFixed(2)} {currentPattern.lengthUnit}).</p>
+      <p class="opacity-50 leading-tight">
+        {measureMode === 'angle'
+          ? 'Click three points (arm, vertex, arm) to save an angle measurement.'
+          : `Click two points to save a measurement. Set a target to track a length while you edit (green = within ±${mmToUnit(MEASURE_TOL_MM).toFixed(2)} ${currentPattern.lengthUnit}).`}
+      </p>
     {:else}
       <div class="max-h-64 overflow-y-auto space-y-1">
         {#each currentPattern.measurements ?? [] as m (m.id)}
-          {@const actual = measuredMm(m)}
+          {@const actual = measuredValue(m)}
+          {@const isAngle = m.kind === 'angle'}
           <div class="rounded border p-1 space-y-1 {m.id === selectedMeasurementId ? 'border-warning' : 'border-base-300'}">
             <div class="flex items-center gap-1">
+              {#if isAngle}<span class="material-symbols-rounded notranslate opacity-50" style="font-size:13px" title="Angle measurement">architecture</span>{/if}
               <input
                 class="input input-bordered input-xs flex-1 min-w-0"
                 value={m.name}
@@ -2180,20 +2720,20 @@
               <button class="btn btn-ghost btn-xs px-1 text-error" title="Delete measurement" aria-label="Delete measurement" onclick={() => deleteMeasurement(m.id)}>✕</button>
             </div>
             <div class="flex items-center gap-1">
-              <span class="tabular-nums {actual != null && m.targetMm != null ? (Math.abs(actual - m.targetMm) <= MEASURE_TOL_MM ? 'text-success' : 'text-error') : ''}">
-                {actual != null ? `${mmToUnit(actual).toFixed(2)} ${currentPattern.lengthUnit}` : 'point missing'}
+              <span class="tabular-nums {actual != null && m.targetMm != null ? (Math.abs(actual - m.targetMm) <= measureTol(m) ? 'text-success' : 'text-error') : ''}">
+                {actual == null ? 'point missing' : isAngle ? `${actual.toFixed(1)}°` : `${mmToUnit(actual).toFixed(2)} ${currentPattern.lengthUnit}`}
               </span>
               <span class="flex-1"></span>
               <label class="flex items-center gap-1">
-                <span class="opacity-60">target</span>
+                <span class="opacity-60">target{isAngle ? ' °' : ''}</span>
                 <input
                   type="number"
                   step="0.1"
                   class="input input-bordered input-xs w-16"
-                  value={m.targetMm != null ? Number(mmToUnit(m.targetMm).toFixed(2)) : ''}
+                  value={m.targetMm != null ? Number((isAngle ? m.targetMm : mmToUnit(m.targetMm)).toFixed(2)) : ''}
                   onchange={(e) => {
                     const v = parseFloat(e.currentTarget.value);
-                    updateMeasurement(m.id, { targetMm: Number.isFinite(v) ? unitToMm(v) : null }, 'Set measurement target');
+                    updateMeasurement(m.id, { targetMm: Number.isFinite(v) ? (isAngle ? v : unitToMm(v)) : null }, 'Set measurement target');
                   }}
                 />
               </label>

@@ -1,6 +1,6 @@
 import { writable, derived } from 'svelte/store';
 import { browser } from '$app/environment';
-import type { Pattern } from '$lib/types/pattern';
+import type { Pattern, Piece, ConstrainablePoint } from '$lib/types/pattern';
 import { EMPTY_PATTERN } from '$lib/types/pattern';
 import { saveHistory, loadHistory, deleteHistory } from '$lib/stores/localDB';
 
@@ -25,6 +25,13 @@ export const snapToGrid = writable<boolean>(false);
 /** Live cursor position in drafting millimetres (set by the 2D canvas), for the status bar. Null when
  *  the pointer is outside the canvas. */
 export const cursorMm = writable<{ x: number; y: number } | null>(null);
+
+/** Clipboard payload awaiting click-placement on the 2D canvas (the source's PasteTool flow). A
+ *  Ctrl+V arms this; the canvas ghosts the content under the cursor and commits on click. */
+export type PendingPaste =
+  | { kind: 'pieces'; items: Piece[] }
+  | { kind: 'points'; items: ConstrainablePoint[] };
+export const pendingPaste = writable<PendingPaste | null>(null);
 
 /** Writable store mirrored to localStorage (browser only) — shared persistence helper. */
 export function persisted<T>(key: string, initial: T) {

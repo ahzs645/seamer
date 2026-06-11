@@ -22,11 +22,14 @@ curl -X DELETE http://localhost:5173/api/mcp-session/<id>
 
   const commands: { group: string; names: string[] }[] = [
     { group: 'Pattern', names: ['pattern.setName', 'pattern.setDescription', 'pattern.setUnit', 'pattern.setSeamAllowance', 'pattern.setDefaultNotchSize', 'pattern.setPointNaming', 'pattern.setPublic'] },
-    { group: 'Points & paths', names: ['point.move', 'point.rename', 'path.reverse', 'piecePath.add'] },
+    { group: 'Create', names: ['point.create', 'path.createLine', 'path.createCurve', 'path.createEllipse', 'path.createCenterArc', 'path.createThreePointArc', 'piece.createDynamic', 'seam.create', 'notch.add', 'variable.create', 'material.upsert', 'layer.create', 'text.create'] },
+    { group: 'Points', names: ['point.move', 'point.rename', 'point.convertToCurvePoint', 'point.convertToSlidingPoint', 'point.releaseSlidingPoint', 'point.disconnectPaths', 'slidingPoint.update'] },
+    { group: 'Paths', names: ['path.reverse', 'path.update', 'path.convertToCurve', 'path.convertToLine', 'path.splitCurveAtPoint', 'path.splitLineAtPoint', 'path.mergeCurvesAtPoint', 'path.mergeLinesAtPoint'] },
+    { group: 'Pieces & seams', names: ['piece.update', 'piece.rotate', 'piece.breakout', 'piecePath.add', 'piecePath.update', 'seam.reverse', 'notch.update', 'notch.delete'] },
     { group: 'Elements', names: ['element.rename', 'element.delete', 'element.bringToFront', 'element.sendToBack', 'element.moveToLayer'] },
     { group: 'Selection', names: ['selection.move', 'selection.rotate', 'selection.scale', 'selection.mirror', 'selection.delete', 'selection.moveToLayer'] },
-    { group: 'Layers', names: ['layer.rename', 'layer.setCurrent', 'layer.setVisible', 'layer.setLocked', 'layer.setStyle'] },
-    { group: 'Variables', names: ['variable.setValue', 'variable.setType', 'variable.setEditable', 'variable.setVisible', 'variable.setDescription', 'variable.setOptions', 'variable.reorder'] },
+    { group: 'Layers', names: ['layer.rename', 'layer.delete', 'layer.setCurrent', 'layer.setVisible', 'layer.setLocked', 'layer.setStyle'] },
+    { group: 'Variables & materials', names: ['variable.setValue', 'variable.setType', 'variable.setEditable', 'variable.setVisible', 'variable.setDescription', 'variable.setOptions', 'variable.reorder', 'variable.delete', 'material.delete'] },
     { group: 'Annotations', names: ['text.update', 'image.update'] }
   ];
 </script>
